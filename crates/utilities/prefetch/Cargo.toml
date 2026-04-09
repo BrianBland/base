@@ -1,0 +1,38 @@
+[package]
+name = "base-prefetch"
+description = "Prefetching database wrapper for Base execution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# alloy
+alloy-primitives.workspace = true
+
+# revm
+revm.workspace = true
+
+# misc
+dashmap.workspace = true
+
+[dev-dependencies]
+# testing
+criterion.workspace = true
+reth-primitives-traits.workspace = true
+
+# reth
+reth-db = { workspace = true, features = ["test-utils"] }
+
+[[bench]]
+name = "prefetch_experiment"
+harness = false
+
+[[bench]]
+name = "mdbx_state_lookup"
+harness = false
