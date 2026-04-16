@@ -44,8 +44,14 @@ pub use core::Batch;
 mod raw;
 pub use raw::RawSpanBatch;
 
+mod zk_raw;
+pub use zk_raw::RawZkSpanBatch;
+
 mod payload;
 pub use payload::SpanBatchPayload;
+
+mod zk_payload;
+pub use zk_payload::ZkSpanBatchPayload;
 
 mod prefix;
 pub use prefix::SpanBatchPrefix;
@@ -62,8 +68,14 @@ pub use bits::SpanBatchBits;
 mod span;
 pub use span::SpanBatch;
 
+mod zk_span;
+pub use zk_span::ZkSpanBatch;
+
 mod transactions;
 pub use transactions::SpanBatchTransactions;
+
+mod zk_transactions;
+pub use zk_transactions::ZkSpanBatchTransactions;
 
 mod element;
 pub use element::{MAX_SPAN_BATCH_ELEMENTS, SpanBatchElement};

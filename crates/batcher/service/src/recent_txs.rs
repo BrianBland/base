@@ -165,6 +165,7 @@ impl RecentTxScanner {
             let last_timestamp = match &batch {
                 Batch::Single(sb) => sb.timestamp,
                 Batch::Span(sb) => sb.final_timestamp(),
+                Batch::ZkSpan(sb) => sb.final_timestamp(),
             };
             let relative = rollup_config.block_number_from_timestamp(last_timestamp);
             let l2_block = rollup_config.genesis.l2.number + relative;

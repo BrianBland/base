@@ -11,7 +11,7 @@ mod submission;
 pub use submission::{BatchSubmission, DaType, FrameEncoder, SubmissionId};
 
 mod step;
-pub use step::{StepError, StepResult};
+pub use step::{StepError, StepResult, ZkTransactionConversionError};
 
 mod reorg;
 pub use reorg::ReorgError;

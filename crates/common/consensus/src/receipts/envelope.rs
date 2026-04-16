@@ -49,6 +49,9 @@ pub enum OpReceiptEnvelope<T = Log> {
     /// [deposit]: https://specs.optimism.io/protocol/deposits.html
     #[cfg_attr(feature = "serde", serde(rename = "0x7e", alias = "0x7E"))]
     Deposit(ReceiptWithBloom<OpDepositReceipt<T>>),
+    /// Receipt envelope with type flag 127, containing a zk sequencer receipt.
+    #[cfg_attr(feature = "serde", serde(rename = "0x7f", alias = "0x7F"))]
+    ZkSequencer(ReceiptWithBloom<Receipt<T>>),
 }
 
 impl OpReceiptEnvelope<Log> {
@@ -89,6 +92,9 @@ impl OpReceiptEnvelope<Log> {
                 };
                 Self::Deposit(inner)
             }
+            OpTxType::ZkSequencer => {
+                Self::ZkSequencer(ReceiptWithBloom { receipt: inner_receipt, logs_bloom })
+            }
         }
     }
 }
@@ -102,6 +108,7 @@ impl<T> OpReceiptEnvelope<T> {
             Self::Eip1559(_) => OpTxType::Eip1559,
             Self::Eip7702(_) => OpTxType::Eip7702,
             Self::Deposit(_) => OpTxType::Deposit,
+            Self::ZkSequencer(_) => OpTxType::ZkSequencer,
         }
     }
 
@@ -130,6 +137,7 @@ impl<T> OpReceiptEnvelope<T> {
             Self::Eip1559(r) => OpReceiptEnvelope::Eip1559(r.map_logs(f)),
             Self::Eip7702(r) => OpReceiptEnvelope::Eip7702(r.map_logs(f)),
             Self::Deposit(r) => OpReceiptEnvelope::Deposit(r.map_receipt(|r| r.map_logs(f))),
+            Self::ZkSequencer(r) => OpReceiptEnvelope::ZkSequencer(r.map_logs(f)),
         }
     }
 
@@ -146,9 +154,11 @@ impl<T> OpReceiptEnvelope<T> {
     /// Return the receipt's bloom.
     pub const fn logs_bloom(&self) -> &Bloom {
         match self {
-            Self::Legacy(t) | Self::Eip2930(t) | Self::Eip1559(t) | Self::Eip7702(t) => {
-                &t.logs_bloom
-            }
+            Self::Legacy(t)
+            | Self::Eip2930(t)
+            | Self::Eip1559(t)
+            | Self::Eip7702(t)
+            | Self::ZkSequencer(t) => &t.logs_bloom,
             Self::Deposit(t) => &t.logs_bloom,
         }
     }
@@ -182,7 +192,11 @@ impl<T> OpReceiptEnvelope<T> {
     /// Consumes the type and returns the underlying [`Receipt`].
     pub fn into_receipt(self) -> Receipt<T> {
         match self {
-            Self::Legacy(t) | Self::Eip2930(t) | Self::Eip1559(t) | Self::Eip7702(t) => t.receipt,
+            Self::Legacy(t)
+            | Self::Eip2930(t)
+            | Self::Eip1559(t)
+            | Self::Eip7702(t)
+            | Self::ZkSequencer(t) => t.receipt,
             Self::Deposit(t) => t.receipt.into_inner(),
         }
     }
@@ -191,9 +205,11 @@ impl<T> OpReceiptEnvelope<T> {
     /// receipt types may be added.
     pub const fn as_receipt(&self) -> Option<&Receipt<T>> {
         match self {
-            Self::Legacy(t) | Self::Eip2930(t) | Self::Eip1559(t) | Self::Eip7702(t) => {
-                Some(&t.receipt)
-            }
+            Self::Legacy(t)
+            | Self::Eip2930(t)
+            | Self::Eip1559(t)
+            | Self::Eip7702(t)
+            | Self::ZkSequencer(t) => Some(&t.receipt),
             Self::Deposit(t) => Some(&t.receipt.inner),
         }
     }
@@ -203,7 +219,11 @@ impl OpReceiptEnvelope {
     /// Get the length of the inner receipt in the 2718 encoding.
     pub fn inner_length(&self) -> usize {
         match self {
-            Self::Legacy(t) | Self::Eip2930(t) | Self::Eip1559(t) | Self::Eip7702(t) => t.length(),
+            Self::Legacy(t)
+            | Self::Eip2930(t)
+            | Self::Eip1559(t)
+            | Self::Eip7702(t)
+            | Self::ZkSequencer(t) => t.length(),
             Self::Deposit(t) => t.length(),
         }
     }
@@ -281,6 +301,7 @@ impl Typed2718 for OpReceiptEnvelope {
             Self::Eip1559(_) => OpTxType::Eip1559,
             Self::Eip7702(_) => OpTxType::Eip7702,
             Self::Deposit(_) => OpTxType::Deposit,
+            Self::ZkSequencer(_) => OpTxType::ZkSequencer,
         };
         ty as u8
     }
@@ -304,9 +325,11 @@ impl Encodable2718 for OpReceiptEnvelope {
         }
         match self {
             Self::Deposit(t) => t.encode(out),
-            Self::Legacy(t) | Self::Eip2930(t) | Self::Eip1559(t) | Self::Eip7702(t) => {
-                t.encode(out)
-            }
+            Self::Legacy(t)
+            | Self::Eip2930(t)
+            | Self::Eip1559(t)
+            | Self::Eip7702(t)
+            | Self::ZkSequencer(t) => t.encode(out),
         }
     }
 }
@@ -322,6 +345,7 @@ impl Decodable2718 for OpReceiptEnvelope {
             OpTxType::Eip7702 => Ok(Self::Eip7702(Decodable::decode(buf)?)),
             OpTxType::Eip2930 => Ok(Self::Eip2930(Decodable::decode(buf)?)),
             OpTxType::Deposit => Ok(Self::Deposit(Decodable::decode(buf)?)),
+            OpTxType::ZkSequencer => Ok(Self::ZkSequencer(Decodable::decode(buf)?)),
         }
     }
 
@@ -356,7 +380,8 @@ where
             1 => Ok(Self::Eip2930(ReceiptWithBloom::arbitrary(u)?)),
             2 => Ok(Self::Eip1559(ReceiptWithBloom::arbitrary(u)?)),
             3 => Ok(Self::Eip7702(ReceiptWithBloom::arbitrary(u)?)),
-            _ => Ok(Self::Deposit(OpDepositReceiptWithBloom::arbitrary(u)?)),
+            4 => Ok(Self::Deposit(OpDepositReceiptWithBloom::arbitrary(u)?)),
+            _ => Ok(Self::ZkSequencer(ReceiptWithBloom::arbitrary(u)?)),
         }
     }
 }

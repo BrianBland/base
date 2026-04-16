@@ -9,6 +9,12 @@ exclude = [".github/"]
 
 [workspace]
 resolver = "2"
+exclude = [
+  "crates/proof/zk/span-proof-airbender",
+  "crates/proof/zk/span-proof-airbender/guest",
+  "crates/proof/zk/span-proof-sp1",
+  "crates/proof/zk/span-proof-sp1/program",
+]
 members = [
   "bin/audit-archiver",
   "bin/basectl",
@@ -48,6 +54,8 @@ members = [
   "crates/proof/zk/db",
   "crates/proof/zk/outbox",
   "crates/proof/zk/service",
+  "crates/proof/zk/span-proof",
+  "crates/proof/zk/span-proof/guest",
   "crates/proof/contracts",
   "crates/proof/rpc",
   "crates/proof/proposer",
@@ -251,6 +259,7 @@ base-proof-rpc = { path = "crates/proof/rpc" }
 base-proposer = { path = "crates/proof/proposer" }
 base-zk-client = { path = "crates/proof/zk/client" }
 base-zk-outbox = { path = "crates/proof/zk/outbox" }
+base-zk-span-proof = { path = "crates/proof/zk/span-proof" }
 base-challenger = { path = "crates/proof/challenge" }
 base-zk-service = { path = "crates/proof/zk/service" }
 base-proof-contracts = { path = "crates/proof/contracts" }
@@ -453,6 +462,7 @@ aws-sdk-elasticloadbalancingv2 = { version = "1.109.0", default-features = false
 
 # risc0 / boundless
 boundless-market = "1.1"
+risc0-build = "3.0.5"
 risc0-ethereum-contracts = "3.0.1"
 risc0-zkvm = { version = "^3.0", default-features = false }
 
@@ -602,3 +612,9 @@ toml = { version = "1.0", default-features = false }
 ark-ff = { version = "0.5.0", default-features = false }
 unsigned-varint = { version = "0.8", default-features = false }
 ark-bls12-381 = { version = "0.5.0", default-features = false }
+
+[patch.crates-io]
+crypto-bigint = { git = "https://github.com/risc0/RustCrypto-crypto-bigint.git", tag = "v0.5.5-risczero.0" }
+k256 = { git = "https://github.com/risc0/RustCrypto-elliptic-curves.git", tag = "k256/v0.13.4-risczero.1" }
+sha2 = { git = "https://github.com/risc0/RustCrypto-hashes.git", tag = "sha2-v0.10.9-risczero.0" }
+tiny-keccak = { git = "https://github.com/risc0/tiny-keccak.git", rev = "d9d031f1e425fc2452e97f88e706de27cb6adc48" }

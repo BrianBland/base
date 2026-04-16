@@ -1,0 +1,47 @@
+[package]
+name = "base-zk-span-proof"
+description = "RISC Zero proofs for zk span batch signature elision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[package.metadata.risc0]
+methods = ["guest"]
+
+[[example]]
+name = "zk_span_bench"
+required-features = ["prove"]
+
+[lints]
+workspace = true
+
+[dependencies]
+base-protocol.workspace = true
+base-alloy-consensus = { workspace = true, features = ["k256", "std"] }
+
+alloy-consensus = { workspace = true, features = ["k256", "std"] }
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+
+bincode = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive", "std"] }
+thiserror.workspace = true
+
+risc0-zkvm = { workspace = true, features = ["prove", "std"], optional = true }
+
+[dev-dependencies]
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+rstest.workspace = true
+
+[build-dependencies]
+risc0-build.workspace = true
+
+[features]
+cuda = ["prove", "risc0-zkvm/cuda"]
+prove = ["dep:risc0-zkvm"]

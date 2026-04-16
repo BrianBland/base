@@ -29,7 +29,8 @@ pub use receipts::{
 mod transaction;
 pub use transaction::{
     DEPOSIT_TX_TYPE_ID, DepositTransaction, OpDepositInfo, OpPooledTransaction, OpTransaction,
-    OpTransactionInfo, OpTxEnvelope, OpTxType, OpTypedTransaction, TxDeposit,
+    OpTransactionInfo, OpTxEnvelope, OpTxType, OpTypedTransaction, TxDeposit, TxZkSequencer,
+    ZK_SEQUENCER_TX_TYPE_ID, ZkSequencerTxBody,
 };
 
 mod extra;
@@ -59,6 +60,9 @@ pub use transaction::serde_deposit_tx_rpc;
 pub mod serde_bincode_compat {
     pub use super::{
         receipts::serde_bincode_compat::{OpDepositReceipt, OpReceipt},
-        transaction::{serde_bincode_compat as transaction, serde_bincode_compat::TxDeposit},
+        transaction::{
+            serde_bincode_compat as transaction,
+            serde_bincode_compat::{TxDeposit, TxZkSequencer, ZkSequencerTxBody},
+        },
     };
 }

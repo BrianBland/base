@@ -72,6 +72,9 @@ pub enum SpanDecodingError {
     /// Failed to decode transaction nonces
     #[error("Failed to decode transaction nonces")]
     TxNonces,
+    /// Failed to decode transaction roots
+    #[error("Failed to decode transaction roots")]
+    TxRoots,
     /// Mismatch in length between the transaction type and signature arrays in a span batch
     /// transaction payload.
     #[error("Mismatch in length between the transaction type and signature arrays")]

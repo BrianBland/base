@@ -24,7 +24,8 @@ use reth_ethereum_primitives as _;
 
 use crate::{
     BaseBlock, DEPOSIT_TX_TYPE_ID, OpDepositReceipt, OpPooledTransaction, OpReceipt, OpTxEnvelope,
-    OpTxType, OpTypedTransaction, TxDeposit,
+    OpTxType, OpTypedTransaction, TxDeposit, TxZkSequencer, ZK_SEQUENCER_TX_TYPE_ID,
+    ZkSequencerTxBody,
 };
 
 // ---------------------------------------------------------------------------
@@ -45,6 +46,13 @@ impl reth_primitives_traits::InMemorySize for TxDeposit {
     }
 }
 
+impl reth_primitives_traits::InMemorySize for TxZkSequencer {
+    #[inline]
+    fn size(&self) -> usize {
+        Self::size(self)
+    }
+}
+
 impl reth_primitives_traits::InMemorySize for OpDepositReceipt {
     fn size(&self) -> usize {
         self.inner.size()
@@ -59,7 +67,8 @@ impl reth_primitives_traits::InMemorySize for OpReceipt {
             Self::Legacy(receipt)
             | Self::Eip2930(receipt)
             | Self::Eip1559(receipt)
-            | Self::Eip7702(receipt) => receipt.size(),
+            | Self::Eip7702(receipt)
+            | Self::ZkSequencer(receipt) => receipt.size(),
             Self::Deposit(receipt) => receipt.size(),
         }
     }
@@ -73,6 +82,7 @@ impl reth_primitives_traits::InMemorySize for OpTypedTransaction {
             Self::Eip1559(tx) => tx.size(),
             Self::Eip7702(tx) => tx.size(),
             Self::Deposit(tx) => tx.size(),
+            Self::ZkSequencer(tx) => tx.size(),
         }
     }
 }
@@ -96,6 +106,7 @@ impl reth_primitives_traits::InMemorySize for OpTxEnvelope {
             Self::Eip1559(tx) => tx.size(),
             Self::Eip7702(tx) => tx.size(),
             Self::Deposit(tx) => tx.size(),
+            Self::ZkSequencer(tx) => tx.size(),
         }
     }
 }
@@ -206,6 +217,63 @@ impl Compact for TxDeposit {
     }
 }
 
+impl Compact for ZkSequencerTxBody {
+    fn to_compact<B>(&self, buf: &mut B) -> usize
+    where
+        B: BufMut + AsMut<[u8]>,
+    {
+        buf.put_u8(self.inner_tx_type() as u8);
+        match self {
+            Self::Legacy(tx) => tx.to_compact(buf),
+            Self::Eip2930(tx) => tx.to_compact(buf),
+            Self::Eip1559(tx) => tx.to_compact(buf),
+            Self::Eip7702(tx) => tx.to_compact(buf),
+        };
+        1
+    }
+
+    fn from_compact(buf: &[u8], _len: usize) -> (Self, &[u8]) {
+        let mut buf = buf;
+        let inner_type = buf.get_u8();
+        match inner_type {
+            0 => {
+                let (tx, buf) = TxLegacy::from_compact(buf, buf.len());
+                (Self::Legacy(tx), buf)
+            }
+            1 => {
+                let (tx, buf) = TxEip2930::from_compact(buf, buf.len());
+                (Self::Eip2930(tx), buf)
+            }
+            2 => {
+                let (tx, buf) = TxEip1559::from_compact(buf, buf.len());
+                (Self::Eip1559(tx), buf)
+            }
+            4 => {
+                let (tx, buf) = TxEip7702::from_compact(buf, buf.len());
+                (Self::Eip7702(tx), buf)
+            }
+            _ => panic!("Unsupported zk sequencer inner tx type: {inner_type}"),
+        }
+    }
+}
+
+impl Compact for TxZkSequencer {
+    fn to_compact<B>(&self, buf: &mut B) -> usize
+    where
+        B: BufMut + AsMut<[u8]>,
+    {
+        let _ = self.sender.to_compact(buf);
+        let _ = self.body.to_compact(buf);
+        0
+    }
+
+    fn from_compact(buf: &[u8], _len: usize) -> (Self, &[u8]) {
+        let (sender, buf) = Address::from_compact(buf, buf.len());
+        let (body, buf) = ZkSequencerTxBody::from_compact(buf, buf.len());
+        (Self { sender, body }, buf)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compact – OpTxType
 // ---------------------------------------------------------------------------
@@ -227,6 +295,10 @@ impl Compact for OpTxType {
                 buf.put_u8(DEPOSIT_TX_TYPE_ID);
                 COMPACT_EXTENDED_IDENTIFIER_FLAG
             }
+            Self::ZkSequencer => {
+                buf.put_u8(ZK_SEQUENCER_TX_TYPE_ID);
+                COMPACT_EXTENDED_IDENTIFIER_FLAG
+            }
         }
     }
 
@@ -241,6 +313,7 @@ impl Compact for OpTxType {
                     match extended_identifier {
                         EIP7702_TX_TYPE_ID => Self::Eip7702,
                         DEPOSIT_TX_TYPE_ID => Self::Deposit,
+                        ZK_SEQUENCER_TX_TYPE_ID => Self::ZkSequencer,
                         _ => panic!("Unsupported OpTxType identifier: {extended_identifier}"),
                     }
                 }
@@ -267,6 +340,7 @@ impl Compact for OpTypedTransaction {
             Self::Eip1559(tx) => tx.to_compact(out),
             Self::Eip7702(tx) => tx.to_compact(out),
             Self::Deposit(tx) => tx.to_compact(out),
+            Self::ZkSequencer(tx) => tx.to_compact(out),
         };
         identifier
     }
@@ -294,6 +368,10 @@ impl Compact for OpTypedTransaction {
                 let (tx, buf) = Compact::from_compact(buf, buf.len());
                 (Self::Deposit(tx), buf)
             }
+            OpTxType::ZkSequencer => {
+                let (tx, buf) = Compact::from_compact(buf, buf.len());
+                (Self::ZkSequencer(tx), buf)
+            }
         }
     }
 }
@@ -310,6 +388,7 @@ impl reth_codecs::alloy::transaction::ToTxCompact for OpTxEnvelope {
             Self::Eip1559(tx) => tx.tx().to_compact(buf),
             Self::Eip7702(tx) => tx.tx().to_compact(buf),
             Self::Deposit(tx) => tx.to_compact(buf),
+            Self::ZkSequencer(tx) => tx.to_compact(buf),
         };
     }
 }
@@ -344,6 +423,11 @@ impl reth_codecs::alloy::transaction::FromTxCompact for OpTxEnvelope {
                 let tx = Sealed::new(tx);
                 (Self::Deposit(tx), buf)
             }
+            OpTxType::ZkSequencer => {
+                let (tx, buf) = TxZkSequencer::from_compact(buf, buf.len());
+                let tx = Sealed::new(tx);
+                (Self::ZkSequencer(tx), buf)
+            }
         }
     }
 }
@@ -362,7 +446,7 @@ impl reth_codecs::alloy::transaction::Envelope for OpTxEnvelope {
             Self::Eip2930(tx) => tx.signature(),
             Self::Eip1559(tx) => tx.signature(),
             Self::Eip7702(tx) => tx.signature(),
-            Self::Deposit(_) => &DEPOSIT_SIGNATURE,
+            Self::Deposit(_) | Self::ZkSequencer(_) => &DEPOSIT_SIGNATURE,
         }
     }
 
@@ -451,6 +535,7 @@ impl From<CompactOpReceipt<'_>> for OpReceipt {
             OpTxType::Deposit => {
                 Self::Deposit(OpDepositReceipt { inner, deposit_nonce, deposit_receipt_version })
             }
+            OpTxType::ZkSequencer => Self::ZkSequencer(inner),
         }
     }
 }

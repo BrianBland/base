@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 tracing = { workspace = true, features = ["std"] }
+alloy-consensus = { workspace = true, features = ["std", "k256"] }
 base-comp = { workspace = true, features = ["std"] }
 thiserror = { workspace = true, features = ["std"] }
 alloy-eips = { workspace = true, features = ["std"] }
@@ -21,13 +22,13 @@ alloy-primitives = { workspace = true, features = ["std"] }
 base-metrics.workspace = true
 metrics = { workspace = true, optional = true }
 rand = { workspace = true, features = ["std", "small_rng"] }
-base-alloy-consensus = { workspace = true, features = ["std"] }
+base-alloy-consensus = { workspace = true, features = ["std", "k256", "serde"] }
 base-consensus-genesis = { workspace = true, features = ["std"] }
 clap = { workspace = true, features = ["derive"], optional = true }
 
 [dev-dependencies]
-alloy-consensus = { workspace = true, features = ["std"] }
 rstest.workspace = true
+serde_json = { workspace = true, features = ["std"] }
 
 [features]
 clap = [ "dep:clap" ]

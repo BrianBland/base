@@ -7,6 +7,9 @@ use crate::transaction::envelope::OpTxType;
 /// Identifier for a deposit transaction
 pub const DEPOSIT_TX_TYPE_ID: u8 = 126; // 0x7E
 
+/// Identifier for a zk-backed sequencer transaction.
+pub const ZK_SEQUENCER_TX_TYPE_ID: u8 = 127; // 0x7F
+
 #[allow(clippy::derivable_impls)]
 impl Default for OpTxType {
     fn default() -> Self {
@@ -22,18 +25,30 @@ impl Display for OpTxType {
             Self::Eip1559 => write!(f, "eip1559"),
             Self::Eip7702 => write!(f, "eip7702"),
             Self::Deposit => write!(f, "deposit"),
+            Self::ZkSequencer => write!(f, "zk_sequencer"),
         }
     }
 }
 
 impl OpTxType {
     /// List of all variants.
-    pub const ALL: [Self; 5] =
-        [Self::Legacy, Self::Eip2930, Self::Eip1559, Self::Eip7702, Self::Deposit];
+    pub const ALL: [Self; 6] = [
+        Self::Legacy,
+        Self::Eip2930,
+        Self::Eip1559,
+        Self::Eip7702,
+        Self::Deposit,
+        Self::ZkSequencer,
+    ];
 
     /// Returns `true` if the type is [`OpTxType::Deposit`].
     pub const fn is_deposit(&self) -> bool {
         matches!(self, Self::Deposit)
+    }
+
+    /// Returns `true` if the type is [`OpTxType::ZkSequencer`].
+    pub const fn is_zk_sequencer(&self) -> bool {
+        matches!(self, Self::ZkSequencer)
     }
 }
 
@@ -47,13 +62,14 @@ mod tests {
 
     #[test]
     fn test_all_tx_types() {
-        assert_eq!(OpTxType::ALL.len(), 5);
+        assert_eq!(OpTxType::ALL.len(), 6);
         let all = vec![
             OpTxType::Legacy,
             OpTxType::Eip2930,
             OpTxType::Eip1559,
             OpTxType::Eip7702,
             OpTxType::Deposit,
+            OpTxType::ZkSequencer,
         ];
         assert_eq!(OpTxType::ALL.to_vec(), all);
     }

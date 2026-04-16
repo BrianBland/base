@@ -1,0 +1,110 @@
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+homepage = "https://github.com/base/base"
+repository = "https://github.com/base/base"
+
+[workspace]
+members = ["program"]
+resolver = "2"
+
+[workspace.dependencies]
+base-protocol = { path = "../../../consensus/protocol", default-features = false }
+base-zk-span-proof = { path = "../span-proof" }
+base-alloy-consensus = { path = "../../../common/consensus", default-features = false }
+
+alloy-signer = "1.6.3"
+alloy-eips = { version = "1.6.3", default-features = false }
+alloy-consensus = { version = "1.6.3", default-features = false }
+alloy-signer-local = "1.6.3"
+alloy-primitives = { version = "1.5.6", default-features = false }
+alloy-rlp = { version = "0.3.13", default-features = false }
+
+bincode = "2"
+serde = { version = "1.0.228", default-features = false }
+thiserror = { version = "2.0", default-features = false }
+
+sp1-build = "6.1.0"
+sp1-sdk = "6.1.0"
+sp1-zkvm = "6.1.0"
+
+[workspace.lints.rust]
+missing-debug-implementations = "warn"
+missing-docs = "warn"
+unreachable-pub = "warn"
+unused-must-use = "deny"
+rust-2018-idioms = "deny"
+unnameable-types = "warn"
+
+[workspace.lints.rustdoc]
+all = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+missing-const-for-fn = "warn"
+redundant-clone = "warn"
+clone-on-ref-ptr = "warn"
+unnecessary-to-owned = "warn"
+cloned-instead-of-copied = "warn"
+flat-map-option = "warn"
+implicit-clone = "warn"
+or-fun-call = "warn"
+wildcard-imports = "warn"
+use-self = "warn"
+option-if-let-else = "warn"
+uninlined-format-args = "warn"
+manual-string-new = "warn"
+single-char-pattern = "warn"
+redundant-else = "warn"
+match-same-arms = "warn"
+undocumented-unsafe-blocks = "warn"
+doc-markdown = "warn"
+dbg-macro = "warn"
+branches-sharing-code = "warn"
+derive-partial-eq-without-eq = "warn"
+explicit-into-iter-loop = "warn"
+explicit-iter-loop = "warn"
+iter-with-drain = "warn"
+needless-pass-by-ref-mut = "warn"
+string-lit-as-bytes = "warn"
+
+[package]
+name = "base-zk-span-proof-sp1"
+description = "Experimental SP1 prover for zk span batch signature elision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[[example]]
+name = "zk_span_sp1_bench"
+
+[lints]
+workspace = true
+
+[dependencies]
+base-zk-span-proof.workspace = true
+
+sp1-sdk = { workspace = true, features = ["blocking"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+base-alloy-consensus = { workspace = true, features = ["k256", "std"] }
+base-protocol.workspace = true
+
+alloy-consensus = { workspace = true, features = ["k256", "std"] }
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+
+[build-dependencies]
+sp1-build.workspace = true
+
+[features]
+cuda = ["sp1-sdk/cuda"]

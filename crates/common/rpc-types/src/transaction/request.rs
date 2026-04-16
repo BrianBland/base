@@ -7,7 +7,9 @@ use alloy_eips::eip7702::SignedAuthorization;
 use alloy_network_primitives::TransactionBuilder7702;
 use alloy_primitives::{Address, Bytes, ChainId, Signature, TxKind, U256};
 use alloy_rpc_types_eth::{AccessList, TransactionInput, TransactionRequest};
-use base_alloy_consensus::{OpTxEnvelope, OpTypedTransaction, TxDeposit};
+use base_alloy_consensus::{
+    OpTxEnvelope, OpTypedTransaction, TxDeposit, TxZkSequencer, ZkSequencerTxBody,
+};
 use serde::{Deserialize, Serialize};
 
 /// Builder for [`OpTypedTransaction`].
@@ -165,6 +167,25 @@ impl From<TxDeposit> for OpTransactionRequest {
     }
 }
 
+impl From<TxZkSequencer> for OpTransactionRequest {
+    fn from(tx: TxZkSequencer) -> Self {
+        let mut inner: TransactionRequest = match tx.body {
+            ZkSequencerTxBody::Legacy(inner) => inner.into(),
+            ZkSequencerTxBody::Eip2930(inner) => inner.into(),
+            ZkSequencerTxBody::Eip1559(inner) => inner.into(),
+            ZkSequencerTxBody::Eip7702(inner) => inner.into(),
+        };
+        inner.from = Some(tx.sender);
+        Self(inner)
+    }
+}
+
+impl From<Sealed<TxZkSequencer>> for OpTransactionRequest {
+    fn from(value: Sealed<TxZkSequencer>) -> Self {
+        value.into_inner().into()
+    }
+}
+
 impl From<Sealed<TxDeposit>> for OpTransactionRequest {
     fn from(value: Sealed<TxDeposit>) -> Self {
         value.into_inner().into()
@@ -196,6 +217,7 @@ impl From<OpTypedTransaction> for OpTransactionRequest {
             OpTypedTransaction::Eip1559(tx) => Self(tx.into()),
             OpTypedTransaction::Eip7702(tx) => Self(tx.into()),
             OpTypedTransaction::Deposit(tx) => tx.into(),
+            OpTypedTransaction::ZkSequencer(tx) => tx.into(),
         }
     }
 }
@@ -208,6 +230,7 @@ impl From<OpTxEnvelope> for OpTransactionRequest {
             OpTxEnvelope::Eip1559(tx) => tx.into(),
             OpTxEnvelope::Eip7702(tx) => tx.into(),
             OpTxEnvelope::Deposit(tx) => tx.into(),
+            OpTxEnvelope::ZkSequencer(tx) => tx.into(),
         }
     }
 }

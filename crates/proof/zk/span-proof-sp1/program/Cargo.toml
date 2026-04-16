@@ -1,0 +1,26 @@
+[package]
+name = "base-zk-span-proof-sp1-program"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.91"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "zk_span_signature_proof_sp1"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-consensus = { workspace = true, features = ["k256"] }
+alloy-eips.workspace = true
+alloy-primitives = { workspace = true, features = ["k256", "serde", "tiny-keccak"] }
+alloy-rlp.workspace = true
+
+bincode = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive", "std"] }
+sp1-zkvm.workspace = true

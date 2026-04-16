@@ -8,7 +8,7 @@ use alloy_network::{AnyRpcTransaction, AnyTxEnvelope, UnknownTxEnvelope, Unknown
 use alloy_rpc_types_eth::{ConversionError, Transaction as AlloyRpcTransaction};
 use alloy_serde::WithOtherFields;
 
-use crate::{DEPOSIT_TX_TYPE_ID, OpTxEnvelope, TxDeposit};
+use crate::{DEPOSIT_TX_TYPE_ID, OpTxEnvelope, TxDeposit, TxZkSequencer, ZK_SEQUENCER_TX_TYPE_ID};
 
 impl TryFrom<UnknownTxEnvelope> for TxDeposit {
     type Error = ConversionError;
@@ -23,6 +23,28 @@ impl TryFrom<UnknownTypedTransaction> for TxDeposit {
 
     fn try_from(value: UnknownTypedTransaction) -> Result<Self, Self::Error> {
         if !value.is_type(DEPOSIT_TX_TYPE_ID) {
+            return Err(ConversionError::Custom("invalid transaction type".to_string()));
+        }
+        value
+            .fields
+            .deserialize_into()
+            .map_err(|_| ConversionError::Custom("invalid transaction data".to_string()))
+    }
+}
+
+impl TryFrom<UnknownTxEnvelope> for TxZkSequencer {
+    type Error = ConversionError;
+
+    fn try_from(value: UnknownTxEnvelope) -> Result<Self, Self::Error> {
+        value.inner.try_into()
+    }
+}
+
+impl TryFrom<UnknownTypedTransaction> for TxZkSequencer {
+    type Error = ConversionError;
+
+    fn try_from(value: UnknownTypedTransaction) -> Result<Self, Self::Error> {
+        if !value.is_type(ZK_SEQUENCER_TX_TYPE_ID) {
             return Err(ConversionError::Custom("invalid transaction type".to_string()));
         }
         value
@@ -58,7 +80,11 @@ impl TryFrom<AnyRpcTransaction> for OpTxEnvelope {
                     .fields
                     .insert_value("from".to_string(), from)
                     .map_err(|err| ConversionError::Custom(err.to_string()))?;
-                Ok(Self::Deposit(Sealed::new(tx.try_into()?)))
+                if tx.inner.is_type(ZK_SEQUENCER_TX_TYPE_ID) {
+                    Ok(Self::ZkSequencer(Sealed::new(tx.try_into()?)))
+                } else {
+                    Ok(Self::Deposit(Sealed::new(tx.try_into()?)))
+                }
             }
         }
     }

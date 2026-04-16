@@ -6,20 +6,20 @@ use std::{
     sync::Arc,
 };
 
-use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::B256;
-use base_alloy_consensus::{BaseBlock, OpTxEnvelope};
+use alloy_eips::eip2718::{Decodable2718, Encodable2718};
+use alloy_primitives::{B256, Bytes};
+use base_alloy_consensus::{BaseBlock, OpTxEnvelope, TxZkSequencer, ZkSequencerTxBody};
 use base_comp::{
     BatchComposer, ChannelOut, CompressionAlgo, CompressorType, Config, ShadowCompressor,
 };
 use base_consensus_genesis::RollupConfig;
-use base_protocol::{Batch, BatchType, ChannelId, Frame, SingleBatch, SpanBatch};
+use base_protocol::{Batch, BatchType, ChannelId, Frame, SingleBatch, SpanBatch, ZkSpanBatch};
 use rand::{RngCore, SeedableRng, rngs::SmallRng};
 use tracing::{debug, warn};
 
 use crate::{
     BatchPipeline, BatchSubmission, BatcherMetrics, DaType, EncoderConfig, ReorgError, StepError,
-    StepResult, SubmissionId,
+    StepResult, SubmissionId, ZkTransactionConversionError,
     channel::{OpenChannel, PendingRef, ReadyChannel},
 };
 
@@ -50,17 +50,19 @@ pub struct BatchEncoder {
     next_id: u64,
     /// Per-instance RNG for generating unique channel IDs.
     rng: SmallRng,
-    /// Accumulated (`SingleBatch`, `sequence_number`) pairs when operating in
-    /// [`BatchType::Span`] mode. Blocks are collected here during `step()` and
-    /// flushed as a single [`SpanBatch`] when `close_current_channel()` is called.
-    span_accumulator: Vec<(SingleBatch, u64)>,
+    /// Accumulated (`SingleBatch`, `sequence_number`, `tx_root`) tuples when operating in
+    /// [`BatchType::Span`] and [`BatchType::ZkSpan`] modes. Span batches leave `tx_root` empty;
+    /// zk span batches preserve the original per-block transaction trie root. Blocks are
+    /// collected here during `step()` and flushed as a single span-like batch when
+    /// `close_current_channel()` is called.
+    span_accumulator: Vec<(SingleBatch, u64, Option<B256>)>,
     /// Running sum of the estimated raw (uncompressed) byte size of all blocks currently
     /// in `span_accumulator`. Incremented by [`Self::SPAN_BATCH_PER_BLOCK_OVERHEAD`] plus raw
     /// transaction bytes for each block pushed in `step()`, and reset to zero when the
     /// accumulator is drained. Avoids an O(N·M) re-scan of the accumulator on every step.
     span_raw_bytes: usize,
     /// L1 head block number when the first block was accumulated into the current span
-    /// (Span mode only). Used by `check_channel_timeout()` to detect when the span has
+    /// (span-like modes only). Used by `check_channel_timeout()` to detect when the span has
     /// been open too long and must be flushed, since `current_channel` is `None` between
     /// span flushes. Cleared when `close_current_channel()` drains the accumulator.
     span_opened_at_l1: Option<u64>,
@@ -146,70 +148,23 @@ impl BatchEncoder {
     /// `close_reason` is recorded as the `reason` label on the
     /// `batcher_channel_closed_total` counter.
     fn close_current_channel(&mut self, close_reason: &'static str) {
-        // In Span mode: build a SpanBatch from the accumulator, then open a channel
-        // and write it. The accumulator is only consumed if all appends succeed, so
-        // blocks are never silently lost on error — they remain in the accumulator for
-        // the next close attempt.
-        //
-        // Importantly, both the channel open and the accumulator drain happen only
-        // after successful batch construction: this prevents writing a zero-block (or
-        // partial) SpanBatch to the channel, which would be silently ignored by the
-        // derivation pipeline and waste L1 DA space.
-        if self.config.batch_type == BatchType::Span && !self.span_accumulator.is_empty() {
-            let chain_id = self.rollup_config.l2_chain_id.id();
-            let mut span_batch = SpanBatch { chain_id, ..Default::default() };
+        if matches!(self.config.batch_type, BatchType::Span | BatchType::ZkSpan)
+            && !self.span_accumulator.is_empty()
+        {
             let total = self.span_accumulator.len();
-            let mut append_failed = false;
+            let add_ok = match self.flush_span_accumulator(total) {
+                Some(add_ok) => add_ok,
+                None => false,
+            };
 
-            for (single, seq_num) in &self.span_accumulator {
-                if let Err(e) = span_batch.append_singular_batch(single.clone(), *seq_num) {
-                    warn!(
-                        error = %e,
-                        total,
-                        "span batch append failed; blocks preserved in accumulator"
-                    );
-                    append_failed = true;
-                    break;
-                }
+            if add_ok {
+                self.span_accumulator.clear();
+                self.span_raw_bytes = 0;
+                self.span_opened_at_l1 = None;
+            } else if self.current_channel.is_some() {
+                BatcherMetrics::channel_closed_total(BatcherMetrics::REASON_DISCARD).increment(1);
+                self.current_channel = None;
             }
-
-            if !append_failed {
-                // All blocks encoded into the SpanBatch. Now open a channel and write it.
-                // The accumulator is only cleared *after* a successful add_batch so that
-                // blocks are never silently lost if the channel rejects the batch (e.g.
-                // if the span batch exceeds MAX_RLP_BYTES_PER_CHANNEL).
-                if self.current_channel.is_none() {
-                    self.open_new_channel();
-                }
-
-                let add_ok = self
-                    .current_channel
-                    .as_mut()
-                    .map(|open| {
-                        open.out.add_batch(Batch::Span(span_batch)).map_err(|e| {
-                            warn!(error = %e, total, "failed to add span batch to channel; blocks preserved in accumulator");
-                        }).is_ok()
-                    })
-                    .unwrap_or(false);
-
-                if add_ok {
-                    self.span_accumulator.clear();
-                    self.span_raw_bytes = 0;
-                    self.span_opened_at_l1 = None;
-                } else {
-                    // Discard the channel we just opened so that the drain logic below
-                    // (`self.current_channel.take()`) short-circuits and returns early.
-                    // Without this, the empty channel (0 frames) would be pushed to
-                    // `ready_channels`, where it can never be confirmed and never removed,
-                    // leaking memory and growing the O(N) scan in `next_submission`.
-                    // Emit a closed counter to keep opened/closed balanced.
-                    BatcherMetrics::channel_closed_total(BatcherMetrics::REASON_DISCARD)
-                        .increment(1);
-                    self.current_channel = None;
-                }
-            }
-            // On failure (append or add_batch): accumulator is untouched so blocks
-            // are retried on the next close attempt. No partial SpanBatch is submitted.
         }
 
         let Some(mut open) = self.current_channel.take() else {
@@ -313,7 +268,7 @@ impl BatchEncoder {
 
         let should_close = if let Some(ref open) = self.current_channel {
             self.l1_head.saturating_sub(open.opened_at_l1) >= effective_duration
-        } else if self.config.batch_type == BatchType::Span {
+        } else if matches!(self.config.batch_type, BatchType::Span | BatchType::ZkSpan) {
             // In Span mode there is no open channel between size-based flushes; instead
             // we track the L1 head at which the first block was accumulated. If the
             // accumulator is non-empty and the effective duration has elapsed, flush it.
@@ -333,6 +288,117 @@ impl BatchEncoder {
         }
 
         should_close
+    }
+
+    fn flush_span_accumulator(&mut self, total: usize) -> Option<bool> {
+        let batch = match self.config.batch_type {
+            BatchType::Span => {
+                let chain_id = self.rollup_config.l2_chain_id.id();
+                let mut span_batch = SpanBatch { chain_id, ..Default::default() };
+                for (single, seq_num, _) in &self.span_accumulator {
+                    if let Err(e) = span_batch.append_singular_batch(single.clone(), *seq_num) {
+                        warn!(
+                            error = %e,
+                            total,
+                            "span batch append failed; blocks preserved in accumulator"
+                        );
+                        return None;
+                    }
+                }
+                Batch::Span(span_batch)
+            }
+            BatchType::ZkSpan => {
+                let chain_id = self.rollup_config.l2_chain_id.id();
+                let mut span_batch = ZkSpanBatch { chain_id, ..Default::default() };
+                for (single, seq_num, tx_root) in &self.span_accumulator {
+                    let Some(tx_root) = tx_root else {
+                        warn!(total, "zk span batch root missing; blocks preserved in accumulator");
+                        return None;
+                    };
+
+                    if let Err(e) =
+                        span_batch.append_singular_batch(single.clone(), *seq_num, *tx_root)
+                    {
+                        warn!(
+                            error = %e,
+                            total,
+                            "zk span batch append failed; blocks preserved in accumulator"
+                        );
+                        return None;
+                    }
+                }
+                Batch::ZkSpan(span_batch)
+            }
+            BatchType::Single => return Some(true),
+        };
+
+        if self.current_channel.is_none() {
+            self.open_new_channel();
+        }
+
+        Some(
+            self.current_channel
+                .as_mut()
+                .map(|open| {
+                    open.out
+                        .add_batch(batch)
+                        .map_err(|e| {
+                            warn!(
+                                error = %e,
+                                total,
+                                "failed to add span-like batch to channel; blocks preserved in accumulator"
+                            );
+                        })
+                        .is_ok()
+                })
+                .unwrap_or(false),
+        )
+    }
+
+    fn convert_single_batch_to_zk(
+        single_batch: SingleBatch,
+    ) -> Result<SingleBatch, ZkTransactionConversionError> {
+        let transactions = single_batch
+            .transactions
+            .into_iter()
+            .map(Self::convert_tx_to_zk)
+            .collect::<Result<Vec<Bytes>, ZkTransactionConversionError>>()?;
+
+        Ok(SingleBatch { transactions, ..single_batch })
+    }
+
+    fn convert_tx_to_zk(tx_bytes: Bytes) -> Result<Bytes, ZkTransactionConversionError> {
+        let tx = OpTxEnvelope::decode_2718(&mut tx_bytes.as_ref())
+            .map_err(|_| ZkTransactionConversionError::Decode)?;
+
+        let zk_tx = match tx {
+            OpTxEnvelope::Legacy(tx) => TxZkSequencer::new(
+                tx.recover_signer()
+                    .map_err(|err| ZkTransactionConversionError::RecoverSigner(err.into()))?,
+                ZkSequencerTxBody::Legacy(tx.strip_signature()),
+            ),
+            OpTxEnvelope::Eip2930(tx) => TxZkSequencer::new(
+                tx.recover_signer()
+                    .map_err(|err| ZkTransactionConversionError::RecoverSigner(err.into()))?,
+                ZkSequencerTxBody::Eip2930(tx.strip_signature()),
+            ),
+            OpTxEnvelope::Eip1559(tx) => TxZkSequencer::new(
+                tx.recover_signer()
+                    .map_err(|err| ZkTransactionConversionError::RecoverSigner(err.into()))?,
+                ZkSequencerTxBody::Eip1559(tx.strip_signature()),
+            ),
+            OpTxEnvelope::Eip7702(tx) => TxZkSequencer::new(
+                tx.recover_signer()
+                    .map_err(|err| ZkTransactionConversionError::RecoverSigner(err.into()))?,
+                ZkSequencerTxBody::Eip7702(tx.strip_signature()),
+            ),
+            OpTxEnvelope::ZkSequencer(tx) => tx.into_inner(),
+            OpTxEnvelope::Deposit(_) => return Err(ZkTransactionConversionError::Deposit),
+        };
+
+        let mut out = Vec::new();
+        OpTxEnvelope::from(zk_tx).encode_2718(&mut out);
+        Ok(out.into())
     }
 }
 
@@ -385,7 +451,7 @@ impl BatchPipeline for BatchEncoder {
                 let block_raw_bytes = Self::SPAN_BATCH_PER_BLOCK_OVERHEAD
                     + single_batch.transactions.iter().map(|tx| tx.len()).sum::<usize>();
                 self.span_raw_bytes += block_raw_bytes;
-                self.span_accumulator.push((single_batch, seq_num));
+                self.span_accumulator.push((single_batch, seq_num, None));
                 self.block_cursor += 1;
 
                 // Track the L1 head at which the first block of this span was accumulated.
@@ -422,6 +488,54 @@ impl BatchPipeline for BatchEncoder {
                     debug!(
                         span_len = self.span_accumulator.len(),
                         compressed_estimate, size_target, "span accumulator full, closing channel"
+                    );
+                    self.close_current_channel("size_full");
+                    return Ok(StepResult::ChannelClosed);
+                }
+
+                Ok(StepResult::BlockEncoded)
+            }
+            BatchType::ZkSpan => {
+                let single_batch =
+                    Self::convert_single_batch_to_zk(single_batch).map_err(|source| {
+                        StepError::ZkTransactionConversionFailed {
+                            cursor: self.block_cursor,
+                            source,
+                        }
+                    })?;
+                let seq_num = l1_info.sequence_number();
+                let tx_root = block.header.transactions_root;
+                let block_raw_bytes = Self::SPAN_BATCH_PER_BLOCK_OVERHEAD
+                    + single_batch.transactions.iter().map(|tx| tx.len()).sum::<usize>();
+                self.span_raw_bytes += block_raw_bytes;
+                self.span_accumulator.push((single_batch, seq_num, Some(tx_root)));
+                self.block_cursor += 1;
+
+                if self.span_opened_at_l1.is_none() {
+                    self.span_opened_at_l1 = Some(self.l1_head);
+                }
+
+                let compressed_estimate =
+                    (self.span_raw_bytes as f64 * self.config.approx_compr_ratio) as usize;
+                let size_target =
+                    self.config.target_frame_size.saturating_mul(self.config.target_num_frames);
+
+                debug!(
+                    block_cursor = self.block_cursor,
+                    blocks_len = self.blocks.len(),
+                    span_accumulator_len = self.span_accumulator.len(),
+                    span_raw_bytes = self.span_raw_bytes,
+                    compressed_estimate,
+                    size_target,
+                    "accumulated block for zk span batch"
+                );
+
+                if compressed_estimate >= size_target {
+                    debug!(
+                        span_len = self.span_accumulator.len(),
+                        compressed_estimate,
+                        size_target,
+                        "zk span accumulator full, closing channel"
                     );
                     self.close_current_channel("size_full");
                     return Ok(StepResult::ChannelClosed);

@@ -1,8 +1,9 @@
 //! This module contains the top level span batch transaction data type.
 
-use alloy_consensus::{Transaction, TxEnvelope, TxType};
+use alloy_consensus::{Transaction, TxEip1559, TxEip2930, TxEip7702, TxEnvelope, TxLegacy, TxType};
 use alloy_primitives::{Address, Signature, U256};
 use alloy_rlp::{Bytes, Decodable, Encodable};
+use base_alloy_consensus::{OpTxEnvelope, TxZkSequencer, ZkSequencerTxBody};
 
 use crate::{
     SpanBatchEip1559TransactionData, SpanBatchEip2930TransactionData,
@@ -104,6 +105,41 @@ impl TryFrom<&TxEnvelope> for SpanBatchTransactionData {
     }
 }
 
+impl TryFrom<&TxZkSequencer> for SpanBatchTransactionData {
+    type Error = SpanBatchError;
+
+    fn try_from(value: &TxZkSequencer) -> Result<Self, Self::Error> {
+        match &value.body {
+            ZkSequencerTxBody::Legacy(s) => Ok(Self::Legacy(SpanBatchLegacyTransactionData {
+                value: s.value,
+                gas_price: U256::from(s.gas_price),
+                data: Bytes::from(s.input().to_vec()),
+            })),
+            ZkSequencerTxBody::Eip2930(s) => Ok(Self::Eip2930(SpanBatchEip2930TransactionData {
+                value: s.value,
+                gas_price: U256::from(s.gas_price),
+                data: Bytes::from(s.input().to_vec()),
+                access_list: s.access_list.clone(),
+            })),
+            ZkSequencerTxBody::Eip1559(s) => Ok(Self::Eip1559(SpanBatchEip1559TransactionData {
+                value: s.value,
+                max_fee_per_gas: U256::from(s.max_fee_per_gas),
+                max_priority_fee_per_gas: U256::from(s.max_priority_fee_per_gas),
+                data: Bytes::from(s.input().to_vec()),
+                access_list: s.access_list.clone(),
+            })),
+            ZkSequencerTxBody::Eip7702(s) => Ok(Self::Eip7702(SpanBatchEip7702TransactionData {
+                value: s.value,
+                max_fee_per_gas: U256::from(s.max_fee_per_gas),
+                max_priority_fee_per_gas: U256::from(s.max_priority_fee_per_gas),
+                data: Bytes::from(s.input().to_vec()),
+                access_list: s.access_list.clone(),
+                authorization_list: s.authorization_list.clone(),
+            })),
+        }
+    }
+}
+
 impl SpanBatchTransactionData {
     /// Returns the transaction type of the [`SpanBatchTransactionData`].
     pub const fn tx_type(&self) -> TxType {
@@ -132,6 +168,54 @@ impl SpanBatchTransactionData {
                 Ok(Self::Eip7702(SpanBatchEip7702TransactionData::decode(&mut &b[1..])?))
             }
             _ => Err(alloy_rlp::Error::Custom("Invalid transaction type")),
+        }
+    }
+
+    /// Converts an [`OpTxEnvelope`] into span batch transaction data.
+    pub fn try_from_op_tx_envelope(tx_envelope: &OpTxEnvelope) -> Result<Self, SpanBatchError> {
+        match tx_envelope {
+            OpTxEnvelope::Legacy(s) => {
+                let s = s.tx();
+                Ok(Self::Legacy(SpanBatchLegacyTransactionData {
+                    value: s.value,
+                    gas_price: U256::from(s.gas_price),
+                    data: Bytes::from(s.input().to_vec()),
+                }))
+            }
+            OpTxEnvelope::Eip2930(s) => {
+                let s = s.tx();
+                Ok(Self::Eip2930(SpanBatchEip2930TransactionData {
+                    value: s.value,
+                    gas_price: U256::from(s.gas_price),
+                    data: Bytes::from(s.input().to_vec()),
+                    access_list: s.access_list.clone(),
+                }))
+            }
+            OpTxEnvelope::Eip1559(s) => {
+                let s = s.tx();
+                Ok(Self::Eip1559(SpanBatchEip1559TransactionData {
+                    value: s.value,
+                    max_fee_per_gas: U256::from(s.max_fee_per_gas),
+                    max_priority_fee_per_gas: U256::from(s.max_priority_fee_per_gas),
+                    data: Bytes::from(s.input().to_vec()),
+                    access_list: s.access_list.clone(),
+                }))
+            }
+            OpTxEnvelope::Eip7702(s) => {
+                let s = s.tx();
+                Ok(Self::Eip7702(SpanBatchEip7702TransactionData {
+                    value: s.value,
+                    max_fee_per_gas: U256::from(s.max_fee_per_gas),
+                    max_priority_fee_per_gas: U256::from(s.max_priority_fee_per_gas),
+                    data: Bytes::from(s.input().to_vec()),
+                    access_list: s.access_list.clone(),
+                    authorization_list: s.authorization_list.clone(),
+                }))
+            }
+            OpTxEnvelope::ZkSequencer(s) => Self::try_from(s.inner()),
+            OpTxEnvelope::Deposit(_) => {
+                Err(SpanBatchError::Decoding(SpanDecodingError::InvalidTransactionType))
+            }
         }
     }
 
@@ -170,4 +254,79 @@ impl SpanBatchTransactionData {
             }
         })
     }
+
+    /// Converts the [`SpanBatchTransactionData`] into a canonical zk-backed sequencer transaction.
+    pub fn to_zk_tx(
+        &self,
+        sender: Address,
+        nonce: u64,
+        gas: u64,
+        to: Option<Address>,
+        chain_id: u64,
+        is_protected: bool,
+    ) -> Result<TxZkSequencer, SpanBatchError> {
+        let body = match self {
+            Self::Legacy(data) => ZkSequencerTxBody::Legacy(TxLegacy {
+                chain_id: is_protected.then_some(chain_id),
+                nonce,
+                gas_price: u256_to_u128(data.gas_price)?,
+                gas_limit: gas,
+                to: to.map_or(alloy_primitives::TxKind::Create, alloy_primitives::TxKind::Call),
+                value: data.value,
+                input: data.data.clone().into(),
+            }),
+            Self::Eip2930(data) => ZkSequencerTxBody::Eip2930(TxEip2930 {
+                chain_id,
+                nonce,
+                gas_price: u256_to_u128(data.gas_price)?,
+                gas_limit: gas,
+                to: to.map_or(alloy_primitives::TxKind::Create, alloy_primitives::TxKind::Call),
+                value: data.value,
+                input: data.data.clone().into(),
+                access_list: data.access_list.clone(),
+            }),
+            Self::Eip1559(data) => ZkSequencerTxBody::Eip1559(TxEip1559 {
+                chain_id,
+                nonce,
+                max_fee_per_gas: u256_to_u128(data.max_fee_per_gas)?,
+                max_priority_fee_per_gas: u256_to_u128(data.max_priority_fee_per_gas)?,
+                gas_limit: gas,
+                to: to.map_or(alloy_primitives::TxKind::Create, alloy_primitives::TxKind::Call),
+                value: data.value,
+                input: data.data.clone().into(),
+                access_list: data.access_list.clone(),
+            }),
+            Self::Eip7702(data) => {
+                let Some(to) = to else {
+                    return Err(SpanBatchError::Decoding(
+                        SpanDecodingError::InvalidTransactionData,
+                    ));
+                };
+                ZkSequencerTxBody::Eip7702(TxEip7702 {
+                    chain_id,
+                    nonce,
+                    max_fee_per_gas: u256_to_u128(data.max_fee_per_gas)?,
+                    max_priority_fee_per_gas: u256_to_u128(data.max_priority_fee_per_gas)?,
+                    gas_limit: gas,
+                    to,
+                    value: data.value,
+                    input: data.data.clone().into(),
+                    access_list: data.access_list.clone(),
+                    authorization_list: data.authorization_list.clone(),
+                })
+            }
+        };
+
+        Ok(TxZkSequencer::new(sender, body))
+    }
+}
+
+fn u256_to_u128(value: U256) -> Result<u128, SpanBatchError> {
+    u128::from_be_bytes(
+        value.to_be_bytes::<32>()[16..]
+            .try_into()
+            .map_err(|_| SpanBatchError::Decoding(SpanDecodingError::InvalidTransactionData))?,
+    )
+    .try_into()
+    .map_err(|_| SpanBatchError::Decoding(SpanDecodingError::InvalidTransactionData))
 }

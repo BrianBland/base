@@ -146,7 +146,7 @@ impl EncoderConfig {
     ) -> Result<(), EncoderConfigError> {
         self.validate()?;
 
-        if matches!(self.batch_type, BatchType::Span)
+        if matches!(self.batch_type, BatchType::Span | BatchType::ZkSpan)
             && !rollup_config.is_fjord_active(next_l2_timestamp)
         {
             return rollup_config.hardforks.fjord_time.map_or(
@@ -201,7 +201,7 @@ pub enum EncoderConfigError {
         /// The configured approximate compression ratio.
         approx_compr_ratio: f64,
     },
-    /// `batch_type == BatchType::Span` before Fjord activates.
+    /// `batch_type == BatchType::Span | BatchType::ZkSpan` before Fjord activates.
     #[error(
         "span batches require Fjord to be active for the next L2 block; \
          next_l2_timestamp ({next_l2_timestamp}) is before fjord_time ({fjord_time})"
@@ -212,7 +212,7 @@ pub enum EncoderConfigError {
         /// The configured Fjord activation timestamp.
         fjord_time: u64,
     },
-    /// `batch_type == BatchType::Span` but Fjord is not scheduled.
+    /// `batch_type == BatchType::Span | BatchType::ZkSpan` but Fjord is not scheduled.
     #[error(
         "span batches require Fjord to be scheduled and active for the next L2 block; \
          next_l2_timestamp is {next_l2_timestamp}"

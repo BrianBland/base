@@ -412,6 +412,27 @@ where
                 };
                 Ok(nb)
             }
+            Batch::ZkSpan(sb) => {
+                let batches = match sb.get_singular_batches(&self.l1_blocks, parent).map_err(|e| {
+                    PipelineError::BadEncoding(PipelineEncodingError::SpanBatchError(e)).crit()
+                }) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Err(e);
+                    }
+                };
+                self.next_spans = batches;
+                let nb = match self
+                    .pop_next_batch(parent)
+                    .ok_or(PipelineError::BatchQueueEmpty.crit())
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Err(e);
+                    }
+                };
+                Ok(nb)
+            }
         }
     }
 

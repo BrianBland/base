@@ -5,7 +5,8 @@ use alloy_rlp::{Buf, Decodable, Encodable};
 use base_consensus_genesis::RollupConfig;
 
 use crate::{
-    BatchDecodingError, BatchEncodingError, BatchType, RawSpanBatch, SingleBatch, SpanBatch,
+    BatchDecodingError, BatchEncodingError, BatchType, RawSpanBatch, RawZkSpanBatch, SingleBatch,
+    SpanBatch, ZkSpanBatch,
 };
 
 /// A Batch.
@@ -16,6 +17,8 @@ pub enum Batch {
     Single(SingleBatch),
     /// Span Batches
     Span(SpanBatch),
+    /// ZK span batches
+    ZkSpan(ZkSpanBatch),
 }
 
 impl core::fmt::Display for Batch {
@@ -23,6 +26,7 @@ impl core::fmt::Display for Batch {
         match self {
             Self::Single(_) => write!(f, "single"),
             Self::Span(_) => write!(f, "span"),
+            Self::ZkSpan(_) => write!(f, "zk-span"),
         }
     }
 }
@@ -33,6 +37,7 @@ impl Batch {
         match self {
             Self::Single(sb) => sb.timestamp,
             Self::Span(sb) => sb.starting_timestamp(),
+            Self::ZkSpan(sb) => sb.starting_timestamp(),
         }
     }
 
@@ -59,6 +64,13 @@ impl Batch {
                     .map_err(BatchDecodingError::SpanBatchError)?;
                 Ok(Self::Span(span_batch))
             }
+            BatchType::ZkSpan => {
+                let mut raw_zk_span_batch = RawZkSpanBatch::decode(r)?;
+                let zk_span_batch = raw_zk_span_batch
+                    .derive(cfg.block_time, cfg.genesis.l2_time, cfg.l2_chain_id.id())
+                    .map_err(BatchDecodingError::SpanBatchError)?;
+                Ok(Self::ZkSpan(zk_span_batch))
+            }
         }
     }
 
@@ -75,6 +87,12 @@ impl Batch {
                     sb.to_raw_span_batch().map_err(BatchEncodingError::SpanBatchError)?;
                 raw_span_batch.encode(out).map_err(BatchEncodingError::SpanBatchError)?;
             }
+            Self::ZkSpan(sb) => {
+                out.put_u8(BatchType::ZkSpan as u8);
+                let raw_zk_span_batch =
+                    sb.to_raw_zk_span_batch().map_err(BatchEncodingError::SpanBatchError)?;
+                raw_zk_span_batch.encode(out).map_err(BatchEncodingError::SpanBatchError)?;
+            }
         }
         Ok(())
     }
@@ -84,11 +102,15 @@ impl Batch {
 mod tests {
     use alloc::{vec, vec::Vec};
 
-    use alloy_consensus::{Signed, TxEip2930, TxEnvelope};
+    use alloy_consensus::{
+        Signed, TxEip1559, TxEip2930, TxEnvelope, proofs::ordered_trie_root_encoded,
+    };
+    use alloy_eips::eip2718::Encodable2718;
     use alloy_primitives::{Bytes, Signature, TxKind, address, hex};
+    use base_alloy_consensus::{OpTxEnvelope, TxZkSequencer, ZkSequencerTxBody};
 
     use super::*;
-    use crate::{SpanBatchElement, SpanBatchError, SpanBatchTransactions};
+    use crate::{SpanBatchElement, SpanBatchError, SpanBatchTransactions, ZkSpanBatchTransactions};
 
     #[test]
     fn test_single_batch_encode_decode() {
@@ -141,5 +163,59 @@ mod tests {
         // Fails to even encode an empty span batch - decoding will do the same
         let err = batch.encode(&mut out).unwrap_err();
         assert_eq!(BatchEncodingError::SpanBatchError(SpanBatchError::EmptySpanBatch), err);
+    }
+
+    #[test]
+    fn test_zk_span_batch_encode_decode() {
+        let sender = address!("1111111111111111111111111111111111111111");
+        let to = address!("0123456789012345678901234567890123456789");
+        let tx = OpTxEnvelope::from(TxZkSequencer::new(
+            sender,
+            ZkSequencerTxBody::Eip1559(TxEip1559 {
+                chain_id: 1,
+                nonce: 1,
+                gas_limit: 21_000,
+                max_fee_per_gas: 2,
+                max_priority_fee_per_gas: 1,
+                to: TxKind::Call(to),
+                ..Default::default()
+            }),
+        ));
+        let mut tx_buf = Vec::new();
+        tx.encode_2718(&mut tx_buf);
+
+        let mut zk_txs = ZkSpanBatchTransactions::default();
+        zk_txs.add_txs(vec![Bytes::from(tx_buf.clone())], 1).unwrap();
+
+        let batch = Batch::ZkSpan(ZkSpanBatch {
+            parent_check: [2u8; 20].into(),
+            l1_origin_check: [3u8; 20].into(),
+            genesis_timestamp: 10,
+            chain_id: 1,
+            batches: vec![SpanBatchElement {
+                epoch_num: 100,
+                timestamp: 20,
+                transactions: vec![tx_buf.clone().into()],
+            }],
+            origin_bits: crate::SpanBatchBits::new(vec![1]),
+            block_tx_counts: vec![1],
+            txs: zk_txs,
+            tx_roots: vec![ordered_trie_root_encoded(&[tx_buf])],
+            proof: vec![0xAA, 0xBB],
+        });
+
+        let mut out = Vec::new();
+        batch.encode(&mut out).unwrap();
+        let decoded = Batch::decode(
+            &mut out.as_slice(),
+            &RollupConfig {
+                genesis: base_consensus_genesis::ChainGenesis { l2_time: 10, ..Default::default() },
+                l2_chain_id: 1u64.into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(batch, decoded);
     }
 }

@@ -9,6 +9,7 @@
 //! The batch type is encoded as a single byte:
 //! - `0x00` for a `SingleBatch`
 //! - `0x01` for a `SpanBatch`
+//! - `0x02` for a `ZkSpanBatch`
 
 use alloy_rlp::{Decodable, Encodable};
 
@@ -17,6 +18,9 @@ pub const SINGLE_BATCH_TYPE: u8 = 0x00;
 
 /// The span batch type identifier.
 pub const SPAN_BATCH_TYPE: u8 = 0x01;
+
+/// The zk span batch type identifier.
+pub const ZK_SPAN_BATCH_TYPE: u8 = 0x02;
 
 /// The Batch Type.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -27,6 +31,8 @@ pub enum BatchType {
     Single = SINGLE_BATCH_TYPE,
     /// Span Batch.
     Span = SPAN_BATCH_TYPE,
+    /// ZK Span Batch.
+    ZkSpan = ZK_SPAN_BATCH_TYPE,
 }
 
 impl From<u8> for BatchType {
@@ -34,6 +40,7 @@ impl From<u8> for BatchType {
         match val {
             SINGLE_BATCH_TYPE => Self::Single,
             SPAN_BATCH_TYPE => Self::Span,
+            ZK_SPAN_BATCH_TYPE => Self::ZkSpan,
             _ => panic!("Invalid batch type: {val}"),
         }
     }
@@ -44,6 +51,7 @@ impl Encodable for BatchType {
         let val = match self {
             Self::Single => SINGLE_BATCH_TYPE,
             Self::Span => SPAN_BATCH_TYPE,
+            Self::ZkSpan => ZK_SPAN_BATCH_TYPE,
         };
         val.encode(out);
     }

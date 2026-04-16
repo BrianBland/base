@@ -8,7 +8,7 @@ use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{B256, Bytes, Signature, TxHash};
 
 use crate::{
-    OpPooledTransaction, TxDeposit,
+    OpPooledTransaction, TxDeposit, TxZkSequencer,
     transaction::{OpDepositInfo, OpTransactionInfo},
 };
 
@@ -42,6 +42,9 @@ pub enum OpTxEnvelope {
     #[envelope(ty = 126)]
     #[serde(serialize_with = "crate::serde_deposit_tx_rpc")]
     Deposit(Sealed<TxDeposit>),
+    /// A [`TxZkSequencer`] tagged with type 0x7F.
+    #[envelope(ty = 127)]
+    ZkSequencer(Sealed<TxZkSequencer>),
 }
 
 /// Represents a transaction envelope for Base chains.
@@ -121,6 +124,12 @@ impl From<TxDeposit> for OpTxEnvelope {
     }
 }
 
+impl From<TxZkSequencer> for OpTxEnvelope {
+    fn from(v: TxZkSequencer) -> Self {
+        v.seal_slow().into()
+    }
+}
+
 impl From<Signed<OpTypedTransaction>> for OpTxEnvelope {
     fn from(value: Signed<OpTypedTransaction>) -> Self {
         let (tx, sig, hash) = value.into_parts();
@@ -142,6 +151,9 @@ impl From<Signed<OpTypedTransaction>> for OpTxEnvelope {
                 Self::Eip7702(tx)
             }
             OpTypedTransaction::Deposit(tx) => Self::Deposit(Sealed::new_unchecked(tx, hash)),
+            OpTypedTransaction::ZkSequencer(tx) => {
+                Self::ZkSequencer(Sealed::new_unchecked(tx, hash))
+            }
         }
     }
 }
@@ -155,6 +167,12 @@ impl From<(OpTypedTransaction, Signature)> for OpTxEnvelope {
 impl From<Sealed<TxDeposit>> for OpTxEnvelope {
     fn from(v: Sealed<TxDeposit>) -> Self {
         Self::Deposit(v)
+    }
+}
+
+impl From<Sealed<TxZkSequencer>> for OpTxEnvelope {
+    fn from(v: Sealed<TxZkSequencer>) -> Self {
+        Self::ZkSequencer(v)
     }
 }
 
@@ -188,6 +206,7 @@ impl From<OpTxEnvelope> for alloy_rpc_types_eth::TransactionRequest {
             OpTxEnvelope::Eip1559(tx) => tx.into_parts().0.into(),
             OpTxEnvelope::Eip7702(tx) => tx.into_parts().0.into(),
             OpTxEnvelope::Deposit(tx) => tx.into_inner().into(),
+            OpTxEnvelope::ZkSequencer(tx) => tx.into_inner().into(),
             OpTxEnvelope::Legacy(tx) => tx.into_parts().0.into(),
         }
     }
@@ -253,6 +272,9 @@ impl OpTxEnvelope {
             Self::Deposit(tx) => {
                 Err(ValueError::new(tx.into(), "Deposit transactions cannot be pooled"))
             }
+            Self::ZkSequencer(tx) => {
+                Err(ValueError::new(tx.into(), "Zk sequencer transactions cannot be pooled"))
+            }
         }
     }
 
@@ -278,6 +300,10 @@ impl OpTxEnvelope {
             tx @ Self::Deposit(_) => Err(ValueError::new(
                 tx,
                 "Deposit transactions cannot be converted to ethereum transaction",
+            )),
+            tx @ Self::ZkSequencer(_) => Err(ValueError::new(
+                tx,
+                "Zk sequencer transactions cannot be converted to ethereum transaction",
             )),
         }
     }
@@ -319,13 +345,14 @@ impl OpTxEnvelope {
     ///
     /// Caution: modifying this will cause side-effects on the hash.
     #[doc(hidden)]
-    pub const fn input_mut(&mut self) -> &mut Bytes {
+    pub fn input_mut(&mut self) -> &mut Bytes {
         match self {
             Self::Eip1559(tx) => &mut tx.tx_mut().input,
             Self::Eip2930(tx) => &mut tx.tx_mut().input,
             Self::Legacy(tx) => &mut tx.tx_mut().input,
             Self::Eip7702(tx) => &mut tx.tx_mut().input,
             Self::Deposit(tx) => &mut tx.inner_mut().input,
+            Self::ZkSequencer(tx) => tx.inner_mut().body.input_mut(),
         }
     }
 
@@ -344,10 +371,13 @@ impl OpTxEnvelope {
             }
             Err(err) => match err.into_value() {
                 alloy_network::AnyTxEnvelope::Unknown(unknown) => {
-                    let Ok(deposit) = unknown.inner.clone().try_into() else {
-                        return Err(alloy_network::AnyTxEnvelope::Unknown(unknown));
+                    let Ok(zk_sequencer) = unknown.inner.clone().try_into() else {
+                        let Ok(deposit) = unknown.inner.clone().try_into() else {
+                            return Err(alloy_network::AnyTxEnvelope::Unknown(unknown));
+                        };
+                        return Ok(Self::Deposit(Sealed::new_unchecked(deposit, unknown.hash)));
                     };
-                    Ok(Self::Deposit(Sealed::new_unchecked(deposit, unknown.hash)))
+                    Ok(Self::ZkSequencer(Sealed::new_unchecked(zk_sequencer, unknown.hash)))
                 }
                 unsupported => Err(unsupported),
             },
@@ -358,6 +388,12 @@ impl OpTxEnvelope {
     #[inline]
     pub const fn is_deposit(&self) -> bool {
         matches!(self, Self::Deposit(_))
+    }
+
+    /// Returns true if the transaction is a zk-backed sequencer transaction.
+    #[inline]
+    pub const fn is_zk_sequencer(&self) -> bool {
+        matches!(self, Self::ZkSequencer(_))
     }
 
     /// Returns the [`TxLegacy`] variant if the transaction is a legacy transaction.
@@ -392,6 +428,14 @@ impl OpTxEnvelope {
         }
     }
 
+    /// Returns the [`TxZkSequencer`] variant if the transaction is zk-backed.
+    pub const fn as_zk_sequencer(&self) -> Option<&Sealed<TxZkSequencer>> {
+        match self {
+            Self::ZkSequencer(tx) => Some(tx),
+            _ => None,
+        }
+    }
+
     /// Return the reference to signature.
     ///
     /// Returns `None` if this is a deposit variant.
@@ -402,6 +446,7 @@ impl OpTxEnvelope {
             Self::Eip1559(tx) => Some(tx.signature()),
             Self::Eip7702(tx) => Some(tx.signature()),
             Self::Deposit(_) => None,
+            Self::ZkSequencer(_) => None,
         }
     }
 
@@ -413,6 +458,7 @@ impl OpTxEnvelope {
             Self::Eip1559(_) => OpTxType::Eip1559,
             Self::Eip7702(_) => OpTxType::Eip7702,
             Self::Deposit(_) => OpTxType::Deposit,
+            Self::ZkSequencer(_) => OpTxType::ZkSequencer,
         }
     }
 
@@ -424,6 +470,7 @@ impl OpTxEnvelope {
             Self::Eip2930(tx) => tx.hash(),
             Self::Eip7702(tx) => tx.hash(),
             Self::Deposit(tx) => tx.hash_ref(),
+            Self::ZkSequencer(tx) => tx.hash_ref(),
         }
     }
 
@@ -440,6 +487,7 @@ impl OpTxEnvelope {
             Self::Eip1559(t) => t.eip2718_encoded_length(),
             Self::Eip7702(t) => t.eip2718_encoded_length(),
             Self::Deposit(t) => t.eip2718_encoded_length(),
+            Self::ZkSequencer(t) => t.eip2718_encoded_length(),
         }
     }
 }
@@ -463,6 +511,7 @@ impl alloy_consensus::transaction::SignerRecoverable for OpTxEnvelope {
             // The Deposit transaction does not have a signature. Directly return the
             // `from` address.
             Self::Deposit(tx) => return Ok(tx.from),
+            Self::ZkSequencer(tx) => return Ok(tx.sender),
         };
         let signature = match self {
             Self::Legacy(tx) => tx.signature(),
@@ -470,6 +519,9 @@ impl alloy_consensus::transaction::SignerRecoverable for OpTxEnvelope {
             Self::Eip1559(tx) => tx.signature(),
             Self::Eip7702(tx) => tx.signature(),
             Self::Deposit(_) => unreachable!("Deposit transactions should not be handled here"),
+            Self::ZkSequencer(_) => {
+                unreachable!("Zk sequencer transactions should not be handled here")
+            }
         };
         alloy_consensus::crypto::secp256k1::recover_signer(signature, signature_hash)
     }
@@ -485,6 +537,7 @@ impl alloy_consensus::transaction::SignerRecoverable for OpTxEnvelope {
             // The Deposit transaction does not have a signature. Directly return the
             // `from` address.
             Self::Deposit(tx) => return Ok(tx.from),
+            Self::ZkSequencer(tx) => return Ok(tx.sender),
         };
         let signature = match self {
             Self::Legacy(tx) => tx.signature(),
@@ -492,6 +545,9 @@ impl alloy_consensus::transaction::SignerRecoverable for OpTxEnvelope {
             Self::Eip1559(tx) => tx.signature(),
             Self::Eip7702(tx) => tx.signature(),
             Self::Deposit(_) => unreachable!("Deposit transactions should not be handled here"),
+            Self::ZkSequencer(_) => {
+                unreachable!("Zk sequencer transactions should not be handled here")
+            }
         };
         alloy_consensus::crypto::secp256k1::recover_signer_unchecked(signature, signature_hash)
     }
@@ -514,6 +570,7 @@ impl alloy_consensus::transaction::SignerRecoverable for OpTxEnvelope {
                 alloy_consensus::transaction::SignerRecoverable::recover_unchecked_with_buf(tx, buf)
             }
             Self::Deposit(tx) => Ok(tx.from),
+            Self::ZkSequencer(tx) => Ok(tx.sender),
         }
     }
 }
@@ -529,7 +586,7 @@ pub(crate) mod serde_bincode_compat {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use serde_with::{DeserializeAs, SerializeAs};
 
-    use crate::serde_bincode_compat::TxDeposit;
+    use crate::serde_bincode_compat::{TxDeposit, TxZkSequencer};
 
     /// Bincode-compatible representation of an [`OpTxEnvelope`].
     #[derive(Debug, Serialize, Deserialize)]
@@ -569,6 +626,13 @@ pub(crate) mod serde_bincode_compat {
             /// Borrowed deposit transaction data.
             transaction: TxDeposit<'a>,
         },
+        /// Zk sequencer variant.
+        ZkSequencer {
+            /// Precomputed hash.
+            hash: B256,
+            /// Borrowed zk sequencer transaction data.
+            transaction: TxZkSequencer,
+        },
     }
 
     impl<'a> From<&'a super::OpTxEnvelope> for OpTxEnvelope<'a> {
@@ -594,6 +658,10 @@ pub(crate) mod serde_bincode_compat {
                     hash: sealed_deposit.seal(),
                     transaction: sealed_deposit.inner().into(),
                 },
+                super::OpTxEnvelope::ZkSequencer(sealed_zk_tx) => Self::ZkSequencer {
+                    hash: sealed_zk_tx.seal(),
+                    transaction: sealed_zk_tx.inner().into(),
+                },
             }
         }
     }
@@ -615,6 +683,9 @@ pub(crate) mod serde_bincode_compat {
                 }
                 OpTxEnvelope::Deposit { hash, transaction } => {
                     Self::Deposit(Sealed::new_unchecked(transaction.into(), hash))
+                }
+                OpTxEnvelope::ZkSequencer { hash, transaction } => {
+                    Self::ZkSequencer(Sealed::new_unchecked(transaction.into(), hash))
                 }
             }
         }

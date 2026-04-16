@@ -1,5 +1,7 @@
 //! Step result and error types for the batcher pipeline.
 
+use alloy_consensus::crypto::RecoveryError;
+
 /// Result of a [`BatchPipeline::step`](crate::BatchPipeline::step) call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepResult {
@@ -30,4 +32,28 @@ pub enum StepError {
         #[source]
         source: base_comp::BatchComposeError,
     },
+    /// A sequencer transaction could not be converted into the canonical zk-backed form.
+    #[error("zk transaction conversion failed for block at cursor {cursor}: {source}")]
+    ZkTransactionConversionFailed {
+        /// Index of the block in the encoder's input queue.
+        cursor: usize,
+        /// Underlying conversion error.
+        #[source]
+        source: ZkTransactionConversionError,
+    },
+}
+
+/// Returned when the batcher cannot convert a sequencer transaction into its canonical zk-backed
+/// representation.
+#[derive(Debug, thiserror::Error)]
+pub enum ZkTransactionConversionError {
+    /// Failed to decode a batch transaction.
+    #[error("failed to decode batch transaction bytes")]
+    Decode,
+    /// Failed to recover the signer of a signed transaction.
+    #[error("failed to recover batch transaction signer: {0}")]
+    RecoverSigner(#[source] RecoveryError),
+    /// Deposits must never appear in a sequencer batch's transaction list.
+    #[error("unexpected deposit transaction in sequencer batch")]
+    Deposit,
 }

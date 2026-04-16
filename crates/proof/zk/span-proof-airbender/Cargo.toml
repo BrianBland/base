@@ -1,0 +1,125 @@
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+homepage = "https://github.com/base/base"
+repository = "https://github.com/base/base"
+
+[workspace]
+members = ["guest"]
+resolver = "2"
+
+[workspace.dependencies]
+base-protocol = { path = "../../../consensus/protocol", default-features = false }
+base-zk-span-proof = { path = "../span-proof" }
+base-alloy-consensus = { path = "../../../common/consensus", default-features = false }
+
+airbender-host = { git = "https://github.com/matter-labs/airbender-platform", rev = "7e559f9572267c124ed2a3dc2926b0c088e5f8d0", default-features = false }
+airbender = { package = "airbender-sdk", git = "https://github.com/matter-labs/airbender-platform", rev = "7e559f9572267c124ed2a3dc2926b0c088e5f8d0" }
+
+alloy-signer = "1.6.3"
+alloy-eips = { version = "1.6.3", default-features = false }
+alloy-consensus = { version = "1.6.3", default-features = false }
+alloy-signer-local = "1.6.3"
+alloy-primitives = { version = "1.5.6", default-features = false }
+
+serde = { version = "1.0.228", default-features = false }
+thiserror = { version = "2.0", default-features = false }
+
+[workspace.lints.rust]
+missing-debug-implementations = "warn"
+missing-docs = "warn"
+unreachable-pub = "warn"
+unused-must-use = "deny"
+rust-2018-idioms = "deny"
+unnameable-types = "warn"
+
+[workspace.lints.rustdoc]
+all = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+missing-const-for-fn = "warn"
+redundant-clone = "warn"
+clone-on-ref-ptr = "warn"
+unnecessary-to-owned = "warn"
+cloned-instead-of-copied = "warn"
+flat-map-option = "warn"
+implicit-clone = "warn"
+or-fun-call = "warn"
+wildcard-imports = "warn"
+use-self = "warn"
+option-if-let-else = "warn"
+uninlined-format-args = "warn"
+manual-string-new = "warn"
+single-char-pattern = "warn"
+redundant-else = "warn"
+match-same-arms = "warn"
+undocumented-unsafe-blocks = "warn"
+doc-markdown = "warn"
+dbg-macro = "warn"
+branches-sharing-code = "warn"
+derive-partial-eq-without-eq = "warn"
+explicit-into-iter-loop = "warn"
+explicit-iter-loop = "warn"
+iter-with-drain = "warn"
+needless-pass-by-ref-mut = "warn"
+string-lit-as-bytes = "warn"
+
+[profile.dev.package.keccak_special5]
+debug = 0
+
+[profile.dev.package.setups]
+debug = 0
+
+[profile.release.package.keccak_special5]
+debug = 0
+
+[profile.release.package.setups]
+debug = 0
+
+[package]
+name = "base-zk-span-proof-airbender"
+description = "Experimental Airbender prover for zk span batch signature elision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[[example]]
+name = "zk_span_airbender_bench"
+
+[lints]
+workspace = true
+
+[dependencies]
+base-zk-span-proof.workspace = true
+
+airbender-host.workspace = true
+alloy-primitives = { workspace = true, features = ["tiny-keccak"] }
+execution_utils = { git = "https://github.com/matter-labs/zksync-airbender", branch = "dev", optional = true }
+gpu_prover = { git = "https://github.com/matter-labs/zksync-airbender", branch = "dev", optional = true }
+riscv_transpiler = { git = "https://github.com/matter-labs/zksync-airbender", branch = "dev", optional = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+base-alloy-consensus = { workspace = true, features = ["k256", "std"] }
+base-protocol.workspace = true
+
+alloy-consensus = { workspace = true, features = ["k256", "std"] }
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+
+[features]
+default = []
+gpu-prover = [
+  "airbender-host/gpu-prover",
+  "dep:execution_utils",
+  "dep:gpu_prover",
+  "dep:riscv_transpiler",
+]

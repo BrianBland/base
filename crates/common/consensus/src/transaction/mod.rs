@@ -4,7 +4,13 @@ mod deposit;
 pub use deposit::{DepositTransaction, TxDeposit};
 
 mod tx_type;
-pub use tx_type::DEPOSIT_TX_TYPE_ID;
+pub use tx_type::{DEPOSIT_TX_TYPE_ID, ZK_SEQUENCER_TX_TYPE_ID};
+
+mod zk_body;
+pub use zk_body::ZkSequencerTxBody;
+
+mod zk_sequencer;
+pub use zk_sequencer::TxZkSequencer;
 
 mod envelope;
 pub use envelope::{OpTransaction, OpTxEnvelope, OpTxType};
@@ -23,5 +29,9 @@ pub use meta::{OpDepositInfo, OpTransactionInfo};
 /// Bincode-compatible serde implementations for transaction types.
 #[cfg(all(feature = "serde", feature = "serde-bincode-compat"))]
 pub mod serde_bincode_compat {
-    pub use super::{deposit::serde_bincode_compat::TxDeposit, envelope::serde_bincode_compat::*};
+    pub use super::{
+        deposit::serde_bincode_compat::TxDeposit, envelope::serde_bincode_compat::*,
+        zk_body::serde_bincode_compat::ZkSequencerTxBody,
+        zk_sequencer::serde_bincode_compat::TxZkSequencer,
+    };
 }

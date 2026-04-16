@@ -31,6 +31,9 @@ impl NetworkWallet<Base> for EthereumWallet {
             OpTypedTransaction::Deposit(_) => {
                 return Err(alloy_signer::Error::other("not implemented for deposit tx"));
             }
+            OpTypedTransaction::ZkSequencer(_) => {
+                return Err(alloy_signer::Error::other("not implemented for zk sequencer tx"));
+            }
         };
         let tx = NetworkWallet::<Ethereum>::sign_transaction_from(self, sender, tx).await?;
 

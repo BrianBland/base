@@ -6,7 +6,7 @@ use alloy_eips::Encodable2718;
 use alloy_primitives::{B256, ChainId, Signature, TxHash, bytes::BufMut};
 
 pub use crate::transaction::envelope::OpTypedTransaction;
-use crate::{OpTxEnvelope, OpTxType, TxDeposit};
+use crate::{OpTxEnvelope, OpTxType, TxDeposit, TxZkSequencer};
 
 impl From<TxLegacy> for OpTypedTransaction {
     fn from(tx: TxLegacy) -> Self {
@@ -38,6 +38,12 @@ impl From<TxDeposit> for OpTypedTransaction {
     }
 }
 
+impl From<TxZkSequencer> for OpTypedTransaction {
+    fn from(tx: TxZkSequencer) -> Self {
+        Self::ZkSequencer(tx)
+    }
+}
+
 impl From<OpTxEnvelope> for OpTypedTransaction {
     fn from(envelope: OpTxEnvelope) -> Self {
         match envelope {
@@ -46,6 +52,7 @@ impl From<OpTxEnvelope> for OpTypedTransaction {
             OpTxEnvelope::Eip1559(tx) => Self::Eip1559(tx.strip_signature()),
             OpTxEnvelope::Eip7702(tx) => Self::Eip7702(tx.strip_signature()),
             OpTxEnvelope::Deposit(tx) => Self::Deposit(tx.into_inner()),
+            OpTxEnvelope::ZkSequencer(tx) => Self::ZkSequencer(tx.into_inner()),
         }
     }
 }
@@ -67,6 +74,7 @@ impl From<OpTypedTransaction> for alloy_rpc_types_eth::TransactionRequest {
             OpTypedTransaction::Eip1559(tx) => tx.into(),
             OpTypedTransaction::Eip7702(tx) => tx.into(),
             OpTypedTransaction::Deposit(tx) => tx.into(),
+            OpTypedTransaction::ZkSequencer(tx) => tx.into(),
         }
     }
 }
@@ -80,6 +88,7 @@ impl OpTypedTransaction {
             Self::Eip1559(_) => OpTxType::Eip1559,
             Self::Eip7702(_) => OpTxType::Eip7702,
             Self::Deposit(_) => OpTxType::Deposit,
+            Self::ZkSequencer(_) => OpTxType::ZkSequencer,
         }
     }
 
@@ -93,6 +102,7 @@ impl OpTypedTransaction {
             Self::Eip1559(tx) => Some(tx.signature_hash()),
             Self::Eip7702(tx) => Some(tx.signature_hash()),
             Self::Deposit(_) => None,
+            Self::ZkSequencer(_) => None,
         }
     }
 
@@ -128,9 +138,22 @@ impl OpTypedTransaction {
         }
     }
 
+    /// Return the inner zk-backed sequencer transaction if it exists.
+    pub const fn zk_sequencer(&self) -> Option<&TxZkSequencer> {
+        match self {
+            Self::ZkSequencer(tx) => Some(tx),
+            _ => None,
+        }
+    }
+
     /// Returns `true` if transaction is deposit transaction.
     pub const fn is_deposit(&self) -> bool {
         matches!(self, Self::Deposit(_))
+    }
+
+    /// Returns `true` if transaction is zk-backed sequencer transaction.
+    pub const fn is_zk_sequencer(&self) -> bool {
+        matches!(self, Self::ZkSequencer(_))
     }
 
     /// Calculate the transaction hash for the given signature.
@@ -143,6 +166,7 @@ impl OpTypedTransaction {
             Self::Eip1559(tx) => tx.tx_hash(signature),
             Self::Eip7702(tx) => tx.tx_hash(signature),
             Self::Deposit(tx) => tx.tx_hash(),
+            Self::ZkSequencer(tx) => tx.tx_hash(),
         }
     }
 
@@ -177,6 +201,10 @@ impl OpTypedTransaction {
                 tx,
                 "Deposit transactions cannot be converted to ethereum transaction",
             )),
+            tx @ Self::ZkSequencer(_) => Err(ValueError::new(
+                tx,
+                "Zk sequencer transactions cannot be converted to ethereum transaction",
+            )),
         }
     }
 }
@@ -189,6 +217,7 @@ impl RlpEcdsaEncodableTx for OpTypedTransaction {
             Self::Eip1559(tx) => tx.rlp_encoded_fields_length(),
             Self::Eip7702(tx) => tx.rlp_encoded_fields_length(),
             Self::Deposit(tx) => tx.rlp_encoded_fields_length(),
+            Self::ZkSequencer(tx) => tx.rlp_encoded_fields_length(),
         }
     }
 
@@ -199,6 +228,7 @@ impl RlpEcdsaEncodableTx for OpTypedTransaction {
             Self::Eip1559(tx) => tx.rlp_encode_fields(out),
             Self::Eip7702(tx) => tx.rlp_encode_fields(out),
             Self::Deposit(tx) => tx.rlp_encode_fields(out),
+            Self::ZkSequencer(tx) => tx.rlp_encode_fields(out),
         }
     }
 
@@ -209,6 +239,7 @@ impl RlpEcdsaEncodableTx for OpTypedTransaction {
             Self::Eip1559(tx) => tx.eip2718_encode_with_type(signature, tx.ty(), out),
             Self::Eip7702(tx) => tx.eip2718_encode_with_type(signature, tx.ty(), out),
             Self::Deposit(tx) => tx.encode_2718(out),
+            Self::ZkSequencer(tx) => tx.encode_2718(out),
         }
     }
 
@@ -219,6 +250,7 @@ impl RlpEcdsaEncodableTx for OpTypedTransaction {
             Self::Eip1559(tx) => tx.eip2718_encode(signature, out),
             Self::Eip7702(tx) => tx.eip2718_encode(signature, out),
             Self::Deposit(tx) => tx.encode_2718(out),
+            Self::ZkSequencer(tx) => tx.encode_2718(out),
         }
     }
 
@@ -229,6 +261,7 @@ impl RlpEcdsaEncodableTx for OpTypedTransaction {
             Self::Eip1559(tx) => tx.network_encode_with_type(signature, tx.ty(), out),
             Self::Eip7702(tx) => tx.network_encode_with_type(signature, tx.ty(), out),
             Self::Deposit(tx) => tx.network_encode(out),
+            Self::ZkSequencer(tx) => tx.network_encode(out),
         }
     }
 
@@ -239,6 +272,7 @@ impl RlpEcdsaEncodableTx for OpTypedTransaction {
             Self::Eip1559(tx) => tx.network_encode(signature, out),
             Self::Eip7702(tx) => tx.network_encode(signature, out),
             Self::Deposit(tx) => tx.network_encode(out),
+            Self::ZkSequencer(tx) => tx.network_encode(out),
         }
     }
 
@@ -249,6 +283,7 @@ impl RlpEcdsaEncodableTx for OpTypedTransaction {
             Self::Eip1559(tx) => tx.tx_hash_with_type(signature, tx.ty()),
             Self::Eip7702(tx) => tx.tx_hash_with_type(signature, tx.ty()),
             Self::Deposit(tx) => tx.tx_hash(),
+            Self::ZkSequencer(tx) => tx.tx_hash(),
         }
     }
 
@@ -259,6 +294,7 @@ impl RlpEcdsaEncodableTx for OpTypedTransaction {
             Self::Eip1559(tx) => tx.tx_hash(signature),
             Self::Eip7702(tx) => tx.tx_hash(signature),
             Self::Deposit(tx) => tx.tx_hash(),
+            Self::ZkSequencer(tx) => tx.tx_hash(),
         }
     }
 }
@@ -271,6 +307,7 @@ impl SignableTransaction<Signature> for OpTypedTransaction {
             Self::Eip1559(tx) => tx.set_chain_id(chain_id),
             Self::Eip7702(tx) => tx.set_chain_id(chain_id),
             Self::Deposit(_) => {}
+            Self::ZkSequencer(_) => {}
         }
     }
 
@@ -281,6 +318,7 @@ impl SignableTransaction<Signature> for OpTypedTransaction {
             Self::Eip1559(tx) => tx.encode_for_signing(out),
             Self::Eip7702(tx) => tx.encode_for_signing(out),
             Self::Deposit(_) => {}
+            Self::ZkSequencer(_) => {}
         }
     }
 
@@ -291,6 +329,7 @@ impl SignableTransaction<Signature> for OpTypedTransaction {
             Self::Eip1559(tx) => tx.payload_len_for_signature(),
             Self::Eip7702(tx) => tx.payload_len_for_signature(),
             Self::Deposit(_) => 0,
+            Self::ZkSequencer(_) => 0,
         }
     }
 

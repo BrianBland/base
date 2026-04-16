@@ -37,6 +37,9 @@ pub enum OpReceipt<T = Log> {
     /// Deposit receipt
     #[cfg_attr(feature = "serde", serde(rename = "0x7e", alias = "0x7E"))]
     Deposit(OpDepositReceipt<T>),
+    /// Zk sequencer receipt.
+    #[cfg_attr(feature = "serde", serde(rename = "0x7f", alias = "0x7F"))]
+    ZkSequencer(Receipt<T>),
 }
 
 impl<T> OpReceipt<T> {
@@ -48,6 +51,7 @@ impl<T> OpReceipt<T> {
             Self::Eip1559(_) => OpTxType::Eip1559,
             Self::Eip7702(_) => OpTxType::Eip7702,
             Self::Deposit(_) => OpTxType::Deposit,
+            Self::ZkSequencer(_) => OpTxType::ZkSequencer,
         }
     }
 
@@ -57,7 +61,8 @@ impl<T> OpReceipt<T> {
             Self::Legacy(receipt)
             | Self::Eip2930(receipt)
             | Self::Eip1559(receipt)
-            | Self::Eip7702(receipt) => receipt,
+            | Self::Eip7702(receipt)
+            | Self::ZkSequencer(receipt) => receipt,
             Self::Deposit(receipt) => &receipt.inner,
         }
     }
@@ -68,7 +73,8 @@ impl<T> OpReceipt<T> {
             Self::Legacy(receipt)
             | Self::Eip2930(receipt)
             | Self::Eip1559(receipt)
-            | Self::Eip7702(receipt) => receipt,
+            | Self::Eip7702(receipt)
+            | Self::ZkSequencer(receipt) => receipt,
             Self::Deposit(receipt) => &mut receipt.inner,
         }
     }
@@ -79,7 +85,8 @@ impl<T> OpReceipt<T> {
             Self::Legacy(receipt)
             | Self::Eip2930(receipt)
             | Self::Eip1559(receipt)
-            | Self::Eip7702(receipt) => receipt,
+            | Self::Eip7702(receipt)
+            | Self::ZkSequencer(receipt) => receipt,
             Self::Deposit(receipt) => receipt.inner,
         }
     }
@@ -94,6 +101,7 @@ impl<T> OpReceipt<T> {
             Self::Eip1559(receipt) => OpReceipt::Eip1559(receipt.map_logs(f)),
             Self::Eip7702(receipt) => OpReceipt::Eip7702(receipt.map_logs(f)),
             Self::Deposit(receipt) => OpReceipt::Deposit(receipt.map_logs(f)),
+            Self::ZkSequencer(receipt) => OpReceipt::ZkSequencer(receipt.map_logs(f)),
         }
     }
 
@@ -106,7 +114,8 @@ impl<T> OpReceipt<T> {
             Self::Legacy(receipt)
             | Self::Eip2930(receipt)
             | Self::Eip1559(receipt)
-            | Self::Eip7702(receipt) => receipt.rlp_encoded_fields_length_with_bloom(bloom),
+            | Self::Eip7702(receipt)
+            | Self::ZkSequencer(receipt) => receipt.rlp_encoded_fields_length_with_bloom(bloom),
             Self::Deposit(receipt) => receipt.rlp_encoded_fields_length_with_bloom(bloom),
         }
     }
@@ -120,7 +129,8 @@ impl<T> OpReceipt<T> {
             Self::Legacy(receipt)
             | Self::Eip2930(receipt)
             | Self::Eip1559(receipt)
-            | Self::Eip7702(receipt) => receipt.rlp_encode_fields_with_bloom(bloom, out),
+            | Self::Eip7702(receipt)
+            | Self::ZkSequencer(receipt) => receipt.rlp_encode_fields_with_bloom(bloom, out),
             Self::Deposit(receipt) => receipt.rlp_encode_fields_with_bloom(bloom, out),
         }
     }
@@ -176,6 +186,11 @@ impl<T> OpReceipt<T> {
                     RlpDecodableReceipt::rlp_decode_with_bloom(buf)?;
                 Ok(ReceiptWithBloom { receipt: Self::Deposit(receipt), logs_bloom })
             }
+            OpTxType::ZkSequencer => {
+                let ReceiptWithBloom { receipt, logs_bloom } =
+                    RlpDecodableReceipt::rlp_decode_with_bloom(buf)?;
+                Ok(ReceiptWithBloom { receipt: Self::ZkSequencer(receipt), logs_bloom })
+            }
         }
     }
 
@@ -189,7 +204,8 @@ impl<T> OpReceipt<T> {
             Self::Legacy(receipt)
             | Self::Eip2930(receipt)
             | Self::Eip1559(receipt)
-            | Self::Eip7702(receipt) => {
+            | Self::Eip7702(receipt)
+            | Self::ZkSequencer(receipt) => {
                 receipt.status.encode(out);
                 receipt.cumulative_gas_used.encode(out);
                 receipt.logs.encode(out);
@@ -218,7 +234,8 @@ impl<T> OpReceipt<T> {
                 Self::Legacy(receipt)
                 | Self::Eip2930(receipt)
                 | Self::Eip1559(receipt)
-                | Self::Eip7702(receipt) => {
+                | Self::Eip7702(receipt)
+                | Self::ZkSequencer(receipt) => {
                     receipt.status.length()
                         + receipt.cumulative_gas_used.length()
                         + receipt.logs.length()
@@ -264,6 +281,9 @@ impl<T> OpReceipt<T> {
                 deposit_nonce,
                 deposit_receipt_version,
             })),
+            OpTxType::ZkSequencer => {
+                Ok(Self::ZkSequencer(Receipt { status, cumulative_gas_used, logs }))
+            }
         }
     }
 }
@@ -403,7 +423,8 @@ impl<T: Send + Sync + Clone + Debug + Eq + AsRef<Log>> TxReceipt for OpReceipt<T
             Self::Legacy(receipt)
             | Self::Eip2930(receipt)
             | Self::Eip1559(receipt)
-            | Self::Eip7702(receipt) => receipt.logs,
+            | Self::Eip7702(receipt)
+            | Self::ZkSequencer(receipt) => receipt.logs,
             Self::Deposit(receipt) => receipt.inner.logs,
         }
     }
@@ -449,6 +470,7 @@ impl From<super::OpReceiptEnvelope> for OpReceipt {
                 deposit_receipt_version: receipt.receipt.deposit_receipt_version,
                 inner: receipt.receipt.inner,
             }),
+            super::OpReceiptEnvelope::ZkSequencer(receipt) => Self::ZkSequencer(receipt.receipt),
         }
     }
 }
@@ -462,6 +484,9 @@ impl<T> From<ReceiptWithBloom<OpReceipt<T>>> for OpReceiptEnvelope<T> {
             OpReceipt::Eip1559(receipt) => Self::Eip1559(ReceiptWithBloom { receipt, logs_bloom }),
             OpReceipt::Eip7702(receipt) => Self::Eip7702(ReceiptWithBloom { receipt, logs_bloom }),
             OpReceipt::Deposit(receipt) => Self::Deposit(ReceiptWithBloom { receipt, logs_bloom }),
+            OpReceipt::ZkSequencer(receipt) => {
+                Self::ZkSequencer(ReceiptWithBloom { receipt, logs_bloom })
+            }
         }
     }
 }
@@ -499,6 +524,8 @@ pub(crate) mod serde_bincode_compat {
         Eip7702(alloy_consensus::serde_bincode_compat::Receipt<'a, alloy_primitives::Log>),
         /// Deposit receipt
         Deposit(crate::serde_bincode_compat::OpDepositReceipt<'a, alloy_primitives::Log>),
+        /// Zk sequencer receipt
+        ZkSequencer(alloy_consensus::serde_bincode_compat::Receipt<'a, alloy_primitives::Log>),
     }
 
     impl<'a> From<&'a super::OpReceipt> for OpReceipt<'a> {
@@ -509,6 +536,7 @@ pub(crate) mod serde_bincode_compat {
                 super::OpReceipt::Eip1559(receipt) => Self::Eip1559(receipt.into()),
                 super::OpReceipt::Eip7702(receipt) => Self::Eip7702(receipt.into()),
                 super::OpReceipt::Deposit(receipt) => Self::Deposit(receipt.into()),
+                super::OpReceipt::ZkSequencer(receipt) => Self::ZkSequencer(receipt.into()),
             }
         }
     }
@@ -521,6 +549,7 @@ pub(crate) mod serde_bincode_compat {
                 OpReceipt::Eip1559(receipt) => Self::Eip1559(receipt.into()),
                 OpReceipt::Eip7702(receipt) => Self::Eip7702(receipt.into()),
                 OpReceipt::Deposit(receipt) => Self::Deposit(receipt.into()),
+                OpReceipt::ZkSequencer(receipt) => Self::ZkSequencer(receipt.into()),
             }
         }
     }

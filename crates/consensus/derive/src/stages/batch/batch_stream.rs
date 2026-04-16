@@ -7,7 +7,7 @@ use alloy_eips::BlockNumHash;
 use async_trait::async_trait;
 use base_consensus_genesis::{RollupConfig, SystemConfig};
 use base_protocol::{
-    Batch, BatchValidity, BatchWithInclusionBlock, BlockInfo, L2BlockInfo, SingleBatch, SpanBatch,
+    Batch, BatchValidity, BatchWithInclusionBlock, BlockInfo, L2BlockInfo, SingleBatch,
     SpanBatchError,
 };
 
@@ -43,8 +43,8 @@ where
 {
     /// The previous stage in the derivation pipeline.
     pub prev: P,
-    /// There can only be a single staged span batch.
-    pub span: Option<SpanBatch>,
+    /// There can only be a single staged span-like batch.
+    pub span: Option<Batch>,
     /// A buffer of single batches derived from the [`SpanBatch`].
     pub buffer: VecDeque<SingleBatch>,
     /// A reference to the rollup config, used to check
@@ -91,7 +91,15 @@ where
         l1_origins: &[BlockInfo],
     ) -> Result<(), SpanBatchError> {
         if let Some(span) = self.span.take() {
-            self.buffer.extend(span.get_singular_batches(l1_origins, parent)?);
+            match span {
+                Batch::Span(span) => {
+                    self.buffer.extend(span.get_singular_batches(l1_origins, parent)?)
+                }
+                Batch::ZkSpan(span) => {
+                    self.buffer.extend(span.get_singular_batches(l1_origins, parent)?)
+                }
+                Batch::Single(_) => panic!("invalid staged batch state"),
+            }
         }
         let batch_count = self.buffer.len() as f64;
         Metrics::pipeline_batch_buffer().set(batch_count);
@@ -159,9 +167,43 @@ where
                     Metrics::pipeline_batch_validity(validity.to_string()).increment(1.0);
 
                     match validity {
-                        BatchValidity::Accept => self.span = Some(b),
+                        BatchValidity::Accept => self.span = Some(Batch::Span(b)),
                         BatchValidity::Drop(_) => {
                             // Flush the stage.
+                            self.flush();
+
+                            return Err(PipelineError::NotEnoughData.temp());
+                        }
+                        BatchValidity::Past => {
+                            if !self.is_active()? {
+                                error!(target: "batch_stream", "BatchValidity::Past is not allowed pre-holocene");
+                                return Err(PipelineError::InvalidBatchValidity.crit());
+                            }
+
+                            return Err(PipelineError::NotEnoughData.temp());
+                        }
+                        BatchValidity::Undecided | BatchValidity::Future => {
+                            return Err(PipelineError::NotEnoughData.temp());
+                        }
+                    }
+                }
+                Batch::ZkSpan(b) => {
+                    let (validity, _) =
+                        base_metrics::time!(Metrics::pipeline_check_batch_prefix(), {
+                            b.check_batch_prefix(
+                                self.config.as_ref(),
+                                l1_origins,
+                                parent,
+                                &batch_with_inclusion.inclusion_block,
+                                &mut self.fetcher,
+                            )
+                            .await
+                        });
+                    Metrics::pipeline_batch_validity(validity.to_string()).increment(1.0);
+
+                    match validity {
+                        BatchValidity::Accept => self.span = Some(Batch::ZkSpan(b)),
+                        BatchValidity::Drop(_) => {
                             self.flush();
 
                             return Err(PipelineError::NotEnoughData.temp());
@@ -266,8 +308,8 @@ mod tests {
     use alloy_primitives::{FixedBytes, b256};
     use base_alloy_consensus::BaseBlock;
     use base_consensus_genesis::{ChainGenesis, HardForkConfig, SystemConfig};
-    use base_protocol::{SingleBatch, SpanBatchElement};
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    use base_protocol::{SingleBatch, SpanBatch, SpanBatchElement};
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
     use crate::{
@@ -284,7 +326,7 @@ mod tests {
         let prev = TestBatchStreamProvider::new(vec![]);
         let mut stream = BatchStream::new(prev, config, TestL2ChainProvider::default());
         stream.buffer.push_back(SingleBatch::default());
-        stream.span = Some(SpanBatch::default());
+        stream.span = Some(Batch::Span(SpanBatch::default()));
         assert!(!stream.buffer.is_empty());
         assert!(stream.span.is_some());
         stream.flush();
@@ -302,7 +344,7 @@ mod tests {
         let mut stream =
             BatchStream::new(prev, Arc::clone(&config), TestL2ChainProvider::default());
         stream.buffer.push_back(SingleBatch::default());
-        stream.span = Some(SpanBatch::default());
+        stream.span = Some(Batch::Span(SpanBatch::default()));
         assert!(!stream.prev.reset);
         stream.reset(BlockNumHash::default(), SystemConfig::default()).await.unwrap();
         assert!(stream.prev.reset);
@@ -320,7 +362,7 @@ mod tests {
         let mut stream =
             BatchStream::new(prev, Arc::clone(&config), TestL2ChainProvider::default());
         stream.buffer.push_back(SingleBatch::default());
-        stream.span = Some(SpanBatch::default());
+        stream.span = Some(Batch::Span(SpanBatch::default()));
         assert!(!stream.prev.flushed);
         stream.flush_channel().await.unwrap();
         assert!(stream.prev.flushed);
@@ -332,7 +374,8 @@ mod tests {
     async fn test_batch_stream_inactive() {
         let trace_store: TraceStorage = Default::default();
         let layer = CollectingLayer::new(trace_store.clone());
-        tracing_subscriber::Registry::default().with(layer).init();
+        let subscriber = tracing_subscriber::Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
 
         let data = vec![Ok(Batch::Single(SingleBatch::default()))];
         let config = Arc::new(RollupConfig {
@@ -435,7 +478,8 @@ mod tests {
     async fn test_span_batch_extraction_error_flushes_stage() {
         let trace_store: TraceStorage = Default::default();
         let layer = CollectingLayer::new(trace_store.clone());
-        tracing_subscriber::Registry::default().with(layer).init();
+        let subscriber = tracing_subscriber::Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
 
         let parent_hash = b256!("1111111111111111111111111111111111111111000000000000000000000000");
         let l1_block_hash =

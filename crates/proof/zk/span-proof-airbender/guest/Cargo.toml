@@ -1,0 +1,24 @@
+[package]
+name = "base-zk-span-proof-airbender-guest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata]
+airbender.profile.release = { panic-immediate-abort = true }
+airbender.profile.debug = { panic-immediate-abort = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+airbender.workspace = true
+alloy-consensus = { workspace = true, features = ["k256"] }
+alloy-eips.workspace = true
+alloy-primitives = { workspace = true, features = ["k256", "serde", "tiny-keccak"] }
+alloy-rlp = { version = "0.3.13", default-features = false }
+serde = { workspace = true, features = ["derive", "alloc"] }

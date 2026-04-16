@@ -2,7 +2,7 @@ use alloy_consensus::InMemorySize;
 
 use crate::{
     OpDepositReceipt, OpPooledTransaction, OpReceipt, OpTxEnvelope, OpTxType, OpTypedTransaction,
-    TxDeposit,
+    TxDeposit, TxZkSequencer,
 };
 
 impl InMemorySize for OpTxType {
@@ -13,6 +13,13 @@ impl InMemorySize for OpTxType {
 }
 
 impl InMemorySize for TxDeposit {
+    #[inline]
+    fn size(&self) -> usize {
+        Self::size(self)
+    }
+}
+
+impl InMemorySize for TxZkSequencer {
     #[inline]
     fn size(&self) -> usize {
         Self::size(self)
@@ -33,7 +40,8 @@ impl InMemorySize for OpReceipt {
             Self::Legacy(receipt)
             | Self::Eip2930(receipt)
             | Self::Eip1559(receipt)
-            | Self::Eip7702(receipt) => receipt.size(),
+            | Self::Eip7702(receipt)
+            | Self::ZkSequencer(receipt) => receipt.size(),
             Self::Deposit(receipt) => receipt.size(),
         }
     }
@@ -47,6 +55,7 @@ impl InMemorySize for OpTypedTransaction {
             Self::Eip1559(tx) => tx.size(),
             Self::Eip7702(tx) => tx.size(),
             Self::Deposit(tx) => tx.size(),
+            Self::ZkSequencer(tx) => tx.size(),
         }
     }
 }
@@ -70,6 +79,7 @@ impl InMemorySize for OpTxEnvelope {
             Self::Eip1559(tx) => tx.size(),
             Self::Eip7702(tx) => tx.size(),
             Self::Deposit(tx) => tx.size(),
+            Self::ZkSequencer(tx) => tx.size(),
         }
     }
 }

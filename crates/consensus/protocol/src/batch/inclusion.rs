@@ -40,6 +40,11 @@ impl BatchWithInclusionBlock {
                     .check_batch(cfg, l1_blocks, l2_safe_head, &self.inclusion_block, fetcher)
                     .await
             }
+            Batch::ZkSpan(span_batch) => {
+                span_batch
+                    .check_batch(cfg, l1_blocks, l2_safe_head, &self.inclusion_block, fetcher)
+                    .await
+            }
         }
     }
 }

@@ -9,7 +9,7 @@ use alloy_primitives::{Address, Bytes};
 use base_revm::{DepositTransactionParts, OpTransaction};
 use revm::context::TxEnv;
 
-use crate::{OpTxEnvelope, TxDeposit};
+use crate::{OpTxEnvelope, TxDeposit, TxZkSequencer, ZkSequencerTxBody};
 
 // ---------------------------------------------------------------------------
 // FromRecoveredTx / FromTxWithEncoded – OpTxEnvelope -> TxEnv
@@ -23,6 +23,7 @@ impl FromRecoveredTx<OpTxEnvelope> for TxEnv {
             OpTxEnvelope::Eip2930(tx) => Self::from_recovered_tx(tx.tx(), caller),
             OpTxEnvelope::Eip7702(tx) => Self::from_recovered_tx(tx.tx(), caller),
             OpTxEnvelope::Deposit(tx) => Self::from_recovered_tx(tx.inner(), caller),
+            OpTxEnvelope::ZkSequencer(tx) => Self::from_recovered_tx(tx.inner(), caller),
         }
     }
 }
@@ -53,6 +54,23 @@ impl FromRecoveredTx<TxDeposit> for TxEnv {
 
 impl FromTxWithEncoded<OpTxEnvelope> for TxEnv {
     fn from_encoded_tx(tx: &OpTxEnvelope, caller: Address, _encoded: Bytes) -> Self {
+        Self::from_recovered_tx(tx, caller)
+    }
+}
+
+impl FromRecoveredTx<TxZkSequencer> for TxEnv {
+    fn from_recovered_tx(tx: &TxZkSequencer, caller: Address) -> Self {
+        match &tx.body {
+            ZkSequencerTxBody::Legacy(inner) => Self::from_recovered_tx(inner, caller),
+            ZkSequencerTxBody::Eip2930(inner) => Self::from_recovered_tx(inner, caller),
+            ZkSequencerTxBody::Eip1559(inner) => Self::from_recovered_tx(inner, caller),
+            ZkSequencerTxBody::Eip7702(inner) => Self::from_recovered_tx(inner, caller),
+        }
+    }
+}
+
+impl FromTxWithEncoded<TxZkSequencer> for TxEnv {
+    fn from_encoded_tx(tx: &TxZkSequencer, caller: Address, _encoded: Bytes) -> Self {
         Self::from_recovered_tx(tx, caller)
     }
 }
@@ -92,6 +110,7 @@ impl FromTxWithEncoded<OpTxEnvelope> for OpTransaction<TxEnv> {
                 deposit: Default::default(),
             },
             OpTxEnvelope::Deposit(tx) => Self::from_encoded_tx(tx.inner(), caller, encoded),
+            OpTxEnvelope::ZkSequencer(tx) => Self::from_encoded_tx(tx.inner(), caller, encoded),
         }
     }
 }
@@ -116,5 +135,19 @@ impl FromTxWithEncoded<TxDeposit> for OpTransaction<TxEnv> {
             is_system_transaction: tx.is_system_transaction,
         };
         Self { base, enveloped_tx: Some(encoded), deposit }
+    }
+}
+
+impl FromRecoveredTx<TxZkSequencer> for OpTransaction<TxEnv> {
+    fn from_recovered_tx(tx: &TxZkSequencer, sender: Address) -> Self {
+        let encoded = tx.encoded_2718();
+        Self::from_encoded_tx(tx, sender, encoded.into())
+    }
+}
+
+impl FromTxWithEncoded<TxZkSequencer> for OpTransaction<TxEnv> {
+    fn from_encoded_tx(tx: &TxZkSequencer, caller: Address, encoded: Bytes) -> Self {
+        let base = TxEnv::from_recovered_tx(tx, caller);
+        Self { base, enveloped_tx: Some(encoded), deposit: Default::default() }
     }
 }
