@@ -4397,6 +4397,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "base-prefetch"
+version = "0.0.0"
+dependencies = [
+ "alloy-eips",
+ "alloy-primitives",
+ "arc-swap",
+ "criterion",
+ "dashmap",
+ "reth-db",
+ "reth-primitives-traits",
+ "reth-revm",
+ "reth-storage-api",
+ "revm",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "base-proof"
 version = "0.0.0"
 dependencies = [

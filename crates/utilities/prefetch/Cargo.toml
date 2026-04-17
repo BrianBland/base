@@ -13,18 +13,29 @@ workspace = true
 
 [dependencies]
 # alloy
-alloy-primitives.workspace = true
+alloy-eips.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
+
+# reth
+reth-revm.workspace = true
+reth-storage-api.workspace = true
 
 # revm
 revm.workspace = true
 
+# serde
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+
 # misc
+arc-swap.workspace = true
 dashmap.workspace = true
 
 [dev-dependencies]
 # testing
 criterion.workspace = true
 reth-primitives-traits.workspace = true
+tempfile.workspace = true
 
 # reth
 reth-db = { workspace = true, features = ["test-utils"] }

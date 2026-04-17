@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::PrefetchMode;
 
 /// Estimated execution scenario used to choose prefetch policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PrefetchScenario {
     /// One `transfer`-style read pattern.
     Transfer,
@@ -93,9 +93,43 @@ impl PrefetchPlanner {
             };
         }
 
-        let scenario_hidden_x100 = Self::scenario_hidden_lookups_x100(scenario, cost_model);
+        Self::plan_with_hidden_lookups(
+            mode,
+            hint_count,
+            Self::scenario_hidden_lookups_x100(scenario, cost_model),
+            miss_latency,
+            cost_model,
+        )
+    }
+
+    /// Computes a prefetch execution plan from an explicit hidden-lookup estimate.
+    pub fn plan_with_hidden_lookups(
+        mode: PrefetchMode,
+        hint_count: usize,
+        estimated_hidden_lookups_x100: u32,
+        miss_latency: Duration,
+        cost_model: PrefetchCostModel,
+    ) -> PrefetchExecutionPlan {
+        if mode == PrefetchMode::Baseline || hint_count == 0 {
+            return PrefetchExecutionPlan {
+                should_prefetch: false,
+                hint_limit: 0,
+                estimated_hidden_lookups_x100: 0,
+                projected_net_gain_ns: 0,
+            };
+        }
+
+        if miss_latency < cost_model.minimum_miss_latency || estimated_hidden_lookups_x100 == 0 {
+            return PrefetchExecutionPlan {
+                should_prefetch: false,
+                hint_limit: 0,
+                estimated_hidden_lookups_x100: 0,
+                projected_net_gain_ns: 0,
+            };
+        }
+
         let hint_bound_x100 = hint_count.saturating_mul(100).min(u32::MAX as usize) as u32;
-        let effective_hidden_x100 = scenario_hidden_x100.min(hint_bound_x100);
+        let effective_hidden_x100 = estimated_hidden_lookups_x100.min(hint_bound_x100);
         let estimated_hint_limit = Self::hint_limit_from_hidden(effective_hidden_x100).max(1);
         let hint_limit = hint_count.min(cost_model.max_prefetch_hints).min(estimated_hint_limit);
 
@@ -202,5 +236,19 @@ mod tests {
             PrefetchCostModel::default(),
         );
         assert!(three_legs.estimated_hidden_lookups_x100 > one_leg.estimated_hidden_lookups_x100);
+    }
+
+    #[test]
+    fn explicit_hidden_lookup_plan_can_disable_weak_speculation() {
+        let plan = PrefetchPlanner::plan_with_hidden_lookups(
+            PrefetchMode::Asynchronous,
+            4,
+            25,
+            Duration::from_micros(8),
+            PrefetchCostModel::default(),
+        );
+
+        assert!(!plan.should_prefetch);
+        assert_eq!(plan.hint_limit, 0);
     }
 }
