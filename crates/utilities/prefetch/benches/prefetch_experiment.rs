@@ -63,6 +63,50 @@ fn prefetch_benches(c: &mut Criterion) {
     group.finish();
 }
 
+fn deep_tree_prefetch_benches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("prefetch_synthetic_deep_tree");
+    let miss_latencies_us = configured_miss_latencies_us();
+    let prefetch_leads_us = [0_u64, 25, 100];
+    let planner_modes = [true, false];
+    let modes = [PrefetchMode::Baseline, PrefetchMode::Synchronous, PrefetchMode::Asynchronous];
+
+    for miss_latency_us in &miss_latencies_us {
+        for prefetch_lead_us in prefetch_leads_us {
+            for planner_enabled in planner_modes {
+                for mode in modes {
+                    let id = BenchmarkId::new(
+                        mode_name(mode),
+                        format!(
+                            "universal_router_2hop_miss={}us_lead={}us_planner={}",
+                            miss_latency_us,
+                            prefetch_lead_us,
+                            if planner_enabled { "on" } else { "off" }
+                        ),
+                    );
+
+                    group.bench_function(id, |b| {
+                        let mut config =
+                            PrefetchExperimentConfig::universal_router_two_hop_swap_like();
+                        config.iterations = 1;
+                        config.miss_latency = Duration::from_micros(*miss_latency_us);
+                        config.execution_gap = Duration::from_micros(8);
+                        config.prefetch_lead = Duration::from_micros(prefetch_lead_us);
+                        config.use_prefetch_planner = planner_enabled;
+                        let experiment = PrefetchExperiment::new(config);
+
+                        b.iter(|| {
+                            let elapsed = experiment.run_once(mode);
+                            black_box(elapsed);
+                        });
+                    });
+                }
+            }
+        }
+    }
+
+    group.finish();
+}
+
 const fn mode_name(mode: PrefetchMode) -> &'static str {
     match mode {
         PrefetchMode::Baseline => "baseline",
@@ -114,5 +158,5 @@ fn configured_miss_latencies_us() -> Vec<u64> {
     )
 }
 
-criterion_group!(benches, prefetch_benches);
+criterion_group!(benches, prefetch_benches, deep_tree_prefetch_benches);
 criterion_main!(benches);
