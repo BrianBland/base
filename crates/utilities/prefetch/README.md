@@ -188,10 +188,14 @@ BASE_PREFETCH_SIM_MISS_US=3,8,25 \
   cargo bench -p base-prefetch --bench prefetch_experiment
 ```
 
-`prefetch_experiment` now reports both `planner=on` and `planner=off` variants so you can
+`prefetch_experiment` reports tx/sec via Criterion's `Throughput::Elements(1)`, so the
+`baseline` vs `sync` vs `async` comparison can be read directly as swaps-per-second and
+USDC-payments-per-second.
+
+`prefetch_experiment` also reports both `planner=on` and `planner=off` variants so you can
 quantify planner gating overhead in warm paths.
 
-The same benchmark now also includes a scripted `universal_router_2hop` deeper-tree case that
+The same benchmark also includes a scripted `universal_router_2hop` deeper-tree case that
 approximates a Universal Router swap traversing Permit2, tokens, and two V2-style pairs.
 
 Run the MDBX plain-storage lookup calibration benchmark:
@@ -222,6 +226,73 @@ Use the measured `mdbx_state_lookup` per-element timing as `miss_latency` input 
 
 For swap modeling, set `context.tx_shape = TxShape::Swap` and provide `swap_legs`. For
 cost-aware gating, keep `use_prefetch_planner = true` and tune `prefetch_cost_model`.
+
+## Cold-Cache Benchmarks
+
+The default `mdbx_state_lookup` run measures *warm* mmap reads — once a page has been
+faulted in, MDBX serves it from the OS page cache and the bench reports a few hundred ns
+per lookup, not the µs–ms range that block builders see when storage is cold.
+
+To measure realistic cold-disk reads without arbitrary `sleep` delays, set
+`BASE_PREFETCH_COLD_CACHE=1`. Before each Criterion sample the bench evicts the MDBX data
+file from the OS page cache, using whichever strategy is available:
+
+- `drop_caches` — writes `1` to `/proc/sys/vm/drop_caches`. Reliable for mmap-backed pages
+  but requires `CAP_SYS_ADMIN`. Used by default when writable (e.g. `docker run --cap-add
+  SYS_ADMIN ...`, or root on Linux).
+- `posix_fadvise(POSIX_FADV_DONTNEED)` — fallback when `drop_caches` is not writable. No
+  privileges required, but advisory only: with no memory pressure the kernel keeps
+  mmap-backed pages around, so cold-disk numbers may not actually be cold. The bench
+  prints a warning when it falls back so you do not silently get warm numbers.
+
+`posix_fadvise` does not exist on macOS, so this whole flow is Linux-only.
+
+```text
+BASE_PREFETCH_COLD_CACHE=1 \
+  cargo bench -p base-prefetch --bench mdbx_state_lookup
+```
+
+When `BASE_PREFETCH_COLD_CACHE=1` is set, the bench produces:
+
+- `mdbx_storage_lookup/{source}/warm/...` — standard hot-path numbers (unchanged)
+- `mdbx_storage_lookup/{source}/cold_disk/full_random` — every read pays a real disk fault
+- `mdbx_storage_lookup/{source}/cold_disk/mixed_hot70` — 70% hot keys, 30% cold
+
+Plug the cold-disk per-lookup µs into `BASE_PREFETCH_SIM_MISS_US` to drive the synthetic
+prefetch benchmark with realistic miss latencies, and read the resulting swaps/sec and
+transfers/sec gain.
+
+The bench also opens MDBX with `with_exclusive(true)` and `with_max_readers(1)` so the
+reader-table churn between samples is minimized. `MDBX_NORDAHEAD` is already hardcoded by
+reth, so MDBX's own page cache is the only knob we cannot tighten further without forking
+reth.
+
+### Running on macOS via Docker
+
+`posix_fadvise` is Linux-only; macOS lacks an unprivileged equivalent. To get cold-cache
+numbers on a macOS dev box, run the benchmarks inside a Linux container — the Docker
+Desktop Linux VM's page cache is what `posix_fadvise` evicts, and no host `sudo` is
+required.
+
+```text
+etc/scripts/prefetch-bench.sh                                  # both bench targets, cold mode
+etc/scripts/prefetch-bench.sh --bench mdbx_state_lookup        # one bench
+BASE_PREFETCH_COLD_CACHE=0 etc/scripts/prefetch-bench.sh       # warm only
+BASE_PREFETCH_SIM_MISS_US=3,8,25 etc/scripts/prefetch-bench.sh
+BASE_PREFETCH_MDBX_PATH=/path/to/node/datadir/db etc/scripts/prefetch-bench.sh
+```
+
+The script builds `etc/docker/Dockerfile.prefetch-bench` on first invocation (Rust 1.93
+trixie + workspace build deps) and persists cargo registry / git / target as named Docker
+volumes so subsequent runs are fast. The container is launched with `--cap-add SYS_ADMIN`
+*and* `--security-opt systempaths=unconfined` so `/proc/sys/vm/drop_caches` is writable
+and the cold-cache benchmarks actually evict mmap-backed pages — the capability alone is
+not enough because Docker masks `/proc/sys` as read-only by default. When
+`BASE_PREFETCH_MDBX_PATH` is set the script bind-mounts the directory read-only into the
+container at the same path.
+
+Linux CI runners can call `cargo bench -p base-prefetch` directly with
+`BASE_PREFETCH_COLD_CACHE=1` and skip the Docker wrapper.
 
 ## License
 

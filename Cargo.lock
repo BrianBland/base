@@ -4401,6 +4401,7 @@ dependencies = [
  "arc-swap",
  "criterion",
  "dashmap",
+ "libc",
  "reth-db",
  "reth-primitives-traits",
  "reth-revm",

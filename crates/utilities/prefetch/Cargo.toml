@@ -40,6 +40,9 @@ tempfile.workspace = true
 # reth
 reth-db = { workspace = true, features = ["test-utils"] }
 
+# misc
+libc.workspace = true
+
 [[bench]]
 name = "prefetch_experiment"
 harness = false

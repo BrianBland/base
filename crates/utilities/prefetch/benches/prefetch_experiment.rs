@@ -8,10 +8,11 @@ use alloy_primitives::Address;
 use base_prefetch::{
     Erc20SwapLeg, PrefetchExperiment, PrefetchExperimentConfig, PrefetchMode, TxShape,
 };
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 fn prefetch_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("prefetch_synthetic");
+    group.throughput(Throughput::Elements(1));
     let miss_latencies_us = configured_miss_latencies_us();
     let prefetch_leads_us = [0_u64, 100];
     let planner_modes = [true, false];
@@ -65,6 +66,7 @@ fn prefetch_benches(c: &mut Criterion) {
 
 fn deep_tree_prefetch_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("prefetch_synthetic_deep_tree");
+    group.throughput(Throughput::Elements(1));
     let miss_latencies_us = configured_miss_latencies_us();
     let prefetch_leads_us = [0_u64, 25, 100];
     let planner_modes = [true, false];
