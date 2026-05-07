@@ -29,3 +29,8 @@ pub use l2_chain_provider::{AlloyL2ChainProvider, AlloyL2ChainProviderError};
 
 mod pipeline;
 pub use pipeline::OnlinePipeline;
+
+mod prefetch;
+pub use prefetch::{
+    PREFETCH_BUFFER_CAPACITY, PrefetchResult, PrefetchedData, PrefetchingEthereumDataSource,
+};
