@@ -1,6 +1,9 @@
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use base_builder_publish::WebSocketPublisher;
+use base_common_consensus::{
+    BasePooledTransaction as ConsensusPooledTransaction, BaseTransactionSigned,
+};
 use base_execution_evm::BaseEvmConfig;
 use base_execution_txpool::BasePooledTransaction;
 use base_node_core::{
@@ -132,20 +135,24 @@ where
     }
 }
 
-impl<S> BasePayloadServiceBuilder for FlashblocksServiceBuilder<S>
+impl<S, E> BasePayloadServiceBuilder<E> for FlashblocksServiceBuilder<S>
 where
-    S: CandidateSource<BasePooledTransaction> + Clone + Unpin + 'static,
+    E: fmt::Debug + Clone + Send + Sync + Unpin + 'static,
+    S: CandidateSource<BasePooledTransaction<BaseTransactionSigned, ConsensusPooledTransaction, E>>
+        + Clone
+        + Unpin
+        + 'static,
 {
     type ComponentsBuilder = ComponentsBuilder<
-        BaseNodeTypes,
-        BasePoolBuilder,
+        BaseNodeTypes<E>,
+        BasePoolBuilder<BasePooledTransaction<BaseTransactionSigned, ConsensusPooledTransaction, E>>,
         Self,
         BaseNetworkBuilder,
         BaseExecutorBuilder,
         BaseConsensusBuilder,
     >;
 
-    fn build_components(self, base_node: &BaseNode) -> Self::ComponentsBuilder {
-        base_node.components::<BaseNodeTypes>().payload(self)
+    fn build_components(self, base_node: &BaseNode<E>) -> Self::ComponentsBuilder {
+        base_node.components::<BaseNodeTypes<E>>().payload(self)
     }
 }
