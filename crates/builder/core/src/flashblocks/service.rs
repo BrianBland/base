@@ -28,37 +28,64 @@ use super::{
     payload::{BasePayloadBuilder, BuilderOutputs},
 };
 use crate::{
-    BuilderConfig, CandidateSource, DefaultCandidateSource, RejectedTxForwarder,
+    BuilderConfig, CandidateSource, DefaultCandidateSource, DefaultInclusionPolicy,
+    InclusionPolicy, RejectedTxForwarder,
     traits::{NodeBounds, PoolBounds},
 };
 
 /// Builder for the flashblocks payload service.
 ///
-/// Holds a [`BuilderConfig`] and a [`CandidateSource`], and implements
+/// Holds a [`BuilderConfig`], a [`CandidateSource`], and an [`InclusionPolicy`], and implements
 /// [`BasePayloadServiceBuilder`] to spawn the flashblocks payload builder service, which produces
 /// sub-block chunks (flashblocks) at sub-second intervals during block construction.
 ///
-/// The candidate source defaults to [`DefaultCandidateSource`] (the pool's best transactions,
-/// unchanged); use [`FlashblocksServiceBuilder::with_candidate_source`] to supply an alternative.
+/// The injectable seams default to [`DefaultCandidateSource`] and [`DefaultInclusionPolicy`]; use
+/// [`FlashblocksServiceBuilder::with_candidate_source`] and
+/// [`FlashblocksServiceBuilder::with_inclusion_policy`] to supply alternatives.
 #[derive(Debug)]
-pub struct FlashblocksServiceBuilder<S = DefaultCandidateSource> {
+pub struct FlashblocksServiceBuilder<S = DefaultCandidateSource, P = DefaultInclusionPolicy> {
     config: BuilderConfig,
     candidate_source: S,
+    inclusion_policy: P,
 }
 
 impl FlashblocksServiceBuilder {
     /// Create a service builder that uses the default candidate source
     /// (the pool's priority-ordered best transactions, unchanged).
     pub const fn new(config: BuilderConfig) -> Self {
-        Self { config, candidate_source: DefaultCandidateSource }
+        Self {
+            config,
+            candidate_source: DefaultCandidateSource,
+            inclusion_policy: DefaultInclusionPolicy,
+        }
     }
 }
 
-impl<S> FlashblocksServiceBuilder<S> {
+impl<S, P> FlashblocksServiceBuilder<S, P> {
     /// Replace the candidate transaction source used by the flashblocks build loop.
     #[must_use]
-    pub fn with_candidate_source<S2>(self, candidate_source: S2) -> FlashblocksServiceBuilder<S2> {
-        FlashblocksServiceBuilder { config: self.config, candidate_source }
+    pub fn with_candidate_source<S2>(
+        self,
+        candidate_source: S2,
+    ) -> FlashblocksServiceBuilder<S2, P> {
+        FlashblocksServiceBuilder {
+            config: self.config,
+            candidate_source,
+            inclusion_policy: self.inclusion_policy,
+        }
+    }
+
+    /// Replace the inclusion policy used by the flashblocks build loop.
+    #[must_use]
+    pub fn with_inclusion_policy<P2>(
+        self,
+        inclusion_policy: P2,
+    ) -> FlashblocksServiceBuilder<S, P2> {
+        FlashblocksServiceBuilder {
+            config: self.config,
+            candidate_source: self.candidate_source,
+            inclusion_policy,
+        }
     }
 
     fn spawn_payload_builder_service<Node, Pool>(
@@ -70,6 +97,7 @@ impl<S> FlashblocksServiceBuilder<S> {
         Node: NodeBounds,
         Pool: PoolBounds,
         S: CandidateSource<Pool::Transaction> + Clone + Unpin + 'static,
+        P: InclusionPolicy<Pool::Transaction> + Clone + Unpin + 'static,
     {
         let (built_payload_tx, built_payload_rx) = tokio::sync::mpsc::channel(16);
 
@@ -93,6 +121,7 @@ impl<S> FlashblocksServiceBuilder<S> {
             self.config.clone(),
             BuilderOutputs { payload_tx: built_payload_tx, ws_pub, rejected_tx_sender },
             self.candidate_source.clone(),
+            self.inclusion_policy.clone(),
         );
         let payload_generator = BlockPayloadJobGenerator::with_builder(
             ctx.provider().clone(),
@@ -118,12 +147,13 @@ impl<S> FlashblocksServiceBuilder<S> {
     }
 }
 
-impl<Node, Pool, S> PayloadServiceBuilder<Node, Pool, BaseEvmConfig>
-    for FlashblocksServiceBuilder<S>
+impl<Node, Pool, S, P> PayloadServiceBuilder<Node, Pool, BaseEvmConfig>
+    for FlashblocksServiceBuilder<S, P>
 where
     Node: NodeBounds,
     Pool: PoolBounds,
     S: CandidateSource<Pool::Transaction> + Clone + Unpin + 'static,
+    P: InclusionPolicy<Pool::Transaction> + Clone + Unpin + 'static,
 {
     async fn spawn_payload_builder_service(
         self,
@@ -135,10 +165,14 @@ where
     }
 }
 
-impl<S, E> BasePayloadServiceBuilder<E> for FlashblocksServiceBuilder<S>
+impl<S, P, E> BasePayloadServiceBuilder<E> for FlashblocksServiceBuilder<S, P>
 where
     E: fmt::Debug + Clone + Send + Sync + Unpin + 'static,
     S: CandidateSource<BasePooledTransaction<BaseTransactionSigned, ConsensusPooledTransaction, E>>
+        + Clone
+        + Unpin
+        + 'static,
+    P: InclusionPolicy<BasePooledTransaction<BaseTransactionSigned, ConsensusPooledTransaction, E>>
         + Clone
         + Unpin
         + 'static,
