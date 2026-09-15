@@ -43,7 +43,7 @@ use reth_provider::{
 };
 use reth_revm::{cached::CachedReads, cancelled::CancelOnDrop, database::StateProviderDatabase};
 use reth_stages_types::StageId;
-use reth_storage_api::{ReceiptProvider as _, TransactionVariant};
+use reth_storage_api::{AccountReader as _, ReceiptProvider as _, TransactionVariant};
 use reth_tasks::{RayonConfig, RuntimeBuilder, RuntimeConfig, TokioConfig};
 use reth_transaction_pool::{
     BestTransactions as _, BestTransactionsAttributes, TransactionOrigin, ValidPoolTransaction,
@@ -540,6 +540,17 @@ impl ReplayBuildBench {
             cache
                 .insert_state(&output.state)
                 .map_err(|()| eyre!("inconsistent bundle state after block {block_number}"))?;
+            if let Ok(debug) = std::env::var("PERF_DEBUG_ACCOUNT") {
+                let address: alloy_primitives::Address = debug.parse()?;
+                let in_bundle = output.state.state.get(&address).map(|account| {
+                    json!({"nonce": account.info.as_ref().map(|i| i.nonce),
+                           "status": format!("{:?}", account.status)})
+                });
+                let read_back = state.basic_account(&address).ok().flatten().map(|a| a.nonce);
+                eprintln!(
+                    "debug block={block_number} bundle={in_bundle:?} read_back_nonce={read_back:?}"
+                );
+            }
 
             let canonical_receipts = factory
                 .receipts_by_block(BlockHashOrNumber::Number(block_number))?
