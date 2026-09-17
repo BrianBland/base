@@ -6040,6 +6040,7 @@ dependencies = [
  "reth-storage-api",
  "reth-tasks",
  "reth-transaction-pool",
+ "reth-trie",
  "serde",
  "serde_json",
 ]

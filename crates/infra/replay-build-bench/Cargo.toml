@@ -33,6 +33,7 @@ reth-provider.workspace = true
 reth-revm.workspace = true
 reth-stages-types.workspace = true
 reth-storage-api.workspace = true
+reth-trie.workspace = true
 reth-tasks = { workspace = true, features = ["rayon"] }
 reth-transaction-pool.workspace = true
 reth-primitives-traits.workspace = true
