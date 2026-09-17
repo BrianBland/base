@@ -56,13 +56,31 @@ target/release/base-replay-build-bench --datadir <private-snapshot> \
     --run --count 64 --output results.json
 ```
 
-The `--prewarm*` flags configure the builder's concurrent prewarming for an
-ABBA prewarm-off vs prewarm-on comparison. Prewarming is **not wired on this
-branch** (the API arrives with the shared prewarm worker pool), so `--prewarm`
-and `--prewarm-simulate` fail the run instead of reporting a prewarm-off
-measurement as prewarm-on; the requested configuration is echoed as `prewarm`
-in the JSON output with `wired: false`. See `PREWARM_WIRING.md` for the exact
-wiring plan.
+The `--prewarm*` flags drive the production prewarm worker pool for an ABBA
+prewarm-off vs prewarm-on comparison:
+
+```bash
+# A: prewarm off (unchanged build path)
+target/release/base-replay-build-bench --datadir <snapshot> --run --count 64
+# B: predicate + transaction-simulation warming
+target/release/base-replay-build-bench --datadir <snapshot> --run --count 64 \
+    --prewarm --prewarm-simulate
+```
+
+One `PrewarmWorkerPool` is created before the replay loop (threads spawn once)
+and one `PrewarmJob` is started per block just before the timed build, so
+workers warm the very `ExecutionCache` the build reads through. Workers open
+their own snapshot anchor and layer the shared durable overlay on it, which at
+that point holds the canonical post-state of every block *before* the one being
+built — the exact parent state, like the builder's
+`state_by_block_hash(parent)`. After the timed build the job is joined
+(untimed) so no worker can write parent-state reads back into the cache after
+canonical advancement. `--prewarm-simulate` requires `--prewarm`, and the JSON
+output reports `prewarm.wired` plus `prewarm.active` (a pool with live workers
+ran) and `prewarm_totals` (keys and simulations actually scheduled, and
+simulations the build loop overtook), so an arm that warmed nothing cannot be
+read as a prewarm arm. `PREWARM_WIRING.md` records the wiring plan this
+follows.
 
 `--datadir` must be a private snapshot root (private `db/mdbx.dat` plus shared
 read-only `rocksdb`/`static_files` links; see `~/perf-tools` on the devbox).

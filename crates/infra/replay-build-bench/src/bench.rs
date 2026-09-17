@@ -22,7 +22,8 @@ use base_common_consensus::{
 use base_execution_chainspec::BaseChainSpec;
 use base_execution_evm::BaseEvmConfig;
 use base_execution_payload_builder::{
-    BasePayloadBuilderAttributes, ParkableBestPayloadTransactions,
+    BasePayloadBuilderAttributes, ParkableBestPayloadTransactions, PrewarmConfig, PrewarmJob,
+    PrewarmWorkerPool, PrewarmingBestTransactions,
     builder::{BasePayloadBuilderCtx, Builder},
     config::BaseBuilderConfig,
     payload::EthPayloadBuilderAttributes,
@@ -43,11 +44,13 @@ use reth_provider::{
 };
 use reth_revm::{cached::CachedReads, cancelled::CancelOnDrop, database::StateProviderDatabase};
 use reth_stages_types::StageId;
-use reth_storage_api::{AccountReader as _, ReceiptProvider as _, TransactionVariant};
+use reth_storage_api::{
+    AccountReader as _, ReceiptProvider as _, StateProviderBox, TransactionVariant,
+};
 use reth_tasks::{RayonConfig, RuntimeBuilder, RuntimeConfig, TokioConfig};
 use crate::durable_state::DurableStateProvider;
 use reth_transaction_pool::{
-    BestTransactions as _, BestTransactionsAttributes, TransactionOrigin, ValidPoolTransaction,
+    BestTransactions, BestTransactionsAttributes, TransactionOrigin, ValidPoolTransaction,
     identifier::{SenderId, TransactionId},
     pool::PendingPool,
 };
@@ -171,6 +174,9 @@ pub struct BlockRow {
     pub canonical: Value,
     /// Build phase statistics (absent with `--no-build`).
     pub build: Option<BuildRow>,
+    /// Prewarm scheduling observed for this build (absent when no prewarm job ran).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prewarm: Option<PrewarmRow>,
     /// Canonical execution wall time in nanoseconds.
     pub execute_ns: u128,
     /// Canonical receipts agreed with the snapshot receipts.
@@ -194,6 +200,46 @@ pub struct BuildRow {
     pub gas_limit: u64,
     /// Fees collected by the built payload.
     pub fees: String,
+}
+
+/// Prewarm scheduling observed for one build, read from the job's scheduler after the
+/// build and before the job is dropped.
+///
+/// This is warming *yield*, not build latency: an arm whose builds schedule nothing warmed
+/// nothing, however fast it looks.
+#[derive(Debug, Serialize)]
+pub struct PrewarmRow {
+    /// Distinct predicate-state keys scheduled to prewarm workers.
+    pub keys_scheduled: usize,
+    /// Transaction simulations scheduled to prewarm workers.
+    pub sims_scheduled: usize,
+    /// Scheduled simulations that had not finished when the build ended: warming did not
+    /// stay ahead of the build loop for those transactions.
+    pub sims_unfinished: usize,
+    /// Work still queued and never taken by a worker when the build ended.
+    pub queued_at_end: usize,
+    /// Whether predicate-key scheduling saturated (per-build key cap or a full queue).
+    pub saturated: bool,
+}
+
+impl PrewarmRow {
+    /// Reads one build's scheduling state. Must be called before the job is dropped, which
+    /// closes and clears the queue.
+    pub fn observe(job: &PrewarmJob) -> Self {
+        let scheduler = &job.scheduler;
+        let keys_scheduled =
+            scheduler.scheduled.lock().expect("prewarm scheduler mutex poisoned").len();
+        let sim = scheduler.sim.lock().expect("prewarm scheduler mutex poisoned");
+        let (sims_scheduled, sims_unfinished) = (sim.scheduled.len(), sim.pending.len());
+        drop(sim);
+        Self {
+            keys_scheduled,
+            sims_scheduled,
+            sims_unfinished,
+            queued_at_end: scheduler.queued_len(),
+            saturated: scheduler.is_saturated(),
+        }
+    }
 }
 
 impl From<BuildStats> for BuildRow {
@@ -236,9 +282,8 @@ pub struct ReplayBuildBench {
     pub cache_mib: usize,
     /// Run the builder's concurrent predicate-state prewarming during each build.
     ///
-    /// Not wired on this branch: the prewarm API lands with the shared prewarm worker
-    /// pool. Setting this flag fails the run rather than reporting a prewarm-off arm as
-    /// prewarm-on. See `PREWARM_WIRING.md` in this crate.
+    /// Drives the production `PrewarmWorkerPool`: one job per replayed block, whose
+    /// workers warm the same `ExecutionCache` the timed build reads through.
     #[arg(long)]
     pub prewarm: bool,
     /// Additionally run full transaction simulation on prewarm workers. Requires
@@ -345,35 +390,55 @@ impl ReplayBuildBench {
         pool
     }
 
-    /// Echoes the requested prewarm configuration into the JSON output.
+    /// The builder's prewarm configuration for this run.
     ///
-    /// The values mirror the fields of the builder's `PrewarmConfig`; `wired` records
-    /// whether this build of the harness can actually run prewarming.
-    pub fn prewarm_config(&self) -> Value {
+    /// `lookahead` and `key_cap` keep the production defaults; the harness exposes no
+    /// flags for them.
+    pub fn prewarm_config(&self) -> PrewarmConfig {
+        PrewarmConfig {
+            enabled: self.prewarm,
+            worker_count: self.prewarm_workers,
+            simulate: self.prewarm_simulate,
+            sim_lookahead: self.prewarm_sim_lookahead,
+            sim_job_cap: self.prewarm_sim_job_cap,
+            ..PrewarmConfig::default()
+        }
+    }
+
+    /// Echoes the prewarm configuration into the JSON output.
+    ///
+    /// `wired` records that this build of the harness can drive prewarming at all;
+    /// `active` records whether a worker pool with live workers was created for this run,
+    /// so a prewarm-off arm can never be read as prewarm-on.
+    pub fn prewarm_json(&self, active: bool) -> Value {
+        let prewarm = self.prewarm_config();
         json!({
-            "enabled": self.prewarm,
-            "simulate": self.prewarm_simulate,
-            "worker_count": self.prewarm_workers,
-            "sim_lookahead": self.prewarm_sim_lookahead,
-            "sim_job_cap": self.prewarm_sim_job_cap,
-            "wired": false,
+            "enabled": prewarm.enabled,
+            "simulate": prewarm.simulate,
+            "worker_count": prewarm.worker_count,
+            "lookahead": prewarm.lookahead,
+            "key_cap": prewarm.key_cap,
+            "sim_lookahead": prewarm.sim_lookahead,
+            "sim_job_cap": prewarm.sim_job_cap,
+            "wired": true,
+            "active": active,
         })
     }
 
-    /// Fails closed while prewarming is unwired, so no arm can be mislabelled.
-    ///
-    // TODO(prewarm-wiring): the prewarm API (`PrewarmConfig`, `PrewarmWorkerPool`,
-    // `PrewarmingBestTransactions`) lands with the shared prewarm worker pool, which is
-    // not part of this branch's base. Once this branch is rebased onto it, replace this
-    // guard with the wiring described in `PREWARM_WIRING.md` (crate root) and flip
-    // `wired` in `prewarm_config` to reflect the real state. Until then a prewarm request
-    // must fail rather than silently produce a prewarm-off measurement.
-    pub fn ensure_prewarm_unwired(&self) -> Result<()> {
+    /// Fails closed on prewarm flag combinations that would measure something other than
+    /// what they name, and bounds the pool sizing.
+    pub fn validate_prewarm_flags(&self) -> Result<()> {
         ensure!(
-            !(self.prewarm || self.prewarm_simulate),
-            "prewarm is not wired on this branch: rebase onto the shared prewarm worker \
-             pool and complete the wiring in PREWARM_WIRING.md before benchmarking a \
-             prewarm arm"
+            self.prewarm_workers <= 64
+                && self.prewarm_sim_lookahead <= 4096
+                && self.prewarm_sim_job_cap <= 65_536,
+            "prewarm worker/lookahead/job-cap must be bounded"
+        );
+        // Simulation warming rides the prewarm worker pool and its lookahead cursor, so
+        // `--prewarm-simulate` alone would silently measure a prewarm-off arm.
+        ensure!(
+            self.prewarm || !self.prewarm_simulate,
+            "--prewarm-simulate requires --prewarm"
         );
         Ok(())
     }
@@ -398,13 +463,7 @@ impl ReplayBuildBench {
             self.count > 0 && self.count <= 1000 && self.cache_mib <= 256 * 1024,
             "count must be in 1..=1000 and cache_mib bounded"
         );
-        ensure!(
-            self.prewarm_workers <= 64
-                && self.prewarm_sim_lookahead <= 4096
-                && self.prewarm_sim_job_cap <= 65_536,
-            "prewarm worker/lookahead/job-cap must be bounded"
-        );
-        self.ensure_prewarm_unwired()?;
+        self.validate_prewarm_flags()?;
         if self.output.as_os_str() != "-" {
             let parent = self
                 .output
@@ -462,7 +521,7 @@ impl ReplayBuildBench {
             return self.write_json(&json!({
                 "benchmark": "base-replay-build", "mode": "inspect", "anchor": anchor,
                 "count": self.count, "cache_mib": self.cache_mib,
-                "prewarm": self.prewarm_config(),
+                "prewarm": self.prewarm_json(false),
             }));
         }
 
@@ -497,6 +556,38 @@ impl ReplayBuildBench {
             None,
             None,
         );
+
+        // The prewarm settings the replayed builds see. Prewarm-off this is exactly
+        // `PrewarmConfig::default()`, the value `BaseBuilderConfig::default()` already
+        // carried, so prewarm-off builds are unchanged; with `--prewarm-simulate` it is
+        // what makes `ctx.simulation_setup()` produce a simulation factory. The rest of
+        // the builder config is still constructed per block (below), because
+        // `BaseBuilderConfig::clone` shares its `RejectionCache` and would leak permanent
+        // rejections across replayed blocks.
+        let prewarm = self.prewarm_config();
+        // One pool for the whole run: worker threads spawn once, off the measured path,
+        // and are reused by every block's job. Prewarm-off creates no pool at all.
+        let prewarm_pool = prewarm.enabled.then(|| PrewarmWorkerPool::new(&prewarm));
+        let prewarm_active = prewarm_pool.as_ref().is_some_and(|pool| pool.worker_count() > 0);
+        // Opens the parent state of the block being built, inside each prewarm worker
+        // thread. Each worker gets its own anchor (its own MDBX read transaction) layered
+        // with the shared durable overlay, exactly as production workers each call
+        // `client.state_by_block_hash(parent)`.
+        //
+        // The overlay a worker reads is the canonical post-state of every block up to the
+        // one before the block being built: the job starts before the timed build and the
+        // canonical `apply` for the current block happens after it. Workers only take read
+        // guards, so they never observe a half-applied bundle.
+        let parent_state_factory = {
+            let factory = factory.clone();
+            let overlay = durable.overlay_handle();
+            move || {
+                Ok(Box::new(DurableStateProvider::from_parts(
+                    factory.history_by_block_number(from)?,
+                    Arc::clone(&overlay),
+                )) as StateProviderBox)
+            }
+        };
 
         let io_before = IoSnapshot::read()?;
         let mut rows: Vec<BlockRow> = Vec::with_capacity(self.count);
@@ -536,6 +627,7 @@ impl ReplayBuildBench {
                 "timestamp": header.timestamp,
             });
 
+            let mut prewarm_row = None;
             let build = if self.no_build {
                 None
             } else {
@@ -544,7 +636,7 @@ impl ReplayBuildBench {
                 let payload_id = attributes.payload_id(&parent.hash());
                 let ctx = BasePayloadBuilderCtx {
                     evm_config: evm_config.clone(),
-                    builder_config: BaseBuilderConfig::default(),
+                    builder_config: BaseBuilderConfig { prewarm, ..Default::default() },
                     chain_spec: Arc::clone(&chain),
                     config: PayloadConfig::new(Arc::new(parent), attributes, payload_id),
                     cancel: CancelOnDrop::default(),
@@ -553,16 +645,49 @@ impl ReplayBuildBench {
                 let pool = Self::pool_for(regular);
                 let mut cursor = pool.best();
                 cursor.no_updates();
+                // Start this block's prewarm job before the timed build, so workers warm
+                // the shared cache while the build loop runs, as in production.
+                let job = prewarm_pool.as_ref().and_then(|pool| {
+                    pool.try_start_job(parent_state_factory.clone(), cache.clone())
+                });
+                let scheduler = job.as_ref().map(|job| Arc::clone(&job.scheduler));
+                // Simulation warming rides the same lookahead cursor and worker pool, so it
+                // only runs where predicate warming is already active.
+                let sim_setup = job.as_ref().and_then(|_| ctx.simulation_setup());
+                // A second, independent read-only lookahead cursor over the same pending
+                // pool: the harness has no `TransactionPool`, so the adapter cannot open
+                // one itself. Only created when a job exists, so the prewarm-off path
+                // allocates nothing extra.
+                let lookahead = job.as_ref().map(|_| {
+                    let mut lookahead = pool.best();
+                    lookahead.no_updates();
+                    lookahead
+                });
                 let build = Instant::now();
                 let outcome = Builder::new(
                     move |attributes: BestTransactionsAttributes| {
-                        ParkableBestPayloadTransactions::new(Box::new(
+                        let inner = ParkableBestPayloadTransactions::new(Box::new(
                             ParkedBestTransactions::new(
                                 cursor,
                                 BaseOrdering::coinbase_tip(),
                                 attributes.basefee,
                             ),
-                        ))
+                        ));
+                        // Wraps the same lane-aware parking the main iterator uses, so the
+                        // lookahead sees the transactions the build loop will see. A pure
+                        // pass-through when `scheduler` is `None`.
+                        let cursor: Option<
+                            Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<_>>>>,
+                        > = lookahead.map(|lookahead| {
+                            Box::new(ParkedBestTransactions::new(
+                                lookahead,
+                                BaseOrdering::coinbase_tip(),
+                                attributes.basefee,
+                            )) as Box<_>
+                        });
+                        PrewarmingBestTransactions::with_cursor(
+                            inner, cursor, scheduler, sim_setup,
+                        )
                     },
                 )
                 .build(
@@ -572,6 +697,17 @@ impl ReplayBuildBench {
                     ctx,
                 )?;
                 let build_ns = build.elapsed().as_nanos();
+                // Untimed: record what warming actually scheduled, then close the queue and
+                // wait for every dispatched worker to drop its cache handle. Canonical
+                // advancement below rewrites the shared cache, and a worker still reading
+                // parent state would otherwise write pre-block values back into it after
+                // `insert_state`. Production relies on the engine refusing to advance the
+                // cache while extra handles exist; the harness advances it itself, so it
+                // waits here instead.
+                prewarm_row = job.as_ref().map(PrewarmRow::observe);
+                if let Some(job) = job {
+                    job.join();
+                }
                 let stats = match outcome {
                     BuildOutcomeKind::Better { payload }
                     | BuildOutcomeKind::Freeze(payload) => {
@@ -654,6 +790,7 @@ impl ReplayBuildBench {
                 hash: canonical_hash.to_string(),
                 canonical,
                 build: build.map(Into::into),
+                prewarm: prewarm_row,
                 execute_ns,
                 receipts_match,
                 gas_used_match,
@@ -667,6 +804,8 @@ impl ReplayBuildBench {
         let build_ns_total: u128 =
             built_rows.iter().filter_map(|row| row.build.as_ref().map(|b| b.build_ns)).sum();
         let execute_ns_total: u128 = rows.iter().map(|row| row.execute_ns).sum();
+        let prewarm_rows: Vec<&PrewarmRow> =
+            rows.iter().filter_map(|row| row.prewarm.as_ref()).collect();
         self.write_json(&json!({
             "benchmark": "base-replay-build",
             "version": 1,
@@ -675,7 +814,14 @@ impl ReplayBuildBench {
             "from": from,
             "count": self.count,
             "cache_mib": self.cache_mib,
-            "prewarm": self.prewarm_config(),
+            "prewarm": self.prewarm_json(prewarm_active),
+            "prewarm_totals": {
+                "jobs": prewarm_rows.len(),
+                "keys_scheduled": prewarm_rows.iter().map(|row| row.keys_scheduled).sum::<usize>(),
+                "sims_scheduled": prewarm_rows.iter().map(|row| row.sims_scheduled).sum::<usize>(),
+                "sims_unfinished": prewarm_rows.iter().map(|row| row.sims_unfinished).sum::<usize>(),
+                "saturated_builds": prewarm_rows.iter().filter(|row| row.saturated).count(),
+            },
             "startup_ns": startup.elapsed().as_nanos().saturating_sub(loop_ns),
             "loop_ns": loop_ns,
             "build_ns_total": build_ns_total,
@@ -692,14 +838,16 @@ impl ReplayBuildBench {
             "blocks": rows,
             "scope": "real builder path with synchronous state root; built payloads discarded; \
                       canonical advancement via a durable in-process state overlay behind a \
-                      read-through ExecutionCache; validated against snapshot receipts",
+                      read-through ExecutionCache; validated against snapshot receipts; with \
+                      --prewarm, production prewarm workers warm that same cache during the \
+                      timed build and are joined untimed before canonical advancement",
         }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{IoSnapshot, ReplayBuildBench, StateStages};
+    use super::{IoSnapshot, PrewarmConfig, ReplayBuildBench, StateStages};
     use alloy_primitives::{B64, bytes};
     use base_common_consensus::JovianExtraData;
 
@@ -745,12 +893,16 @@ mod tests {
         assert!(stages.validate(11).is_err());
     }
 
+    /// The flags must reach the builder's `PrewarmConfig` unchanged, and the JSON echo must
+    /// distinguish "the harness can prewarm" from "this arm did prewarm".
     #[test]
-    fn prewarm_flags_are_echoed_and_fail_closed_while_unwired() {
+    fn prewarm_flags_drive_the_builder_config_and_json_echo() {
         use clap::Parser as _;
         let base = ReplayBuildBench::parse_from(["bench", "--datadir", "/snapshot", "--run"]);
-        assert!(base.ensure_prewarm_unwired().is_ok());
-        assert_eq!(base.prewarm_config()["enabled"], false);
+        assert!(base.validate_prewarm_flags().is_ok());
+        // The prewarm-off arm must configure exactly the production default.
+        assert_eq!(base.prewarm_config(), PrewarmConfig::default());
+        assert_eq!(base.prewarm_json(false)["active"], false);
 
         let prewarm = ReplayBuildBench::parse_from([
             "bench",
@@ -766,15 +918,52 @@ mod tests {
             "--prewarm-sim-job-cap",
             "32",
         ]);
+        assert!(prewarm.validate_prewarm_flags().is_ok());
         let config = prewarm.prewarm_config();
-        assert_eq!(config["enabled"], true);
-        assert_eq!(config["simulate"], true);
-        assert_eq!(config["worker_count"], 4);
-        assert_eq!(config["sim_lookahead"], 8);
-        assert_eq!(config["sim_job_cap"], 32);
-        // Unwired prewarming must never report a prewarm-off run as prewarm-on.
-        assert_eq!(config["wired"], false);
-        assert!(prewarm.ensure_prewarm_unwired().is_err());
+        assert!(config.enabled && config.simulate);
+        assert_eq!(config.worker_count, 4);
+        assert_eq!(config.sim_lookahead, 8);
+        assert_eq!(config.sim_job_cap, 32);
+        // Unflagged sizing keeps the production defaults.
+        assert_eq!(config.lookahead, PrewarmConfig::default().lookahead);
+        assert_eq!(config.key_cap, PrewarmConfig::default().key_cap);
+
+        let echo = prewarm.prewarm_json(true);
+        assert_eq!(echo["enabled"], true);
+        assert_eq!(echo["simulate"], true);
+        assert_eq!(echo["worker_count"], 4);
+        assert_eq!(echo["sim_lookahead"], 8);
+        assert_eq!(echo["sim_job_cap"], 32);
+        assert_eq!(echo["wired"], true);
+        assert_eq!(echo["active"], true);
+        // A pool that spawned no workers is reported inactive, never as a prewarm arm.
+        assert_eq!(prewarm.prewarm_json(false)["active"], false);
+    }
+
+    /// Simulation warming rides the prewarm pool, so requesting it alone would measure a
+    /// prewarm-off arm under a prewarm-on name.
+    #[test]
+    fn prewarm_simulate_requires_prewarm() {
+        use clap::Parser as _;
+        let simulate_only = ReplayBuildBench::parse_from([
+            "bench",
+            "--datadir",
+            "/snapshot",
+            "--run",
+            "--prewarm-simulate",
+        ]);
+        assert!(simulate_only.validate_prewarm_flags().is_err());
+
+        let unbounded = ReplayBuildBench::parse_from([
+            "bench",
+            "--datadir",
+            "/snapshot",
+            "--run",
+            "--prewarm",
+            "--prewarm-workers",
+            "65",
+        ]);
+        assert!(unbounded.validate_prewarm_flags().is_err());
     }
 
     #[test]

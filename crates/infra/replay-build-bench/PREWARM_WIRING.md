@@ -1,12 +1,11 @@
-# Prewarm wiring plan (`TODO(prewarm-wiring)`)
+# Prewarm wiring plan (implemented)
 
-Status: **flags only**. `--prewarm` / `--prewarm-simulate` currently fail the run
-(`ReplayBuildBench::ensure_prewarm_unwired`) so a prewarm-off measurement can never be
-reported as prewarm-on. The prewarm API is not in this branch's base; it arrives with the
-shared prewarm worker pool (branch `builder-sim-prewarm/phase1-shared-pool`, worktree
-`../builder-sim-prewarm-phase1`, crate `base-execution-payload-builder`). Rebasing this
-harness onto that work is a separate step; this file records exactly what the wiring looks
-like afterwards, verified against that branch's source.
+Status: **wired**. `--prewarm` / `--prewarm-simulate` drive the production
+`PrewarmWorkerPool` from `ReplayBuildBench::execute` (see `src/bench.rs`); the fail-closed
+`ensure_prewarm_unwired` guard is gone, replaced by `validate_prewarm_flags`
+(`--prewarm-simulate` requires `--prewarm`) and by `prewarm.active` in the JSON output.
+This file is kept as the record of the plan; the two deviations the implementation had to
+make are noted below.
 
 ## Production API (as of `builder-sim-prewarm/phase1-shared-pool`)
 
@@ -139,7 +138,10 @@ In `bench.rs`:
   shared with worker threads as-is. Faithful fix: give `DurableStateProvider` an
   `Arc<RwLock<StateOverlay>>` and a `from_parts(anchor, overlay)` constructor, then the
   factory closure opens a fresh per-worker anchor from the (cloneable, `'static`)
-  `ProviderFactory` and layers the shared overlay on it:
+  `ProviderFactory` and layers the shared overlay on it (**as implemented**; the anchor is
+  *not* shared, because `StateProviderBox` is `Box<dyn StateProvider + Send>` and not
+  `Sync`, so an `Arc<StateProviderBox>` would itself be `!Send` and could never reach a
+  worker thread):
   ```rust
   let factory = factory.clone();
   let overlay = Arc::clone(&durable.overlay_handle());
@@ -149,6 +151,18 @@ In `bench.rs`:
   Overlay writes happen between blocks, while no job is running, so workers only ever take
   read guards. Note this gives each worker its own MDBX read transaction — same as
   production, where each worker calls `client.state_by_block_hash(parent)`.
+
+## Implementation deviations
+
+- **The builder config is still constructed per block** rather than cloned from one hoisted
+  `BaseBuilderConfig` (step 1): `BaseBuilderConfig::clone` shares its `RejectionCache`
+  (a `moka` cache), which would carry permanent rejections across replayed blocks and change
+  the prewarm-off baseline. Only the `PrewarmConfig` (a `Copy` value) is hoisted.
+- **The job is joined, not just dropped, after each build** (step 5): the harness advances
+  the shared `ExecutionCache` itself (`insert_state`), where production relies on the engine
+  refusing to advance a cache that still has extra handles. Without the untimed join a
+  worker still reading parent state could write pre-block values back into the cache after
+  canonical advancement and corrupt later blocks.
 
 ## ABBA arms once wired
 
