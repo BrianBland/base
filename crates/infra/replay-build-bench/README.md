@@ -56,6 +56,14 @@ target/release/base-replay-build-bench --datadir <private-snapshot> \
     --run --count 64 --output results.json
 ```
 
+The `--prewarm*` flags configure the builder's concurrent prewarming for an
+ABBA prewarm-off vs prewarm-on comparison. Prewarming is **not wired on this
+branch** (the API arrives with the shared prewarm worker pool), so `--prewarm`
+and `--prewarm-simulate` fail the run instead of reporting a prewarm-off
+measurement as prewarm-on; the requested configuration is echoed as `prewarm`
+in the JSON output with `wired: false`. See `PREWARM_WIRING.md` for the exact
+wiring plan.
+
 `--datadir` must be a private snapshot root (private `db/mdbx.dat` plus shared
 read-only `rocksdb`/`static_files` links; see `~/perf-tools` on the devbox).
 `--from` defaults to `head - count` so the whole replay range is contained in
