@@ -844,7 +844,13 @@ where
     /// overlay layered on the worker's cache-filling provider. Every read the transaction
     /// performs lands in the build's shared cache; all output is discarded, so the build
     /// loop still executes the transaction itself.
-    fn simulation_setup<T>(&self) -> Option<SimSetup<T>>
+    ///
+    /// Public so out-of-crate drivers of the production build path (the replayed-building
+    /// benchmark in `base-replay-build-bench`) can wire the same simulation warming the
+    /// builder uses instead of duplicating it. It is a pure helper over
+    /// `builder_config.prewarm` and this build's EVM environment: it reads no state and
+    /// starts no work.
+    pub fn simulation_setup<T>(&self) -> Option<SimSetup<T>>
     where
         T: PoolTransaction<Consensus = TxTy<Evm::Primitives>> + BasePooledTx + 'static,
         Evm: 'static,
