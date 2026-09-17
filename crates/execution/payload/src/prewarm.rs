@@ -94,11 +94,30 @@ pub struct PrewarmConfig {
     /// Maximum distinct state keys scheduled per build; once reached the scheduler
     /// saturates and stops advancing the lookahead cursor.
     pub key_cap: usize,
+    /// Whether workers additionally run full transaction simulation to warm each
+    /// simulated transaction's entire EVM read set (not just declared predicate
+    /// keys). Strict opt-in on top of `enabled`; disabled by default.
+    pub simulate: bool,
+    /// Bounded lookahead in transactions for simulation jobs. Simulation is far
+    /// heavier than a single key read, so this is typically smaller than
+    /// `lookahead`. Only meaningful when `simulate` is set.
+    pub sim_lookahead: usize,
+    /// Maximum distinct simulation jobs scheduled per build; once reached the
+    /// simulation scheduler saturates. Only meaningful when `simulate` is set.
+    pub sim_job_cap: usize,
 }
 
 impl Default for PrewarmConfig {
     fn default() -> Self {
-        Self { enabled: false, worker_count: 2, lookahead: 64, key_cap: 4096 }
+        Self {
+            enabled: false,
+            worker_count: 2,
+            lookahead: 64,
+            key_cap: 4096,
+            simulate: false,
+            sim_lookahead: 16,
+            sim_job_cap: 256,
+        }
     }
 }
 

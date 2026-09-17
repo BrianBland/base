@@ -304,6 +304,20 @@ pub struct Args {
     #[arg(long = "builder.prewarm-key-cap", default_value = "4096")]
     pub prewarm_key_cap: usize,
 
+    /// Additionally run full transaction simulation on prewarm workers to warm each
+    /// simulated transaction's entire EVM read set, not just its declared predicate
+    /// keys. Strict opt-in on top of `--builder.enable-prewarming`.
+    #[arg(long = "builder.prewarm-simulate", default_value = "false")]
+    pub prewarm_simulate: bool,
+
+    /// Transactions scanned ahead of the build loop for simulation prewarming.
+    #[arg(long = "builder.prewarm-sim-lookahead", default_value = "16")]
+    pub prewarm_sim_lookahead: usize,
+
+    /// Maximum distinct simulation jobs scheduled per build.
+    #[arg(long = "builder.prewarm-sim-job-cap", default_value = "256")]
+    pub prewarm_sim_job_cap: usize,
+
     /// Flashblocks configuration
     #[command(flatten)]
     pub flashblocks: FlashblocksArgs,
@@ -384,6 +398,9 @@ impl Default for Args {
             prewarm_workers: 2,
             prewarm_lookahead: 64,
             prewarm_key_cap: 4096,
+            prewarm_simulate: false,
+            prewarm_sim_lookahead: 16,
+            prewarm_sim_job_cap: 256,
             flashblocks: FlashblocksArgs::default(),
             payload_builder_cutover: false,
             basic_payload_builder: false,
@@ -425,6 +442,13 @@ impl Args {
                     && self.prewarm_lookahead > 0
                     && self.prewarm_key_cap > 0),
             "enabled prewarming requires positive workers, lookahead, and key cap"
+        );
+        eyre::ensure!(
+            !self.prewarm_simulate
+                || (self.enable_prewarming
+                    && self.prewarm_sim_lookahead > 0
+                    && self.prewarm_sim_job_cap > 0),
+            "prewarm simulation requires prewarming enabled with positive sim lookahead and job cap"
         );
         if self.flashblock_execution_time_budget_us.is_some()
             || self.block_state_root_gas_limit.is_some()
@@ -471,6 +495,9 @@ impl Args {
                 worker_count: self.prewarm_workers,
                 lookahead: self.prewarm_lookahead,
                 key_cap: self.prewarm_key_cap,
+                simulate: self.prewarm_simulate,
+                sim_lookahead: self.prewarm_sim_lookahead,
+                sim_job_cap: self.prewarm_sim_job_cap,
             },
         })
     }
@@ -534,7 +561,13 @@ mod tests {
         ]);
         assert_eq!(
             convert(parsed.args).prewarm,
-            PrewarmConfig { enabled: true, worker_count: 4, lookahead: 32, key_cap: 512 }
+            PrewarmConfig {
+                enabled: true,
+                worker_count: 4,
+                lookahead: 32,
+                key_cap: 512,
+                ..PrewarmConfig::default()
+            }
         );
     }
 
@@ -547,6 +580,43 @@ mod tests {
         ] {
             let parsed =
                 CommandParser::parse_from(["builder", "--builder.enable-prewarming", flag, "0"]);
+            assert!(parsed.args.into_builder_config(Arc::new(NoopMeteringProvider)).is_err());
+        }
+    }
+
+    #[test]
+    fn simulation_flags_map_to_config() {
+        let parsed = CommandParser::parse_from([
+            "builder",
+            "--builder.enable-prewarming",
+            "--builder.prewarm-simulate",
+            "--builder.prewarm-sim-lookahead",
+            "8",
+            "--builder.prewarm-sim-job-cap",
+            "64",
+        ]);
+        let prewarm = convert(parsed.args).prewarm;
+        assert!(prewarm.simulate);
+        assert_eq!(prewarm.sim_lookahead, 8);
+        assert_eq!(prewarm.sim_job_cap, 64);
+    }
+
+    #[test]
+    fn simulation_requires_prewarming_enabled() {
+        let parsed = CommandParser::parse_from(["builder", "--builder.prewarm-simulate"]);
+        assert!(parsed.args.into_builder_config(Arc::new(NoopMeteringProvider)).is_err());
+    }
+
+    #[test]
+    fn enabled_simulation_rejects_zero_limits() {
+        for flag in ["--builder.prewarm-sim-lookahead", "--builder.prewarm-sim-job-cap"] {
+            let parsed = CommandParser::parse_from([
+                "builder",
+                "--builder.enable-prewarming",
+                "--builder.prewarm-simulate",
+                flag,
+                "0",
+            ]);
             assert!(parsed.args.into_builder_config(Arc::new(NoopMeteringProvider)).is_err());
         }
     }
