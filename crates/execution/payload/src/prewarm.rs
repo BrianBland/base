@@ -124,9 +124,10 @@ pub struct PrewarmConfig {
     /// simulated transaction's entire EVM read set (not just declared predicate
     /// keys). Strict opt-in on top of `enabled`; disabled by default.
     pub simulate: bool,
-    /// Bounded lookahead in transactions for simulation jobs. Simulation is far
-    /// heavier than a single key read, so this is typically smaller than
-    /// `lookahead`. Only meaningful when `simulate` is set.
+    /// Maximum simulations outstanding (queued or in flight) at any time. Simulation is
+    /// far heavier than a single key read, so this bounds how far warming runs ahead of
+    /// the build loop and self-throttles to worker throughput. Only meaningful when
+    /// `simulate` is set.
     pub sim_lookahead: usize,
     /// Maximum distinct simulation jobs scheduled per build; once reached the
     /// simulation scheduler saturates. Only meaningful when `simulate` is set.
@@ -244,8 +245,7 @@ pub type SimJobFactory<T> = dyn Fn(&T) -> Option<SimJob> + Send + Sync;
 pub struct SimSetup<T> {
     /// Builds the simulation job for one lookahead transaction.
     pub factory: Arc<SimJobFactory<T>>,
-    /// Bounded simulation lookahead: the initial burst of transactions to simulate, then
-    /// one further simulation per candidate the build loop consumes.
+    /// Maximum simulations outstanding (queued or in flight) at any time.
     pub lookahead: usize,
 }
 
@@ -554,6 +554,11 @@ impl PrewarmScheduler {
         self.sim.lock().expect("prewarm scheduler mutex poisoned").pending.remove(tx_hash);
     }
 
+    /// Returns the number of scheduled simulations that have not finished executing.
+    pub fn pending_simulations(&self) -> usize {
+        self.sim.lock().expect("prewarm scheduler mutex poisoned").pending.len()
+    }
+
     /// Returns whether `tx_hash` has a scheduled simulation that has not finished.
     pub fn simulation_pending(&self, tx_hash: &TxHash) -> bool {
         self.sim.lock().expect("prewarm scheduler mutex poisoned").pending.contains(tx_hash)
@@ -845,10 +850,13 @@ where
     pub prewarm: Option<Arc<PrewarmScheduler>>,
     /// Transaction-simulation warming setup. `None` when simulation warming is off.
     pub sim: Option<SimSetup<T>>,
-    /// Remaining simulation budget: seeded with the simulation lookahead and replenished
-    /// by one per candidate the build loop consumes, so warming stays a bounded window
-    /// ahead of the build loop rather than committing workers to the whole cursor.
-    pub sim_budget: usize,
+    /// Simulation-eligible transactions waiting for a slot in the bounded simulation
+    /// window, nearest the build loop first.
+    ///
+    /// The lookahead cursor is shared with predicate-key warming and runs far ahead of the
+    /// simulation window, so transactions that find the window full are held here instead
+    /// of being lost: the cursor cannot be rewound.
+    pub sim_deferred: VecDeque<Arc<ValidPoolTransaction<T>>>,
 }
 
 impl<I, T> std::fmt::Debug for PrewarmingBestTransactions<I, T>
@@ -861,7 +869,7 @@ where
             .field("has_cursor", &self.cursor.is_some())
             .field("has_scheduler", &self.prewarm.is_some())
             .field("has_simulation", &self.sim.is_some())
-            .field("sim_budget", &self.sim_budget)
+            .field("sim_deferred", &self.sim_deferred.len())
             .finish_non_exhaustive()
     }
 }
@@ -900,8 +908,7 @@ where
         prewarm: Option<Arc<PrewarmScheduler>>,
         sim: Option<SimSetup<T>>,
     ) -> Self {
-        let sim_budget = sim.as_ref().map_or(0, |sim| sim.lookahead);
-        let mut adapter = Self { inner, cursor, prewarm, sim, sim_budget };
+        let mut adapter = Self { inner, cursor, prewarm, sim, sim_deferred: VecDeque::new() };
         let initial = adapter.prewarm.as_ref().map_or(0, |scheduler| scheduler.lookahead());
         adapter.advance_lookahead(initial);
         adapter
@@ -913,6 +920,15 @@ where
     /// blocks.
     pub fn advance_lookahead(&mut self, budget: usize) {
         let Some(scheduler) = self.prewarm.clone() else { return };
+        self.advance_cursor(&scheduler, budget);
+        // Always drain: the simulation window reopens as workers finish, independently of
+        // whether the shared cursor still has transactions left to scan.
+        self.drain_simulations(&scheduler);
+    }
+
+    /// Advances the shared lookahead cursor by at most `budget` transactions, warming each
+    /// transaction's declared predicate keys and queueing it for simulation if eligible.
+    fn advance_cursor(&mut self, scheduler: &PrewarmScheduler, budget: usize) {
         for _ in 0..budget {
             if !scheduler.should_advance_cursor() {
                 self.cursor = None;
@@ -923,34 +939,54 @@ where
                 return;
             };
             scheduler.schedule_transaction(&transaction.transaction);
-            self.schedule_simulation(&scheduler, &transaction.transaction);
+            self.defer_simulation(scheduler, transaction);
         }
     }
 
-    /// Schedules one lookahead transaction's simulation, within the bounded simulation
-    /// window.
+    /// Queues one lookahead transaction for simulation, if it is eligible.
     ///
     /// Phase 1 policy: only transactions that declare no validity predicates are
     /// simulated. Predicated transactions already have their declared state warmed cheaply
     /// by [`PrewarmScheduler::schedule_transaction`] and are the ones the build loop is
     /// most likely to skip, so worker time goes to transactions that are certain to
-    /// execute against snapshot state. Reordering the cursor to simulate non-predicated
-    /// transactions first and then fall back to predicated ones needs lookahead buffering
-    /// and is deferred.
-    fn schedule_simulation(&mut self, scheduler: &PrewarmScheduler, transaction: &T) {
+    /// execute against snapshot state.
+    fn defer_simulation(
+        &mut self,
+        scheduler: &PrewarmScheduler,
+        transaction: Arc<ValidPoolTransaction<T>>,
+    ) {
         let Some(sim) = self.sim.as_ref() else { return };
-        if self.sim_budget == 0 || !transaction.validity_predicates().is_empty() {
+        if !transaction.transaction.validity_predicates().is_empty() || scheduler.is_sim_saturated()
+        {
             return;
         }
-        if scheduler.is_sim_saturated() {
-            self.sim_budget = 0;
-            return;
+        // Bounded by the per-build job cap: beyond it nothing more can be scheduled
+        // anyway, so holding further transactions would only grow memory. The transactions
+        // held are the ones nearest the build loop, so a full buffer drops the farthest.
+        if self.sim_deferred.len() < scheduler.sim_job_cap.max(sim.lookahead) {
+            self.sim_deferred.push_back(transaction);
         }
-        let Some(job) = (sim.factory)(transaction) else { return };
-        if scheduler.schedule_simulation(job) {
-            self.sim_budget -= 1;
-        } else {
-            self.sim_budget = 0;
+    }
+
+    /// Schedules deferred simulations while the bounded simulation window has room.
+    ///
+    /// The window counts simulations that are queued or in flight, so it drains as workers
+    /// finish: warming self-throttles to worker throughput instead of committing the whole
+    /// cursor, and always picks the transactions nearest the build loop first.
+    fn drain_simulations(&mut self, scheduler: &PrewarmScheduler) {
+        let Some(lookahead) = self.sim.as_ref().map(|sim| sim.lookahead) else { return };
+        while scheduler.pending_simulations() < lookahead {
+            if scheduler.is_sim_saturated() {
+                self.sim_deferred.clear();
+                return;
+            }
+            let Some(transaction) = self.sim_deferred.pop_front() else { return };
+            let Some(sim) = self.sim.as_ref() else { return };
+            let Some(job) = (sim.factory)(&transaction.transaction) else { continue };
+            if !scheduler.schedule_simulation(job) {
+                self.sim_deferred.clear();
+                return;
+            }
         }
     }
 }
@@ -964,18 +1000,15 @@ where
 
     fn next(&mut self, ctx: ()) -> Option<Self::Transaction> {
         let transaction = self.inner.next(ctx)?;
-        if self.sim.is_some() {
-            // The build loop reaching a transaction whose simulation is still queued or in
-            // flight means warming did not stay ahead: the read set it would have warmed
-            // is not there yet. Counted to measure whether the simulation window and
-            // worker budget keep up with the build loop.
-            if let Some(scheduler) = self.prewarm.as_ref()
-                && scheduler.simulation_pending(transaction.hash())
-            {
-                PrewarmMetrics::canonical_overtook_sim_total().increment(1);
-            }
-            // Replenish the bounded simulation window as the build loop advances.
-            self.sim_budget += 1;
+        // The build loop reaching a transaction whose simulation is still queued or in
+        // flight means warming did not stay ahead: the read set it would have warmed is
+        // not there yet. Counted to measure whether the simulation window and worker
+        // budget keep up with the build loop.
+        if self.sim.is_some()
+            && let Some(scheduler) = self.prewarm.as_ref()
+            && scheduler.simulation_pending(transaction.hash())
+        {
+            PrewarmMetrics::canonical_overtook_sim_total().increment(1);
         }
         // One lookahead advance per consumed candidate keeps the schedule bounded.
         self.advance_lookahead(1);
@@ -1040,6 +1073,70 @@ mod tests {
             key_cap,
             ..PrewarmConfig::default()
         }
+    }
+
+    fn sim_config(
+        workers: usize,
+        lookahead: usize,
+        sim_lookahead: usize,
+        sim_job_cap: usize,
+    ) -> PrewarmConfig {
+        PrewarmConfig {
+            enabled: true,
+            worker_count: workers,
+            lookahead,
+            key_cap: 64,
+            simulate: true,
+            sim_lookahead,
+            sim_job_cap,
+        }
+    }
+
+    /// A simulation job standing in for the builder-supplied EVM closure: it performs the
+    /// account, storage, and bytecode reads a real `transact` would issue through the
+    /// worker's cache-filling provider.
+    fn reading_sim_job(
+        tx_hash: TxHash,
+        address: Address,
+        slot: U256,
+    ) -> (SimJob, Arc<AtomicUsize>) {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let job = SimJob {
+            tx_hash,
+            simulate: {
+                let runs = Arc::clone(&runs);
+                Box::new(move |provider| {
+                    runs.fetch_add(1, Ordering::Relaxed);
+                    let _ = provider.basic_account(&address);
+                    let _ = provider.storage(address, StorageKey::new(slot.to_be_bytes()));
+                })
+            },
+        };
+        (job, runs)
+    }
+
+    /// A no-op simulation job, for scheduling-only assertions.
+    fn noop_sim_job(tx_hash: TxHash) -> SimJob {
+        SimJob { tx_hash, simulate: Box::new(|_| {}) }
+    }
+
+    /// A simulation setup recording every transaction the adapter asks it to simulate.
+    fn recording_sim_setup(
+        lookahead: usize,
+    ) -> (SimSetup<BasePooledTransaction>, Arc<Mutex<Vec<TxHash>>>) {
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let setup = SimSetup {
+            lookahead,
+            factory: {
+                let requested = Arc::clone(&requested);
+                Arc::new(move |transaction: &BasePooledTransaction| {
+                    let tx_hash = *transaction.hash();
+                    requested.lock().unwrap().push(tx_hash);
+                    Some(noop_sim_job(tx_hash))
+                })
+            },
+        };
+        (setup, requested)
     }
 
     fn balance_predicate(address: Address) -> ValidityPredicate {
@@ -1765,5 +1862,169 @@ mod tests {
 
         adapter.mark_invalid(second.sender(), second.nonce());
         assert_eq!(adapter.inner.invalidated, 1);
+    }
+
+    #[test]
+    fn simulation_job_warms_its_reads_into_the_shared_cache() {
+        let mock = MockEthProvider::default();
+        let address = Address::with_last_byte(11);
+        warmable_account(&mock, address);
+
+        let config = sim_config(1, 8, 4, 16);
+        let (pool, cache, factory, _account_reads, _storage_reads) =
+            test_pool(&config, &mock, Duration::ZERO);
+        let job = pool.try_start_job(factory, cache.clone()).expect("worker must take the job");
+
+        let tx_hash = TxHash::with_last_byte(1);
+        let (sim, runs) = reading_sim_job(tx_hash, address, U256::from(7));
+        assert!(job.scheduler().schedule_simulation(sim));
+        // The simulation is in flight until a worker finishes it.
+        assert!(
+            wait_until(
+                || runs.load(Ordering::Relaxed) == 1
+                    && !job.scheduler().simulation_pending(&tx_hash),
+                Duration::from_secs(5)
+            ),
+            "the worker must run the simulation and then mark it finished"
+        );
+        job.join();
+
+        // The simulated reads are in the shared cache: a build-side provider over an empty
+        // backend is served entirely from it, exactly as for predicate-key warming.
+        let build_backend = DelayStateProvider::new(MockEthProvider::default(), Duration::ZERO);
+        let build_provider =
+            CachedStateProvider::new(Box::new(build_backend.clone()), cache.clone(), None);
+        let mut db = reth_revm::database::StateProviderDatabase::new(build_provider);
+        let account = revm::Database::basic(&mut db, address).unwrap().expect("warmed account");
+        assert_eq!(account.balance, U256::from(100));
+        assert_eq!(
+            revm::Database::storage(&mut db, address, U256::from(7)).unwrap(),
+            U256::from(42)
+        );
+        assert_eq!(build_backend.account_reads(), 0, "warmed account must not hit the backend");
+        assert_eq!(build_backend.storage_reads(), 0, "warmed slot must not hit the backend");
+
+        drop(db);
+        let saved = reth_execution_cache::SavedCache::new(B256::ZERO, cache);
+        assert!(saved.is_available(), "the worker must release its cache handle");
+    }
+
+    #[test]
+    fn sim_scheduler_dedups_and_saturates_at_job_cap() {
+        let scheduler = PrewarmScheduler::new(&sim_config(1, 8, 4, 2));
+        let first = TxHash::with_last_byte(1);
+
+        assert!(scheduler.schedule_simulation(noop_sim_job(first)));
+        assert!(
+            scheduler.schedule_simulation(noop_sim_job(first)),
+            "duplicates count as scheduled"
+        );
+        assert_eq!(scheduler.queued_len(), 1, "a duplicate must not be queued twice");
+
+        assert!(scheduler.schedule_simulation(noop_sim_job(TxHash::with_last_byte(2))));
+        assert!(!scheduler.schedule_simulation(noop_sim_job(TxHash::with_last_byte(3))));
+        assert!(scheduler.is_sim_saturated(), "the job cap must saturate simulation");
+        assert_eq!(scheduler.queued_len(), 2);
+
+        // Predicate-key warming has its own budget and is unaffected.
+        assert!(!scheduler.is_saturated());
+        assert!(scheduler.schedule_key(WarmKey::Balance(Address::with_last_byte(1))));
+    }
+
+    #[test]
+    fn simulation_is_refused_unless_configured() {
+        let scheduler = PrewarmScheduler::new(&enabled_config(1, 8, 64));
+        assert!(scheduler.is_sim_saturated(), "simulation is off by default");
+        assert!(!scheduler.schedule_simulation(noop_sim_job(TxHash::with_last_byte(1))));
+        assert_eq!(scheduler.queued_len(), 0);
+        // A closed queue refuses simulation jobs too.
+        let scheduler = PrewarmScheduler::new(&sim_config(1, 8, 4, 16));
+        scheduler.close();
+        assert!(!scheduler.schedule_simulation(noop_sim_job(TxHash::with_last_byte(1))));
+    }
+
+    #[test]
+    fn adapter_simulates_only_non_predicated_transactions_in_a_bounded_window() {
+        let predicated = Address::with_last_byte(1);
+        let transactions = vec![
+            // Predicated: warmed by declared keys, never simulated.
+            validity_transaction(predicated, vec![balance_predicate(predicated)]),
+            validity_transaction(Address::with_last_byte(2), vec![]),
+            validity_transaction(Address::with_last_byte(3), vec![]),
+            validity_transaction(Address::with_last_byte(4), vec![]),
+        ];
+        let expected_first = *transactions[1].transaction.hash();
+        let expected_second = *transactions[2].transaction.hash();
+        let expected_third = *transactions[3].transaction.hash();
+
+        // A simulation window of one: only one simulation may be outstanding, so the rest
+        // wait for a worker to finish rather than being lost to the shared cursor.
+        let scheduler = Arc::new(PrewarmScheduler::new(&sim_config(1, 4, 1, 16)));
+        let (sim, requested) = recording_sim_setup(1);
+        let mut adapter =
+            PrewarmingBestTransactions::<SpyInner, BasePooledTransaction>::with_cursor(
+                SpyInner::new(transactions.clone()),
+                Some(Box::new(StaticCursor::new(transactions))),
+                Some(Arc::clone(&scheduler)),
+                Some(sim),
+            );
+
+        // The predicated transaction is skipped; the window admits exactly one simulation.
+        assert_eq!(
+            requested.lock().unwrap().as_slice(),
+            &[expected_first],
+            "only the first non-predicated transaction is simulated"
+        );
+        assert_eq!(
+            adapter.sim_deferred.len(),
+            2,
+            "the cursor ran ahead of the window; the rest wait instead of being dropped"
+        );
+
+        // No worker is running here, so the window only reopens as simulations finish.
+        scheduler.finish_simulation(&expected_first);
+        adapter.next(()).expect("candidate");
+        assert_eq!(requested.lock().unwrap().len(), 2);
+        assert_eq!(requested.lock().unwrap()[1], expected_second, "nearest the build loop first");
+
+        scheduler.finish_simulation(&expected_second);
+        adapter.next(()).expect("candidate");
+        assert_eq!(requested.lock().unwrap().len(), 3);
+        assert_eq!(requested.lock().unwrap()[2], expected_third);
+        assert!(adapter.sim_deferred.is_empty(), "every eligible transaction was simulated");
+
+        // The predicated transaction still had its declared key warmed.
+        assert!(scheduler.queued_len() >= 1);
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn build_loop_overtaking_an_unfinished_simulation_is_counted() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let transactions = vec![validity_transaction(Address::with_last_byte(2), vec![])];
+
+        let scheduler = Arc::new(PrewarmScheduler::new(&sim_config(1, 4, 4, 16)));
+        let (sim, _requested) = recording_sim_setup(4);
+        metrics::with_local_recorder(&recorder, || {
+            let mut adapter =
+                PrewarmingBestTransactions::<SpyInner, BasePooledTransaction>::with_cursor(
+                    SpyInner::new(transactions.clone()),
+                    Some(Box::new(StaticCursor::new(transactions))),
+                    Some(Arc::clone(&scheduler)),
+                    Some(sim),
+                );
+            // No worker is running, so the scheduled simulation is still pending when the
+            // build loop reaches the same transaction.
+            adapter.next(()).expect("candidate");
+        });
+
+        assert!(
+            handle
+                .render()
+                .lines()
+                .any(|line| line == "base_payload_prewarm_canonical_overtook_sim_total 1"),
+            "reaching a transaction whose simulation is still pending must be counted"
+        );
     }
 }
