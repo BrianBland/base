@@ -30,7 +30,7 @@ use reth_basic_payload_builder::{
 };
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_evm::{
-    BlockExecutorForEvm, ConfigureEvm, Database,
+    BlockExecutorForEvm, ConfigureEvm, Database, EvmEnvFor,
     execute::{
         BlockBuilder, BlockBuilderOutcome, BlockExecutionError, BlockExecutor, BlockValidationError,
     },
@@ -773,6 +773,66 @@ impl ExecutionInfo {
     }
 }
 
+/// Builds the transaction-simulation warming setup for a build whose next-block EVM
+/// environment is already known.
+///
+/// Single source of truth for the semantics of simulation warming, shared by every build
+/// path that wires it (the standard builder via
+/// [`BasePayloadBuilderCtx::simulation_setup`], and the flashblocks builder, which already
+/// carries the next-block env on its own context). Callers own the `simulate` gate: this
+/// function unconditionally builds a setup.
+///
+/// `evm_env` must be the environment of the block being built (the same one the build loop
+/// executes against), passed by value because it is relaxed and then captured.
+pub fn simulation_setup_for_env<Evm, T>(
+    evm_config: &Evm,
+    mut evm_env: EvmEnvFor<Evm>,
+    lookahead: usize,
+) -> SimSetup<T>
+where
+    Evm: ConfigureEvm + 'static,
+    T: PoolTransaction<Consensus = TxTy<Evm::Primitives>> + BasePooledTx + 'static,
+{
+    // Relax sender-side gating so a stale-nonce or underfunded lookahead transaction
+    // still exercises its call path and warms its reads. Output is discarded, so this
+    // cannot affect the built block.
+    evm_env.cfg_env.disable_nonce_check = true;
+    evm_env.cfg_env.disable_balance_check = true;
+    evm_env.cfg_env.disable_base_fee = true;
+
+    let evm_config = evm_config.clone();
+    let factory = move |transaction: &T| {
+        let tx_hash = *transaction.hash();
+        let recovered = transaction.clone_into_consensus();
+        let evm_config = evm_config.clone();
+        let evm_env = evm_env.clone();
+        let simulate = move |provider: &CachedStateProvider<StateProviderBox>| {
+            // A fresh throwaway overlay per simulation: simulated writes land here and
+            // are dropped with it, so they never reach the build's database. Only the
+            // reads reach the provider, which fills the shared cache.
+            let mut db = State::builder()
+                .with_database(StateProviderDatabase::new(provider))
+                .with_bundle_update()
+                .build();
+            let mut evm = evm_config.evm_with_env(&mut db, evm_env.clone());
+            // A revert or halt is a legitimate outcome that still warmed reads; only a
+            // database or environment failure is an error.
+            if let Err(error) = evm.transact(&recovered) {
+                PrewarmMetrics::sim_exec_errors_total().increment(1);
+                trace!(
+                    target: "payload_builder::prewarm",
+                    %tx_hash,
+                    %error,
+                    "prewarm transaction simulation failed",
+                );
+            }
+        };
+        Some(SimJob { simulate: Box::new(simulate), tx_hash })
+    };
+
+    SimSetup { factory: Arc::new(factory), lookahead }
+}
+
 /// Container type that holds all necessities to build a new payload.
 #[derive(derive_more::Debug)]
 pub struct BasePayloadBuilderCtx<
@@ -866,46 +926,9 @@ where
             self.chain_spec.as_ref(),
         )
         .ok()?;
-        let mut evm_env = self.evm_config.next_evm_env(self.parent(), &next_env).ok()?;
+        let evm_env = self.evm_config.next_evm_env(self.parent(), &next_env).ok()?;
 
-        // Relax sender-side gating so a stale-nonce or underfunded lookahead transaction
-        // still exercises its call path and warms its reads. Output is discarded, so this
-        // cannot affect the built block.
-        evm_env.cfg_env.disable_nonce_check = true;
-        evm_env.cfg_env.disable_balance_check = true;
-        evm_env.cfg_env.disable_base_fee = true;
-
-        let evm_config = self.evm_config.clone();
-        let factory = move |transaction: &T| {
-            let tx_hash = *transaction.hash();
-            let recovered = transaction.clone_into_consensus();
-            let evm_config = evm_config.clone();
-            let evm_env = evm_env.clone();
-            let simulate = move |provider: &CachedStateProvider<StateProviderBox>| {
-                // A fresh throwaway overlay per simulation: simulated writes land here and
-                // are dropped with it, so they never reach the build's database. Only the
-                // reads reach the provider, which fills the shared cache.
-                let mut db = State::builder()
-                    .with_database(StateProviderDatabase::new(provider))
-                    .with_bundle_update()
-                    .build();
-                let mut evm = evm_config.evm_with_env(&mut db, evm_env.clone());
-                // A revert or halt is a legitimate outcome that still warmed reads; only a
-                // database or environment failure is an error.
-                if let Err(error) = evm.transact(&recovered) {
-                    PrewarmMetrics::sim_exec_errors_total().increment(1);
-                    trace!(
-                        target: "payload_builder::prewarm",
-                        %tx_hash,
-                        %error,
-                        "prewarm transaction simulation failed",
-                    );
-                }
-            };
-            Some(SimJob { simulate: Box::new(simulate), tx_hash })
-        };
-
-        Some(SimSetup { factory: Arc::new(factory), lookahead: prewarm.sim_lookahead })
+        Some(simulation_setup_for_env(&self.evm_config, evm_env, prewarm.sim_lookahead))
     }
 
     /// Prepares a [`BlockBuilder`] for the next block.
