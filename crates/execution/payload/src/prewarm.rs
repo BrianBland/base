@@ -249,6 +249,14 @@ pub struct SimSetup<T> {
     pub lookahead: usize,
 }
 
+// Hand-written so cloning never requires `T: Clone`: the transaction type only appears
+// behind the shared factory pointer. Cloning shares the one factory; it starts no work.
+impl<T> Clone for SimSetup<T> {
+    fn clone(&self) -> Self {
+        Self { factory: Arc::clone(&self.factory), lookahead: self.lookahead }
+    }
+}
+
 impl<T> std::fmt::Debug for SimSetup<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SimSetup").field("lookahead", &self.lookahead).finish_non_exhaustive()
