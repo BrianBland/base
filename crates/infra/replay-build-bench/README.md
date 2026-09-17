@@ -15,10 +15,13 @@ builder path** and the **real canonical execution path**, in that order:
    including a synchronous state root). The built payload is **discarded**;
    only timings and payload statistics are recorded.
 2. **Advance (untimed).** Execute the canonical block `i` with the real block
-   executor and insert the resulting bundle state into an `ExecutionCache`,
-   mirroring how the live node keeps uncommitted blocks in memory. Every
-   subsequent build therefore observes canonical post-state through a
-   `CachedStateProvider`, exactly like the live cross-block cache.
+   executor and fold the resulting bundle state into a durable in-process state
+   overlay (`DurableStateProvider`), then into the process-local
+   `ExecutionCache`. The overlay is the source of truth for cross-block state;
+   the `ExecutionCache` is layered above it as a read-through cache, exactly as
+   in production. Every subsequent build and canonical execution therefore
+   observes the exact post-state of block `i` regardless of cache capacity or
+   eviction order.
 3. **Validate.** Receipts and gas usage of the executed canonical block are
    compared against the receipts stored in the snapshot; any divergence aborts
    the run with evidence.
@@ -32,13 +35,17 @@ canonical `i` to advance state, then inject `i+1`'s transactions and repeat.
   interval**; the live sequencer overlaps it with a parallel state-root job.
   Build timings are therefore an upper bound on the sealing component.
 - The state root of a *built* payload can diverge from canonical for accounts
-  touched by earlier replayed (in-cache) blocks, because trie nodes are read
-  from the anchor provider. This does not affect execution semantics, which
-  always observe the correct post-state; validation is anchored to the
-  canonical execution receipts, not to built-payload roots.
+  touched by earlier replayed blocks, because trie nodes and hashed state are
+  read from the frozen anchor provider (the durable overlay serves
+  account/storage/bytecode reads, not trie nodes). This does not affect
+  execution semantics, which always observe the correct post-state; validation
+  is anchored to the canonical execution receipts, not to built-payload roots.
 - No transaction broadcast, no writes to any database: the snapshot is opened
-  read-only and all state advancement stays in the process-local
-  `ExecutionCache`. Unwinding is discarding the snapshot.
+  read-only and all state advancement stays in the process-local durable
+  overlay and `ExecutionCache`. Unwinding is discarding the snapshot.
+- The durable overlay grows with the replay range (accounts and slots touched
+  by replayed blocks); its size is reported as `durable_overlay` in the JSON
+  output. `--count` is capped at 1000 blocks.
 
 ## Usage
 

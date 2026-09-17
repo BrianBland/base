@@ -45,6 +45,7 @@ use reth_revm::{cached::CachedReads, cancelled::CancelOnDrop, database::StatePro
 use reth_stages_types::StageId;
 use reth_storage_api::{AccountReader as _, ReceiptProvider as _, TransactionVariant};
 use reth_tasks::{RayonConfig, RuntimeBuilder, RuntimeConfig, TokioConfig};
+use crate::durable_state::DurableStateProvider;
 use reth_transaction_pool::{
     BestTransactions as _, BestTransactionsAttributes, TransactionOrigin, ValidPoolTransaction,
     identifier::{SenderId, TransactionId},
@@ -418,11 +419,18 @@ impl ReplayBuildBench {
 
         let evm_config = BaseEvmConfig::base(Arc::clone(&chain));
         let cache = ExecutionCache::new(self.cache_mib * 1024 * 1024);
-        // Anchor state is fixed; the ExecutionCache accumulates the canonical
-        // bundles of every replayed block, mirroring the live cross-block cache.
-        let anchor_state = factory.history_by_block_number(from)?;
+        // The snapshot is read-only and its state is frozen at `from`, so canonical
+        // advancement lives in process. `DurableStateProvider` is the source of truth:
+        // it retains the canonical bundle of every replayed block, unbounded, layered
+        // directly on the frozen anchor. The `ExecutionCache` sits above it purely as a
+        // read-through performance cache, as in production - it is fixed-capacity and
+        // collision-evicting, so it must never be the only place cross-block state lives
+        // (an evicted accumulated entry used to fall through to the frozen anchor and
+        // return pre-replay values, nondeterministically aborting the run with
+        // `nonce N too high, expected N-1`).
+        let durable = DurableStateProvider::new(factory.history_by_block_number(from)?);
         let state = CachedStateProvider::new_with_mode(
-            anchor_state,
+            &durable,
             cache.clone(),
             CacheFillMode::FillOnMiss,
             None,
@@ -537,6 +545,10 @@ impl ReplayBuildBench {
                 BasicBlockExecutor::new(evm_config.clone(), StateProviderDatabase::new(&state));
             let output = executor.execute(&block)?;
             let execute_ns = execute.elapsed().as_nanos();
+            // Durable layer first (source of truth), then the read-through cache.
+            durable.apply(&output.state).map_err(|address| {
+                eyre!("inconsistent bundle state for {address} after block {block_number}")
+            })?;
             cache
                 .insert_state(&output.state)
                 .map_err(|()| eyre!("inconsistent bundle state after block {block_number}"))?;
@@ -611,9 +623,14 @@ impl ReplayBuildBench {
             "io_before": io_before,
             "io_after": io_after,
             "io_delta": io_before.zip(io_after).map(|(before, after)| after.delta(&before)),
+            "durable_overlay": {
+                "accounts": durable.overlay().accounts_len(),
+                "slots": durable.overlay().slots_len(),
+            },
             "blocks": rows,
             "scope": "real builder path with synchronous state root; built payloads discarded; \
-                      canonical advancement via ExecutionCache; validated against snapshot receipts",
+                      canonical advancement via a durable in-process state overlay behind a \
+                      read-through ExecutionCache; validated against snapshot receipts",
         }))
     }
 }
