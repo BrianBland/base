@@ -457,6 +457,9 @@ where
                 self.pool.clone(),
                 best_txs_attributes,
                 prewarm_scheduler.clone(),
+                // Transaction-simulation warming is wired into the standard payload
+                // builder only; the flashblocks path keeps predicate-key warming alone.
+                None,
             ),
             self.config.rejection_cache.clone(),
         );
@@ -665,6 +668,8 @@ where
             self.pool.clone(),
             best_txs_attributes,
             prewarm_scheduler.cloned(),
+            // Simulation warming is not wired into the flashblocks path; see above.
+            None,
         ));
         let transaction_pool_fetch_time = best_txs_start_time.elapsed();
         BuilderMetrics::transaction_pool_fetch_duration().record(transaction_pool_fetch_time);

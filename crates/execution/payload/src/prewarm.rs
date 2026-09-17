@@ -233,6 +233,28 @@ impl std::fmt::Debug for SimJob {
     }
 }
 
+/// Builds the [`SimJob`] for one pooled transaction.
+///
+/// Returns `None` when no simulation can be prepared for the transaction (for example the
+/// transaction cannot be converted into an EVM transaction environment). Built on the
+/// build thread, where the concrete `ConfigureEvm` type is known.
+pub type SimJobFactory<T> = dyn Fn(&T) -> Option<SimJob> + Send + Sync;
+
+/// Build-side transaction-simulation warming setup for the lookahead adapter.
+pub struct SimSetup<T> {
+    /// Builds the simulation job for one lookahead transaction.
+    pub factory: Arc<SimJobFactory<T>>,
+    /// Bounded simulation lookahead: the initial burst of transactions to simulate, then
+    /// one further simulation per candidate the build loop consumes.
+    pub lookahead: usize,
+}
+
+impl<T> std::fmt::Debug for SimSetup<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimSetup").field("lookahead", &self.lookahead).finish_non_exhaustive()
+    }
+}
+
 /// A unit of prewarm work dispatched to an IO worker.
 ///
 /// This is the extension seam for warming modes: variants slot into the same bounded
@@ -821,6 +843,12 @@ where
     pub cursor: Option<Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<T>>>>>,
     /// The build's prewarm scheduler. `None` when prewarming is inactive.
     pub prewarm: Option<Arc<PrewarmScheduler>>,
+    /// Transaction-simulation warming setup. `None` when simulation warming is off.
+    pub sim: Option<SimSetup<T>>,
+    /// Remaining simulation budget: seeded with the simulation lookahead and replenished
+    /// by one per candidate the build loop consumes, so warming stays a bounded window
+    /// ahead of the build loop rather than committing workers to the whole cursor.
+    pub sim_budget: usize,
 }
 
 impl<I, T> std::fmt::Debug for PrewarmingBestTransactions<I, T>
@@ -832,6 +860,8 @@ where
         f.debug_struct("PrewarmingBestTransactions")
             .field("has_cursor", &self.cursor.is_some())
             .field("has_scheduler", &self.prewarm.is_some())
+            .field("has_simulation", &self.sim.is_some())
+            .field("sim_budget", &self.sim_budget)
             .finish_non_exhaustive()
     }
 }
@@ -851,15 +881,16 @@ where
         pool: P,
         attributes: BestTransactionsAttributes,
         prewarm: Option<Arc<PrewarmScheduler>>,
+        sim: Option<SimSetup<T>>,
     ) -> Self
     where
         P: TransactionPool<Transaction = T>,
     {
         let cursor = prewarm
             .as_ref()
-            .filter(|scheduler| !scheduler.is_saturated())
+            .filter(|scheduler| scheduler.should_advance_cursor())
             .map(|_| pool.best_transactions_with_attributes(attributes));
-        Self::with_cursor(inner, cursor, prewarm)
+        Self::with_cursor(inner, cursor, prewarm, sim)
     }
 
     /// Wraps an existing lookahead cursor. Schedules the initial bounded burst.
@@ -867,20 +898,23 @@ where
         inner: I,
         cursor: Option<Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<T>>>>>,
         prewarm: Option<Arc<PrewarmScheduler>>,
+        sim: Option<SimSetup<T>>,
     ) -> Self {
-        let mut adapter = Self { inner, cursor, prewarm };
+        let sim_budget = sim.as_ref().map_or(0, |sim| sim.lookahead);
+        let mut adapter = Self { inner, cursor, prewarm, sim, sim_budget };
         let initial = adapter.prewarm.as_ref().map_or(0, |scheduler| scheduler.lookahead());
         adapter.advance_lookahead(initial);
         adapter
     }
 
     /// Advances the lookahead cursor by at most `budget` transactions, scheduling each
-    /// transaction's declared predicate state. Stops when the scheduler saturates or the
-    /// cursor is exhausted. Never blocks.
+    /// transaction's declared predicate state and, when simulation warming is on, its
+    /// simulation. Stops when scheduling saturates or the cursor is exhausted. Never
+    /// blocks.
     pub fn advance_lookahead(&mut self, budget: usize) {
-        let Some(scheduler) = self.prewarm.as_ref() else { return };
+        let Some(scheduler) = self.prewarm.clone() else { return };
         for _ in 0..budget {
-            if scheduler.is_saturated() {
+            if !scheduler.should_advance_cursor() {
                 self.cursor = None;
                 return;
             }
@@ -889,6 +923,34 @@ where
                 return;
             };
             scheduler.schedule_transaction(&transaction.transaction);
+            self.schedule_simulation(&scheduler, &transaction.transaction);
+        }
+    }
+
+    /// Schedules one lookahead transaction's simulation, within the bounded simulation
+    /// window.
+    ///
+    /// Phase 1 policy: only transactions that declare no validity predicates are
+    /// simulated. Predicated transactions already have their declared state warmed cheaply
+    /// by [`PrewarmScheduler::schedule_transaction`] and are the ones the build loop is
+    /// most likely to skip, so worker time goes to transactions that are certain to
+    /// execute against snapshot state. Reordering the cursor to simulate non-predicated
+    /// transactions first and then fall back to predicated ones needs lookahead buffering
+    /// and is deferred.
+    fn schedule_simulation(&mut self, scheduler: &PrewarmScheduler, transaction: &T) {
+        let Some(sim) = self.sim.as_ref() else { return };
+        if self.sim_budget == 0 || !transaction.validity_predicates().is_empty() {
+            return;
+        }
+        if scheduler.is_sim_saturated() {
+            self.sim_budget = 0;
+            return;
+        }
+        let Some(job) = (sim.factory)(transaction) else { return };
+        if scheduler.schedule_simulation(job) {
+            self.sim_budget -= 1;
+        } else {
+            self.sim_budget = 0;
         }
     }
 }
@@ -902,6 +964,19 @@ where
 
     fn next(&mut self, ctx: ()) -> Option<Self::Transaction> {
         let transaction = self.inner.next(ctx)?;
+        if self.sim.is_some() {
+            // The build loop reaching a transaction whose simulation is still queued or in
+            // flight means warming did not stay ahead: the read set it would have warmed
+            // is not there yet. Counted to measure whether the simulation window and
+            // worker budget keep up with the build loop.
+            if let Some(scheduler) = self.prewarm.as_ref()
+                && scheduler.simulation_pending(transaction.hash())
+            {
+                PrewarmMetrics::canonical_overtook_sim_total().increment(1);
+            }
+            // Replenish the bounded simulation window as the build loop advances.
+            self.sim_budget += 1;
+        }
         // One lookahead advance per consumed candidate keeps the schedule bounded.
         self.advance_lookahead(1);
         Some(transaction)
@@ -1655,6 +1730,7 @@ mod tests {
                 SpyInner::new(transactions.clone()),
                 Some(Box::new(StaticCursor::new(transactions))),
                 Some(Arc::clone(&scheduler)),
+                None,
             );
 
         // Initial bounded burst: lookahead transactions' keys are queued before the loop.

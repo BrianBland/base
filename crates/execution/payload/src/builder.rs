@@ -35,6 +35,7 @@ use reth_evm::{
         BlockBuilder, BlockBuilderOutcome, BlockExecutionError, BlockExecutor, BlockValidationError,
     },
 };
+use reth_execution_cache::CachedStateProvider;
 use reth_execution_types::BlockExecutionOutput;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::{BuildNextEnv, BuiltPayloadExecutedBlock};
@@ -46,7 +47,9 @@ use reth_revm::{
     cancelled::CancelOnDrop, database::StateProviderDatabase, db::State,
     witness::ExecutionWitnessRecord,
 };
-use reth_storage_api::{BlockReader, StateProvider, StateProviderFactory, errors::ProviderError};
+use reth_storage_api::{
+    BlockReader, StateProvider, StateProviderBox, StateProviderFactory, errors::ProviderError,
+};
 use reth_transaction_pool::{BestTransactionsAttributes, PoolTransaction, TransactionPool};
 use reth_trie_common::ExecutionWitnessMode;
 use reth_trie_parallel::state_root_task::PayloadStateRootHandle;
@@ -58,8 +61,9 @@ use crate::{
     InclusionTracker, MeteringProvider, ParkableBestPayloadTransactions,
     ParkablePayloadTransactions, ParkedPredicateIndex, PayloadPrimitives, PredicateLoadTracker,
     PredicateReadRecorder, PrewarmWorkerPool, PrewarmingBestTransactions, RejectionCacheMetrics,
-    StateChangeEffects, ValidityMetrics, ValidityPredicateEvaluation, config::BaseBuilderConfig,
-    error::BasePayloadBuilderError, payload::BaseBuiltPayload,
+    SimJob, SimSetup, StateChangeEffects, ValidityMetrics, ValidityPredicateEvaluation,
+    config::BaseBuilderConfig, error::BasePayloadBuilderError, metrics::PrewarmMetrics,
+    payload::BaseBuiltPayload,
 };
 
 macro_rules! emit_native_validity_event {
@@ -226,6 +230,7 @@ where
                 Transaction: PoolTransaction<Consensus = N::SignedTx> + BasePooledTx,
             >,
         Client: Clone + 'static,
+        Evm: 'static,
     {
         let BuildArguments {
             mut cached_reads,
@@ -270,10 +275,19 @@ where
         // lookahead adapter. When prewarming is inactive the adapter is a pure
         // pass-through over the inner iterator.
         let prewarm_scheduler = prewarm.as_ref().map(|job| Arc::clone(&job.scheduler));
+        // Transaction-simulation warming rides the same lookahead cursor and worker pool,
+        // so it only runs where predicate warming is already active.
+        let sim_setup = prewarm.as_ref().and_then(|_| ctx.simulation_setup());
         let cursor_pool = self.pool.clone();
         let best_with_prewarm = move |attributes: BestTransactionsAttributes| {
             let inner = best(attributes);
-            PrewarmingBestTransactions::new(inner, cursor_pool, attributes, prewarm_scheduler)
+            PrewarmingBestTransactions::new(
+                inner,
+                cursor_pool,
+                attributes,
+                prewarm_scheduler,
+                sim_setup,
+            )
         };
 
         let pool = self.pool.clone();
@@ -346,7 +360,7 @@ where
     Evm: ConfigureEvm<
             Primitives = N,
             NextBlockEnvCtx: BuildNextEnv<Attrs, N::BlockHeader, Client::ChainSpec>,
-        >,
+        > + 'static,
     Txs: BasePayloadTransactions<Pool>,
     Attrs: Attributes<Transaction = N::SignedTx>,
 {
@@ -820,6 +834,72 @@ where
     /// Returns true if the fees are higher than the previous payload.
     pub fn is_better_payload(&self, total_fees: U256) -> bool {
         is_better_payload(self.best_payload.as_ref(), total_fees)
+    }
+
+    /// Builds the transaction-simulation warming setup for this build, or `None` when
+    /// simulation warming is off or the build's EVM environment cannot be derived.
+    ///
+    /// The returned factory turns a pooled transaction into a [`SimJob`] whose closure runs
+    /// the full EVM for that transaction on a prewarm worker, against a throwaway state
+    /// overlay layered on the worker's cache-filling provider. Every read the transaction
+    /// performs lands in the build's shared cache; all output is discarded, so the build
+    /// loop still executes the transaction itself.
+    fn simulation_setup<T>(&self) -> Option<SimSetup<T>>
+    where
+        T: PoolTransaction<Consensus = TxTy<Evm::Primitives>> + BasePooledTx + 'static,
+        Evm: 'static,
+    {
+        let prewarm = &self.builder_config.prewarm;
+        if !prewarm.simulate {
+            return None;
+        }
+
+        let next_env = Evm::NextBlockEnvCtx::build_next_env(
+            self.attributes(),
+            self.parent(),
+            self.chain_spec.as_ref(),
+        )
+        .ok()?;
+        let mut evm_env = self.evm_config.next_evm_env(self.parent(), &next_env).ok()?;
+
+        // Relax sender-side gating so a stale-nonce or underfunded lookahead transaction
+        // still exercises its call path and warms its reads. Output is discarded, so this
+        // cannot affect the built block.
+        evm_env.cfg_env.disable_nonce_check = true;
+        evm_env.cfg_env.disable_balance_check = true;
+        evm_env.cfg_env.disable_base_fee = true;
+
+        let evm_config = self.evm_config.clone();
+        let factory = move |transaction: &T| {
+            let tx_hash = *transaction.hash();
+            let recovered = transaction.clone_into_consensus();
+            let evm_config = evm_config.clone();
+            let evm_env = evm_env.clone();
+            let simulate = move |provider: &CachedStateProvider<StateProviderBox>| {
+                // A fresh throwaway overlay per simulation: simulated writes land here and
+                // are dropped with it, so they never reach the build's database. Only the
+                // reads reach the provider, which fills the shared cache.
+                let mut db = State::builder()
+                    .with_database(StateProviderDatabase::new(provider))
+                    .with_bundle_update()
+                    .build();
+                let mut evm = evm_config.evm_with_env(&mut db, evm_env.clone());
+                // A revert or halt is a legitimate outcome that still warmed reads; only a
+                // database or environment failure is an error.
+                if let Err(error) = evm.transact(&recovered) {
+                    PrewarmMetrics::sim_exec_errors_total().increment(1);
+                    trace!(
+                        target: "payload_builder::prewarm",
+                        %tx_hash,
+                        %error,
+                        "prewarm transaction simulation failed",
+                    );
+                }
+            };
+            Some(SimJob { simulate: Box::new(simulate), tx_hash })
+        };
+
+        Some(SimSetup { factory: Arc::new(factory), lookahead: prewarm.sim_lookahead })
     }
 
     /// Prepares a [`BlockBuilder`] for the next block.

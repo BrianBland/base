@@ -49,8 +49,8 @@ pub use predicate_loads::{PredicateLoadTracker, PredicateReadRecorder};
 mod prewarm;
 pub use prewarm::{
     JobCompletion, KeyQueue, KeyQueueState, PrewarmConfig, PrewarmJob, PrewarmScheduler,
-    PrewarmWorkerPool, PrewarmingBestTransactions, SimJob, SimSchedulerState, SimulateFn, WarmJob,
-    WarmKey, WorkerJob, WorkerLease,
+    PrewarmWorkerPool, PrewarmingBestTransactions, SimJob, SimJobFactory, SimSchedulerState,
+    SimSetup, SimulateFn, WarmJob, WarmKey, WorkerJob, WorkerLease,
 };
 
 mod traits;
