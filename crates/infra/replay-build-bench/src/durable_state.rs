@@ -17,6 +17,13 @@
 //! production: evicting any cache entry is now harmless because the read falls through to
 //! the durable overlay instead of the anchor.
 //!
+//! The overlay is held behind an [`Arc<RwLock<_>>`](std::sync::RwLock) so the same
+//! canonical state can be observed by more than one provider: the replay loop's provider
+//! writes it between blocks, and prewarm worker threads read it through their own
+//! [`DurableStateProvider`] view built with [`DurableStateProvider::from_parts`] over an
+//! independently opened anchor. Readers only ever take read guards, so a view always sees
+//! a whole applied bundle, never a half-applied one.
+//!
 //! Trie-facing methods (state root, storage root, proofs, witnesses) delegate to the
 //! anchor without overlay data, so state roots computed over replayed blocks are not
 //! canonical. That is the pre-existing, documented harness caveat: built payloads are
@@ -26,7 +33,7 @@
 use std::{
     collections::HashMap,
     fmt,
-    sync::{RwLock, RwLockReadGuard},
+    sync::{Arc, RwLock, RwLockReadGuard},
 };
 
 use alloy_primitives::{Address, B256, BlockNumber, Bytes, StorageKey, StorageValue};
@@ -135,13 +142,27 @@ impl StateOverlay {
     }
 }
 
+/// A handle to the canonical post-state accumulated across replayed blocks.
+///
+/// Cloning the handle shares one overlay between the build loop and prewarm workers: the
+/// loop writes it between blocks and workers only ever take read guards.
+pub type SharedOverlay = Arc<RwLock<StateOverlay>>;
+
 /// A [`StateProvider`] serving the canonical post-state of every replayed block from a
 /// durable overlay, falling through to the frozen snapshot anchor.
+///
+/// The overlay is shared ([`SharedOverlay`]); the anchor is owned per provider. Sharing the
+/// anchor is not possible: [`StateProviderBox`] is `Box<dyn StateProvider + Send>` and not
+/// `Sync`, so an `Arc<StateProviderBox>` would itself be `!Send` and could not be handed to
+/// a prewarm worker. Each provider therefore opens its own anchor (its own MDBX read
+/// transaction) exactly as production prewarm workers each call
+/// `client.state_by_block_hash(parent)`; see [`Self::from_parts`].
 pub struct DurableStateProvider {
     /// Frozen historical state at the replay anchor.
     anchor: StateProviderBox,
-    /// Canonical post-state accumulated by [`Self::apply`].
-    overlay: RwLock<StateOverlay>,
+    /// Canonical post-state accumulated by [`Self::apply`], shared with every handle
+    /// built from the same overlay.
+    overlay: SharedOverlay,
 }
 
 impl fmt::Debug for DurableStateProvider {
@@ -155,9 +176,26 @@ impl fmt::Debug for DurableStateProvider {
 }
 
 impl DurableStateProvider {
-    /// Wraps the frozen anchor state with an empty overlay.
+    /// Wraps the frozen anchor state with a fresh, empty overlay.
     pub fn new(anchor: StateProviderBox) -> Self {
-        Self { anchor, overlay: RwLock::new(StateOverlay::default()) }
+        Self::from_parts(anchor, SharedOverlay::default())
+    }
+
+    /// Wraps `anchor` with an existing shared overlay.
+    ///
+    /// Used to build a second, read-only view of the same canonical state over an
+    /// independently opened anchor - for example inside a prewarm worker thread, which
+    /// needs an owned `'static` [`StateProviderBox`] for the parent state of the block
+    /// being built. Such a view must never [`apply`](Self::apply): the replay loop owns
+    /// canonical advancement.
+    pub fn from_parts(anchor: StateProviderBox, overlay: SharedOverlay) -> Self {
+        Self { anchor, overlay }
+    }
+
+    /// Returns a handle to the shared overlay, for building further views with
+    /// [`Self::from_parts`].
+    pub fn overlay_handle(&self) -> SharedOverlay {
+        Arc::clone(&self.overlay)
     }
 
     /// Folds one canonical block's bundle into the durable overlay.
@@ -304,7 +342,7 @@ impl HashedPostStateProvider for DurableStateProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{DurableStateProvider, StateOverlay};
+    use super::{DurableStateProvider, SharedOverlay, StateOverlay};
     use alloy_primitives::{Address, B256, U256};
     use reth_revm::{
         db::{
@@ -406,6 +444,17 @@ mod tests {
         );
     }
 
+    /// A `StateProviderBox` handed to a prewarm worker must be `Send + 'static`; the
+    /// overlay handle must additionally be `Send + Sync` to be captured by the worker
+    /// factory closure.
+    #[test]
+    fn provider_and_overlay_handle_are_thread_safe() {
+        const fn assert_send_static<T: Send + 'static>() {}
+        const fn assert_send_sync<T: Send + Sync + 'static>() {}
+        assert_send_static::<DurableStateProvider>();
+        assert_send_sync::<SharedOverlay>();
+    }
+
     #[test]
     fn provider_serves_overlay_over_anchor() {
         let address = Address::with_last_byte(1);
@@ -420,5 +469,33 @@ mod tests {
         assert_eq!(provider.basic_account(&address).unwrap().unwrap().nonce, 5);
         assert_eq!(provider.storage(address, B256::from(slot)).unwrap(), Some(U256::from(9u64)));
         assert_eq!(provider.storage(address, B256::with_last_byte(4)).unwrap(), None);
+    }
+
+    #[test]
+    fn views_sharing_an_overlay_observe_the_same_canonical_state() {
+        let address = Address::with_last_byte(1);
+        let slot = U256::from(3u64);
+        let provider = DurableStateProvider::new(Box::new(NoopProvider::default()));
+        // A worker-side view over its own anchor, sharing the loop's overlay.
+        let view = DurableStateProvider::from_parts(
+            Box::new(NoopProvider::default()),
+            provider.overlay_handle(),
+        );
+        assert_eq!(view.basic_account(&address).unwrap(), None);
+
+        // Applying through the loop's provider is visible to the view immediately.
+        provider
+            .apply(&bundle(address, AccountStatus::Changed, info(5), &[(slot, U256::from(9u64))]))
+            .unwrap();
+        assert_eq!(view.basic_account(&address).unwrap().unwrap().nonce, 5);
+        assert_eq!(view.storage(address, B256::from(slot)).unwrap(), Some(U256::from(9u64)));
+        assert_eq!(view.overlay().accounts_len(), 1);
+
+        // A view over an unrelated overlay is unaffected.
+        let separate = DurableStateProvider::from_parts(
+            Box::new(NoopProvider::default()),
+            SharedOverlay::default(),
+        );
+        assert_eq!(separate.basic_account(&address).unwrap(), None);
     }
 }
