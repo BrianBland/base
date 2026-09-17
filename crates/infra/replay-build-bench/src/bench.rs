@@ -234,6 +234,26 @@ pub struct ReplayBuildBench {
     /// Process-local `ExecutionCache` size in `MiB`.
     #[arg(long, default_value_t = 4096)]
     pub cache_mib: usize,
+    /// Run the builder's concurrent predicate-state prewarming during each build.
+    ///
+    /// Not wired on this branch: the prewarm API lands with the shared prewarm worker
+    /// pool. Setting this flag fails the run rather than reporting a prewarm-off arm as
+    /// prewarm-on. See `PREWARM_WIRING.md` in this crate.
+    #[arg(long)]
+    pub prewarm: bool,
+    /// Additionally run full transaction simulation on prewarm workers. Requires
+    /// `--prewarm`.
+    #[arg(long)]
+    pub prewarm_simulate: bool,
+    /// Number of prewarm IO worker threads (`PrewarmConfig::worker_count`).
+    #[arg(long, default_value_t = 2)]
+    pub prewarm_workers: usize,
+    /// Maximum simulations outstanding at any time (`PrewarmConfig::sim_lookahead`).
+    #[arg(long, default_value_t = 16)]
+    pub prewarm_sim_lookahead: usize,
+    /// Maximum simulation jobs scheduled per build (`PrewarmConfig::sim_job_cap`).
+    #[arg(long, default_value_t = 256)]
+    pub prewarm_sim_job_cap: usize,
     /// JSON destination, or '-' for stdout. Existing files are never overwritten.
     #[arg(long, default_value = "-")]
     pub output: PathBuf,
@@ -325,6 +345,39 @@ impl ReplayBuildBench {
         pool
     }
 
+    /// Echoes the requested prewarm configuration into the JSON output.
+    ///
+    /// The values mirror the fields of the builder's `PrewarmConfig`; `wired` records
+    /// whether this build of the harness can actually run prewarming.
+    pub fn prewarm_config(&self) -> Value {
+        json!({
+            "enabled": self.prewarm,
+            "simulate": self.prewarm_simulate,
+            "worker_count": self.prewarm_workers,
+            "sim_lookahead": self.prewarm_sim_lookahead,
+            "sim_job_cap": self.prewarm_sim_job_cap,
+            "wired": false,
+        })
+    }
+
+    /// Fails closed while prewarming is unwired, so no arm can be mislabelled.
+    ///
+    // TODO(prewarm-wiring): the prewarm API (`PrewarmConfig`, `PrewarmWorkerPool`,
+    // `PrewarmingBestTransactions`) lands with the shared prewarm worker pool, which is
+    // not part of this branch's base. Once this branch is rebased onto it, replace this
+    // guard with the wiring described in `PREWARM_WIRING.md` (crate root) and flip
+    // `wired` in `prewarm_config` to reflect the real state. Until then a prewarm request
+    // must fail rather than silently produce a prewarm-off measurement.
+    pub fn ensure_prewarm_unwired(&self) -> Result<()> {
+        ensure!(
+            !(self.prewarm || self.prewarm_simulate),
+            "prewarm is not wired on this branch: rebase onto the shared prewarm worker \
+             pool and complete the wiring in PREWARM_WIRING.md before benchmarking a \
+             prewarm arm"
+        );
+        Ok(())
+    }
+
     /// Writes a single JSON document, outside all build-loop timings.
     pub fn write_json(&self, value: &Value) -> Result<()> {
         let mut out: Box<dyn Write> = if self.output.as_os_str() == "-" {
@@ -345,6 +398,13 @@ impl ReplayBuildBench {
             self.count > 0 && self.count <= 1000 && self.cache_mib <= 256 * 1024,
             "count must be in 1..=1000 and cache_mib bounded"
         );
+        ensure!(
+            self.prewarm_workers <= 64
+                && self.prewarm_sim_lookahead <= 4096
+                && self.prewarm_sim_job_cap <= 65_536,
+            "prewarm worker/lookahead/job-cap must be bounded"
+        );
+        self.ensure_prewarm_unwired()?;
         if self.output.as_os_str() != "-" {
             let parent = self
                 .output
@@ -402,6 +462,7 @@ impl ReplayBuildBench {
             return self.write_json(&json!({
                 "benchmark": "base-replay-build", "mode": "inspect", "anchor": anchor,
                 "count": self.count, "cache_mib": self.cache_mib,
+                "prewarm": self.prewarm_config(),
             }));
         }
 
@@ -614,6 +675,7 @@ impl ReplayBuildBench {
             "from": from,
             "count": self.count,
             "cache_mib": self.cache_mib,
+            "prewarm": self.prewarm_config(),
             "startup_ns": startup.elapsed().as_nanos().saturating_sub(loop_ns),
             "loop_ns": loop_ns,
             "build_ns_total": build_ns_total,
@@ -681,6 +743,38 @@ mod tests {
         stages.storage_hashing = Some(10);
         assert!(stages.validate(10).is_ok());
         assert!(stages.validate(11).is_err());
+    }
+
+    #[test]
+    fn prewarm_flags_are_echoed_and_fail_closed_while_unwired() {
+        use clap::Parser as _;
+        let base = ReplayBuildBench::parse_from(["bench", "--datadir", "/snapshot", "--run"]);
+        assert!(base.ensure_prewarm_unwired().is_ok());
+        assert_eq!(base.prewarm_config()["enabled"], false);
+
+        let prewarm = ReplayBuildBench::parse_from([
+            "bench",
+            "--datadir",
+            "/snapshot",
+            "--run",
+            "--prewarm",
+            "--prewarm-simulate",
+            "--prewarm-workers",
+            "4",
+            "--prewarm-sim-lookahead",
+            "8",
+            "--prewarm-sim-job-cap",
+            "32",
+        ]);
+        let config = prewarm.prewarm_config();
+        assert_eq!(config["enabled"], true);
+        assert_eq!(config["simulate"], true);
+        assert_eq!(config["worker_count"], 4);
+        assert_eq!(config["sim_lookahead"], 8);
+        assert_eq!(config["sim_job_cap"], 32);
+        // Unwired prewarming must never report a prewarm-off run as prewarm-on.
+        assert_eq!(config["wired"], false);
+        assert!(prewarm.ensure_prewarm_unwired().is_err());
     }
 
     #[test]
