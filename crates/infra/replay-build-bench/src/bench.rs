@@ -33,8 +33,8 @@ use base_node_runner::BaseNode;
 use clap::Parser;
 use eyre::{Result, ensure, eyre};
 use reth_basic_payload_builder::{BuildOutcomeKind, PayloadConfig};
-use reth_execution_cache::{CacheFillMode, CachedStateProvider, ExecutionCache};
 use reth_evm::execute::{BasicBlockExecutor, Executor};
+use reth_execution_cache::{CacheFillMode, CachedStateProvider, ExecutionCache};
 use reth_payload_builder::PayloadId;
 use reth_payload_primitives::PayloadAttributes as _;
 use reth_primitives_traits::NodePrimitives;
@@ -48,7 +48,6 @@ use reth_storage_api::{
     AccountReader as _, ReceiptProvider as _, StateProviderBox, TransactionVariant,
 };
 use reth_tasks::{RayonConfig, RuntimeBuilder, RuntimeConfig, TokioConfig};
-use crate::durable_state::DurableStateProvider;
 use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, TransactionOrigin, ValidPoolTransaction,
     identifier::{SenderId, TransactionId},
@@ -56,6 +55,8 @@ use reth_transaction_pool::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+use crate::durable_state::DurableStateProvider;
 
 /// Persisted checkpoints controlling latest-state reads (not ancillary file tips).
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,10 +437,7 @@ impl ReplayBuildBench {
         );
         // Simulation warming rides the prewarm worker pool and its lookahead cursor, so
         // `--prewarm-simulate` alone would silently measure a prewarm-off arm.
-        ensure!(
-            self.prewarm || !self.prewarm_simulate,
-            "--prewarm-simulate requires --prewarm"
-        );
+        ensure!(self.prewarm || !self.prewarm_simulate, "--prewarm-simulate requires --prewarm");
         Ok(())
     }
 
@@ -477,14 +475,14 @@ impl ReplayBuildBench {
         }
         let chain = Arc::new(BaseChainSpec::mainnet());
         let runtime = RuntimeBuilder::new(
-            RuntimeConfig::default()
-                .with_tokio(TokioConfig::with_worker_threads(2))
-                .with_rayon(RayonConfig {
+            RuntimeConfig::default().with_tokio(TokioConfig::with_worker_threads(2)).with_rayon(
+                RayonConfig {
                     cpu_threads: Some(1),
                     storage_threads: Some(1),
                     state_trie_overlay_worker_threads: Some(1),
                     ..Default::default()
-                }),
+                },
+            ),
         )
         .build()?;
         let factory = BaseNode::provider_factory_builder().open_read_only(
@@ -493,9 +491,8 @@ impl ReplayBuildBench {
             runtime,
         )?;
         let head = factory.best_block_number()?;
-        let header = factory
-            .header_by_number(head)?
-            .ok_or_else(|| eyre!("missing persisted header"))?;
+        let header =
+            factory.header_by_number(head)?.ok_or_else(|| eyre!("missing persisted header"))?;
         let hash = header.hash_slow();
         let stages = StateStages::read(&factory)?;
         stages.validate(head)?;
@@ -631,8 +628,7 @@ impl ReplayBuildBench {
             let build = if self.no_build {
                 None
             } else {
-                let attributes =
-                    Self::attributes_for(&chain, header, parent.hash(), deposits)?;
+                let attributes = Self::attributes_for(&chain, header, parent.hash(), deposits)?;
                 let payload_id = attributes.payload_id(&parent.hash());
                 let ctx = BasePayloadBuilderCtx {
                     evm_config: evm_config.clone(),
@@ -664,32 +660,28 @@ impl ReplayBuildBench {
                     lookahead
                 });
                 let build = Instant::now();
-                let outcome = Builder::new(
-                    move |attributes: BestTransactionsAttributes| {
-                        let inner = ParkableBestPayloadTransactions::new(Box::new(
-                            ParkedBestTransactions::new(
-                                cursor,
-                                BaseOrdering::coinbase_tip(),
-                                attributes.basefee,
-                            ),
-                        ));
-                        // Wraps the same lane-aware parking the main iterator uses, so the
-                        // lookahead sees the transactions the build loop will see. A pure
-                        // pass-through when `scheduler` is `None`.
-                        let cursor: Option<
-                            Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<_>>>>,
-                        > = lookahead.map(|lookahead| {
-                            Box::new(ParkedBestTransactions::new(
-                                lookahead,
-                                BaseOrdering::coinbase_tip(),
-                                attributes.basefee,
-                            )) as Box<_>
-                        });
-                        PrewarmingBestTransactions::with_cursor(
-                            inner, cursor, scheduler, sim_setup,
-                        )
-                    },
-                )
+                let outcome = Builder::new(move |attributes: BestTransactionsAttributes| {
+                    let inner = ParkableBestPayloadTransactions::new(Box::new(
+                        ParkedBestTransactions::new(
+                            cursor,
+                            BaseOrdering::coinbase_tip(),
+                            attributes.basefee,
+                        ),
+                    ));
+                    // Wraps the same lane-aware parking the main iterator uses, so the
+                    // lookahead sees the transactions the build loop will see. A pure
+                    // pass-through when `scheduler` is `None`.
+                    let cursor: Option<
+                        Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<_>>>>,
+                    > = lookahead.map(|lookahead| {
+                        Box::new(ParkedBestTransactions::new(
+                            lookahead,
+                            BaseOrdering::coinbase_tip(),
+                            attributes.basefee,
+                        )) as Box<_>
+                    });
+                    PrewarmingBestTransactions::with_cursor(inner, cursor, scheduler, sim_setup)
+                })
                 .build(
                     CachedReads::default().as_db_mut(StateProviderDatabase::new(&state)),
                     &state,
@@ -709,8 +701,7 @@ impl ReplayBuildBench {
                     job.join();
                 }
                 let stats = match outcome {
-                    BuildOutcomeKind::Better { payload }
-                    | BuildOutcomeKind::Freeze(payload) => {
+                    BuildOutcomeKind::Better { payload } | BuildOutcomeKind::Freeze(payload) => {
                         let built = payload.block();
                         BuildStats {
                             build_ns,
@@ -730,7 +721,7 @@ impl ReplayBuildBench {
                         fees: fees.to_string(),
                     },
                     BuildOutcomeKind::Cancelled => {
-                        return Err(eyre!("build cancelled for block {block_number}"))
+                        return Err(eyre!("build cancelled for block {block_number}"));
                     }
                 };
                 Some(stats)
@@ -765,17 +756,13 @@ impl ReplayBuildBench {
                 .receipts_by_block(BlockHashOrNumber::Number(block_number))?
                 .ok_or_else(|| eyre!("missing canonical receipts for {block_number}"))?;
             let receipts_match = output.result.receipts.len() == canonical_receipts.len()
-                && output
-                    .result
-                    .receipts
-                    .iter()
-                    .zip(canonical_receipts.iter())
-                    .all(|(executed, canonical)| {
+                && output.result.receipts.iter().zip(canonical_receipts.iter()).all(
+                    |(executed, canonical)| {
                         executed.as_receipt().cumulative_gas_used
                             == canonical.as_receipt().cumulative_gas_used
-                            && executed.as_receipt().logs.len()
-                                == canonical.as_receipt().logs.len()
-                    });
+                            && executed.as_receipt().logs.len() == canonical.as_receipt().logs.len()
+                    },
+                );
             let gas_used_match = output.result.gas_used == header.gas_used;
             ensure!(
                 receipts_match && gas_used_match,
@@ -847,9 +834,10 @@ impl ReplayBuildBench {
 
 #[cfg(test)]
 mod tests {
-    use super::{IoSnapshot, PrewarmConfig, ReplayBuildBench, StateStages};
     use alloy_primitives::{B64, bytes};
     use base_common_consensus::JovianExtraData;
+
+    use super::{IoSnapshot, PrewarmConfig, ReplayBuildBench, StateStages};
 
     #[test]
     fn jovian_params_roundtrip_matches_encoder_layout() {

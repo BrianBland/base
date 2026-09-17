@@ -342,7 +342,6 @@ impl HashedPostStateProvider for DurableStateProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{DurableStateProvider, SharedOverlay, StateOverlay};
     use alloy_primitives::{Address, B256, U256};
     use reth_revm::{
         db::{
@@ -352,6 +351,8 @@ mod tests {
         state::AccountInfo,
     };
     use reth_storage_api::{AccountReader, StateProvider, noop::NoopProvider};
+
+    use super::{DurableStateProvider, SharedOverlay, StateOverlay};
 
     /// A single-account bundle: `address` ends the block with `nonce` and one written slot.
     fn bundle(
