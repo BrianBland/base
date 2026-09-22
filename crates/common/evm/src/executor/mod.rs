@@ -11,3 +11,6 @@ pub use block_executor::BaseBlockExecutor;
 
 mod context;
 pub use context::BaseBlockExecutionCtx;
+
+mod prepared;
+pub use prepared::{BalEligibility, BuildIdentity, IdentityMismatch, Ineligible, PreparedTx};

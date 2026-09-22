@@ -69,5 +69,6 @@ pub use zenith::ensure_eip8130_system_accounts;
 
 mod executor;
 pub use executor::{
-    BaseBlockExecutionCtx, BaseBlockExecutor, BaseBlockExecutorFactory, BaseTxResult,
+    BalEligibility, BaseBlockExecutionCtx, BaseBlockExecutor, BaseBlockExecutorFactory,
+    BaseTxResult, BuildIdentity, IdentityMismatch, Ineligible, PreparedTx,
 };
