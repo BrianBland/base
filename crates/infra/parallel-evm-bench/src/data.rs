@@ -63,7 +63,8 @@ impl BlockFixture {
             .iter()
             .map(|raw| BaseTxEnvelope::decode_2718(&mut raw.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        let body = BlockBody { transactions, ommers: vec![], withdrawals: Some(Default::default()) };
+        let body =
+            BlockBody { transactions, ommers: vec![], withdrawals: Some(Default::default()) };
         Ok(RecoveredBlock::new_unhashed(
             BaseBlock { header: self.header.clone(), body },
             self.senders.clone(),
@@ -83,11 +84,8 @@ pub struct PreDb {
 impl PreDb {
     /// Builds the in-memory database from a fixture.
     pub fn new(pre: &Prestate) -> Self {
-        let codes: FastMap<B256, Bytecode> = pre
-            .codes
-            .iter()
-            .map(|(hash, code)| (*hash, Bytecode::new_raw(code.clone())))
-            .collect();
+        let codes: FastMap<B256, Bytecode> =
+            pre.codes.iter().map(|(hash, code)| (*hash, Bytecode::new_raw(code.clone()))).collect();
         let accounts = pre
             .accounts
             .iter()
@@ -162,7 +160,8 @@ pub struct RpcRecorder {
 impl RpcRecorder {
     /// Creates a recorder reading state at `parent`.
     pub fn new(rpc: &str, parent: u64) -> Result<Self> {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let rt =
+            tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
         let provider = RootProvider::<Base>::new_http(rpc.parse()?);
         Ok(Self { rt, provider, at: BlockId::number(parent), pre: Mutex::default() })
     }
@@ -183,6 +182,37 @@ impl RpcRecorder {
             })
             .unzip();
         Ok((header, txs, senders))
+    }
+
+    /// Prefetches the hinted accounts and slots concurrently, so the serial execution pass only
+    /// waits on keys the hint missed.
+    pub fn prefetch(&self, hint: &Prestate) -> Result<()> {
+        let keys: Vec<(Address, Option<U256>)> = hint
+            .accounts
+            .keys()
+            .map(|a| (*a, None))
+            .chain(hint.storage.iter().flat_map(|(a, s)| s.keys().map(move |k| (*a, Some(*k)))))
+            .collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| -> Result<(), FetchError> {
+                        while let Some((address, slot)) =
+                            keys.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                        {
+                            match slot {
+                                Some(slot) => drop(self.storage_ref(*address, *slot)?),
+                                None => drop(self.basic_ref(*address)?),
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            workers.into_iter().try_for_each(|w| w.join().unwrap())
+        })?;
+        Ok(())
     }
 
     fn is_rate_limit(err: &str) -> bool {

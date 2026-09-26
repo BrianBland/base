@@ -43,6 +43,7 @@ use revm::{
     },
     handler::{EvmTr, FrameResult, Handler, evm::FrameTr, handler::EvmTrError},
     interpreter::{GasTracker, interpreter_action::FrameInit},
+    primitives::KECCAK_EMPTY,
     state::{AccountInfo, Bytecode, EvmState},
 };
 
@@ -198,7 +199,8 @@ impl Store<'_> {
         };
         let addresses = bundle.state.keys().copied().chain(self.accounts.iter().map(|e| *e.key()));
         for address in addresses {
-            let (want, got) = (account_key(&expected_account(&address)), account_key(&self.account(address)));
+            let (want, got) =
+                (account_key(&expected_account(&address)), account_key(&self.account(address)));
             if want != got {
                 diffs.push(format!("account {address}: want {want:?} got {got:?}"));
             }
@@ -269,12 +271,12 @@ pub struct MvMemory {
 }
 
 impl MvMemory {
-    fn latest(&self, loc: &Loc, tx: usize) -> Option<Value> {
-        self.writes.get(loc)?.range(..tx).next_back().map(|(_, v)| v.clone())
+    fn latest(&self, loc: &Loc, tx: usize) -> Option<(usize, Value)> {
+        self.writes.get(loc)?.range(..tx).next_back().map(|(w, v)| (*w, v.clone()))
     }
 
     fn visible(&self, store: &Store<'_>, loc: &Loc, tx: usize) -> Value {
-        self.latest(loc, tx).unwrap_or_else(|| match loc {
+        self.latest(loc, tx).map(|(_, v)| v).unwrap_or_else(|| match loc {
             Loc::Account(address) => Value::Account(store.account(*address)),
             Loc::Slot(address, slot) => Value::Slot(store.slot(*address, *slot)),
         })
@@ -319,53 +321,71 @@ impl MvMemory {
     }
 }
 
+/// A speculative read hit a value written by a transaction that is being re-executed (Block-STM's
+/// ESTIMATE): abort and retry once that transaction finishes.
+#[derive(Debug)]
+pub struct Blocked(pub usize);
+
+impl std::fmt::Display for Blocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "blocked on transaction {}", self.0)
+    }
+}
+
+impl std::error::Error for Blocked {}
+impl revm::context::DBErrorMarker for Blocked {}
+
 /// Database view for one execution: resolves reads through the multi-version memory (when
 /// speculating) or the committed state (at the commit frontier), recording every value read.
 #[derive(Debug)]
 pub struct RecordingDb<'a> {
     store: &'a Store<'a>,
-    mv: Option<&'a MvMemory>,
+    speculation: Option<(&'a MvMemory, &'a [AtomicU8])>,
     tx: usize,
     reads: Vec<Read>,
 }
 
 impl RecordingDb<'_> {
-    fn resolve(&self, loc: Loc) -> Value {
-        match self.mv {
-            Some(mv) => {
-                // Register before reading so a concurrent writer either sees us or we see it.
-                mv.readers.entry(loc).or_default().push(self.tx);
-                mv.visible(self.store, &loc, self.tx)
-            }
-            None => match loc {
+    fn resolve(&self, loc: Loc) -> Result<Value, Blocked> {
+        let Some((mv, status)) = self.speculation else {
+            return Ok(match loc {
                 Loc::Account(address) => Value::Account(self.store.account(address)),
                 Loc::Slot(address, slot) => Value::Slot(self.store.slot(address, slot)),
-            },
+            });
+        };
+        // Register before reading so a concurrent writer either sees us or we see it.
+        mv.readers.entry(loc).or_default().push(self.tx);
+        match mv.latest(&loc, self.tx) {
+            Some((writer, _)) if status[writer].load(Ordering::SeqCst) != EXECUTED => {
+                Err(Blocked(writer))
+            }
+            Some((_, value)) => Ok(value),
+            None => Ok(mv.visible(self.store, &loc, self.tx)),
         }
     }
 }
 
 impl Database for RecordingDb<'_> {
-    type Error = Infallible;
+    type Error = Blocked;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let Value::Account(account) = self.resolve(Loc::Account(address)) else { unreachable!() };
+        let Value::Account(account) = self.resolve(Loc::Account(address))? else { unreachable!() };
         self.reads.push(Read::Account(address, account_key(&account)));
         Ok(account)
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        self.store.code_by_hash_ref(code_hash)
+        Ok(self.store.code_by_hash_ref(code_hash).unwrap())
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        let Value::Slot(value) = self.resolve(Loc::Slot(address, index)) else { unreachable!() };
+        let Value::Slot(value) = self.resolve(Loc::Slot(address, index))? else { unreachable!() };
         self.reads.push(Read::Slot(address, index, value));
         Ok(value)
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        self.store.block_hash_ref(number)
+        Ok(self.store.block_hash_ref(number).unwrap())
     }
 }
 
@@ -504,6 +524,8 @@ pub struct TxTrace {
     pub reads: Vec<Loc>,
     /// Locations written, including deferred fee credits.
     pub writes: Vec<Loc>,
+    /// Subset of `writes` that only changed the balance of an account with code.
+    pub contract_balance_writes: Vec<Loc>,
     /// Execution time of the committed incarnation.
     pub nanos: u64,
 }
@@ -536,6 +558,8 @@ struct Scheduler<'a> {
     txs: Vec<BaseTransaction<TxEnv>>,
     status: Vec<AtomicU8>,
     invalidations: Vec<AtomicU64>,
+    /// Transaction each one last blocked on (`usize::MAX` = none).
+    waiting: Vec<AtomicUsize>,
     slots: Vec<Mutex<Option<Speculation>>>,
     frontier: AtomicUsize,
     stop: AtomicBool,
@@ -543,14 +567,20 @@ struct Scheduler<'a> {
 }
 
 impl Scheduler<'_> {
-    fn execute(&self, tx: usize, speculative: bool) -> Speculation {
+    fn execute(&self, tx: usize, speculative: bool) -> Result<Speculation, usize> {
         let start = Instant::now();
-        let db = RecordingDb { store: self.store, mv: speculative.then_some(&self.mv), tx, reads: Vec::new() };
+        let speculation = speculative.then_some((&self.mv, self.status.as_slice()));
+        let db = RecordingDb { store: self.store, speculation, tx, reads: Vec::new() };
         let mut evm = self.config.evm_with_env(db, self.env.clone());
         evm.ctx_mut().set_tx(self.txs[tx].clone());
-        let mut handler: LazyFeeHandler<_, EVMError<Infallible, BaseTransactionError>, _> =
+        let mut handler: LazyFeeHandler<_, EVMError<Blocked, BaseTransactionError>, _> =
             LazyFeeHandler::default();
-        let result = handler.run(&mut evm).ok();
+        self.executions.fetch_add(1, Ordering::Relaxed);
+        let result = match handler.run(&mut evm) {
+            Ok(result) => Some(result),
+            Err(EVMError::Database(Blocked(writer))) => return Err(writer),
+            Err(_) => None,
+        };
         let state = evm.ctx_mut().journal_mut().finalize();
         let reads = std::mem::take(&mut evm.ctx_mut().db_mut().reads);
         let writes = state
@@ -560,28 +590,34 @@ impl Scheduler<'_> {
                 let info = (!account.is_selfdestructed() && !account.is_empty())
                     .then(|| account.info.clone());
                 std::iter::once((Loc::Account(*address), Value::Account(info))).chain(
-                    account
-                        .changed_storage_slots()
-                        .map(|(slot, v)| (Loc::Slot(*address, *slot), Value::Slot(v.present_value))),
+                    account.changed_storage_slots().map(|(slot, v)| {
+                        (Loc::Slot(*address, *slot), Value::Slot(v.present_value))
+                    }),
                 )
             })
             .collect();
-        self.executions.fetch_add(1, Ordering::Relaxed);
-        Speculation {
+        Ok(Speculation {
             result,
             state,
             reads,
             writes,
             fees: handler.fees.take(),
             nanos: start.elapsed().as_nanos() as u64,
-        }
+        })
     }
 
     /// Runs a transaction the caller moved to `EXECUTING`, publishes its writes, and invalidates
     /// higher transactions that read a location whose value changed.
     fn run(&self, tx: usize, speculative: bool) {
         let seen = self.invalidations[tx].load(Ordering::SeqCst);
-        let spec = self.execute(tx, speculative);
+        let spec = match self.execute(tx, speculative) {
+            Ok(spec) => spec,
+            Err(writer) => {
+                self.waiting[tx].store(writer, Ordering::SeqCst);
+                self.status[tx].store(PENDING, Ordering::SeqCst);
+                return;
+            }
+        };
         let previous = self.slots[tx].lock().unwrap().take().map(|s| s.writes).unwrap_or_default();
         for loc in self.mv.publish(self.store, tx, &spec.writes, &previous) {
             if let Some(readers) = self.mv.readers.get(&loc) {
@@ -599,12 +635,23 @@ impl Scheduler<'_> {
         *self.slots[tx].lock().unwrap() = Some(spec);
         self.status[tx].store(EXECUTED, Ordering::SeqCst);
         if self.invalidations[tx].load(Ordering::SeqCst) != seen {
-            let _ = self.status[tx].compare_exchange(EXECUTED, PENDING, Ordering::SeqCst, Ordering::SeqCst);
+            let _ = self.status[tx].compare_exchange(
+                EXECUTED,
+                PENDING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
         }
     }
 
     fn claim(&self, tx: usize) -> bool {
-        self.status[tx].compare_exchange(PENDING, EXECUTING, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+        let waiting = self.waiting[tx].load(Ordering::SeqCst);
+        if waiting != usize::MAX && self.status[waiting].load(Ordering::SeqCst) != EXECUTED {
+            return false;
+        }
+        self.status[tx]
+            .compare_exchange(PENDING, EXECUTING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 
     /// Executes the lowest pending transaction above the commit frontier, if any.
@@ -638,8 +685,7 @@ impl ParallelOutcome {
         // every later transaction reads the L1 block info it writes.
         let mut txs = Vec::with_capacity(recovered.len());
         {
-            let mut state =
-                State::builder().with_database_ref(store).with_bundle_update().build();
+            let mut state = State::builder().with_database_ref(store).with_bundle_update().build();
             let mut executor = config.executor_for_block(&mut state, block.sealed_block())?;
             executor.apply_pre_execution_changes()?;
             let gas = executor.execute_transaction(recovered[0])?;
@@ -650,7 +696,9 @@ impl ParallelOutcome {
                 logs: alloy_consensus::TxReceipt::logs(receipt).to_vec(),
             });
             drop(executor);
-            state.merge_transitions(reth_revm::db::states::bundle_state::BundleRetention::PlainState);
+            state.merge_transitions(
+                reth_revm::db::states::bundle_state::BundleRetention::PlainState,
+            );
             store.apply_bundle(&state.take_bundle());
         }
 
@@ -667,6 +715,7 @@ impl ParallelOutcome {
             txs: rest,
             status: (0..n).map(|_| AtomicU8::new(PENDING)).collect(),
             invalidations: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            waiting: (0..n).map(|_| AtomicUsize::new(usize::MAX)).collect(),
             slots: (0..n).map(|_| Mutex::new(None)).collect(),
             frontier: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
@@ -692,7 +741,9 @@ impl ParallelOutcome {
                         }
                         if scheduler.status[i].load(Ordering::SeqCst) == EXECUTED {
                             let spec = scheduler.slots[i].lock().unwrap().take().unwrap();
-                            if spec.result.is_some() && spec.reads.iter().all(|r| store.is_current(r)) {
+                            if spec.result.is_some()
+                                && spec.reads.iter().all(|r| store.is_current(r))
+                            {
                                 break spec;
                             }
                             reexecuted += 1;
@@ -708,7 +759,10 @@ impl ParallelOutcome {
                         std::hint::spin_loop();
                     };
                     let Some(result) = &spec.result else {
-                        return Err(eyre!("transaction {} failed at its exact prefix state", i + 1));
+                        return Err(eyre!(
+                            "transaction {} failed at its exact prefix state",
+                            i + 1
+                        ));
                     };
                     cumulative_gas += result.tx_gas_used();
                     txs.push(TxOutcome {
@@ -717,16 +771,37 @@ impl ParallelOutcome {
                         logs: result.logs().to_vec(),
                     });
                     if trace {
-                        let writes = spec
+                        let changed: Vec<_> = spec
                             .writes
                             .iter()
-                            .filter(|(loc, value)| !scheduler.mv.visible(store, loc, 0).same(value))
-                            .map(|(loc, _)| *loc)
-                            .chain(spec.fees.iter().filter(|(_, a)| !a.is_zero()).map(|(r, _)| Loc::Account(*r)))
+                            .filter_map(|(loc, value)| {
+                                let before = scheduler.mv.visible(store, loc, 0);
+                                let balance_only = matches!(
+                                    (&before, value),
+                                    (Value::Account(Some(a)), Value::Account(Some(b)))
+                                        if a.nonce == b.nonce
+                                            && a.code_hash == b.code_hash
+                                            && a.code_hash != KECCAK_EMPTY
+                                );
+                                (!before.same(value)).then_some((*loc, balance_only))
+                            })
                             .collect();
+                        let writes = changed
+                            .iter()
+                            .map(|(loc, _)| *loc)
+                            .chain(
+                                spec.fees
+                                    .iter()
+                                    .filter(|(_, a)| !a.is_zero())
+                                    .map(|(r, _)| Loc::Account(*r)),
+                            )
+                            .collect();
+                        let contract_balance_writes =
+                            changed.iter().filter(|(_, b)| *b).map(|(loc, _)| *loc).collect();
                         traces.push(TxTrace {
                             reads: spec.reads.iter().map(Read::loc).collect(),
                             writes,
+                            contract_balance_writes,
                             nanos: spec.nanos,
                         });
                     }
@@ -760,9 +835,13 @@ pub struct CriticalPath {
 }
 
 impl CriticalPath {
-    /// Computes the critical path. Fee credits count as writes, so any transaction that reads a
-    /// fee recipient depends on every earlier fee-paying transaction.
-    pub fn new(traces: &[TxTrace]) -> Self {
+    /// Computes the critical path (list-scheduled in block order on `cores` workers, unbounded
+    /// when `None`). Fee credits count as writes, so any transaction that reads a fee recipient
+    /// depends on every earlier fee-paying transaction. With `ignore_contract_balance`, balance-only
+    /// changes to contracts are not conflicts: an optimistic bound for engines that track
+    /// balance reads precisely instead of per account.
+    pub fn new(traces: &[TxTrace], cores: Option<usize>, ignore_contract_balance: bool) -> Self {
+        let mut free = vec![0u64; cores.unwrap_or(traces.len()).max(1)];
         // Max finish time over all earlier writers of each location (conservative for blind
         // writes, exact for commutative fee credits).
         let mut written: FastMap<Loc, u64> = FastMap::default();
@@ -780,8 +859,14 @@ impl CriticalPath {
             }
             let ready = binding.map(|(f, _)| f);
             dependent_txs += usize::from(ready.is_some());
-            finish[i] = ready.unwrap_or_default() + trace.nanos;
-            for loc in &trace.writes {
+            let core = (0..free.len()).min_by_key(|&c| free[c]).unwrap();
+            finish[i] = ready.unwrap_or_default().max(free[core]) + trace.nanos;
+            free[core] = finish[i];
+            for loc in trace
+                .writes
+                .iter()
+                .filter(|l| !ignore_contract_balance || !trace.contract_balance_writes.contains(l))
+            {
                 let entry = written.entry(*loc).or_default();
                 *entry = (*entry).max(finish[i]);
             }
