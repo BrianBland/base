@@ -792,6 +792,9 @@ pub struct Schedule {
     /// executed. Speculative sender reads already assume the signed nonce, so this only avoids
     /// executions that would read the sender's stale balance or code.
     pub sender_gate: bool,
+    /// Speculate only on transactions at most this far above the commit frontier (`None` =
+    /// unbounded).
+    pub window: Option<usize>,
 }
 
 type Config = BaseEvmConfig;
@@ -830,6 +833,8 @@ struct Scheduler<'a> {
     /// Lowest uncommitted transaction.
     frontier: AtomicUsize,
     stop: AtomicBool,
+    /// Speculate only on transactions at most this far above the frontier (`None` = unbounded).
+    window: Option<usize>,
     trace: bool,
     /// Whether a thread holds the commit role.
     committing: AtomicBool,
@@ -951,10 +956,12 @@ impl Scheduler<'_> {
             .is_ok()
     }
 
-    /// Executes the lowest pending transaction above the commit frontier, if any.
+    /// Executes the lowest pending transaction within the window above the commit frontier, if
+    /// any.
     fn step(&self) -> bool {
         let from = self.frontier.load(Ordering::SeqCst) + 1;
-        (from..self.txs.len()).find(|&tx| self.claim(tx)).map(|tx| self.run(tx, true)).is_some()
+        let to = self.window.map_or(self.txs.len(), |w| self.txs.len().min(from + w));
+        (from..to).find(|&tx| self.claim(tx)).map(|tx| self.run(tx, true)).is_some()
     }
 
     /// Commits frontier transactions while any is committable. Every thread calls this between
@@ -1144,6 +1151,7 @@ impl ParallelOutcome {
             slots: (0..n).map(|_| Mutex::new(None)).collect(),
             frontier: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
+            window: schedule.window,
             trace,
             committing: AtomicBool::new(false),
             committed: Mutex::new(Committed { txs, cumulative_gas, ..Default::default() }),

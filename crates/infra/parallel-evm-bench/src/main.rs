@@ -65,6 +65,9 @@ enum Cmd {
         /// Defer speculation until the sender's previous transaction has executed.
         #[arg(long)]
         sender_gate: bool,
+        /// Speculate at most this many transactions above the commit frontier (default unbounded).
+        #[arg(long)]
+        window: Option<usize>,
     },
 }
 
@@ -304,8 +307,8 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Bench { data, threads, iters, sender_gate } => {
-            bench(&data, &threads, iters, Schedule { sender_gate })
+        Cmd::Bench { data, threads, iters, sender_gate, window } => {
+            bench(&data, &threads, iters, Schedule { sender_gate, window })
         }
     }
 }
