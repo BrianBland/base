@@ -12,7 +12,8 @@ use base_common_consensus::BaseBlock;
 use base_execution_chainspec::BaseChainSpecBuilder;
 use base_execution_evm::BaseEvmConfig;
 use base_parallel_evm_bench::{
-    BlockFixture, CriticalPath, ParallelOutcome, PreDb, RpcRecorder, Stats, Store, TxOutcome,
+    BlockFixture, CriticalPath, ParallelOutcome, PreDb, RpcRecorder, Schedule, Stats, Store,
+    TxOutcome,
 };
 use clap::{Parser, Subcommand};
 use eyre::{Result, ensure};
@@ -61,6 +62,9 @@ enum Cmd {
         threads: Vec<usize>,
         #[arg(long, default_value_t = 5)]
         iters: usize,
+        /// Defer speculation until the sender's previous transaction has executed.
+        #[arg(long)]
+        sender_gate: bool,
     },
 }
 
@@ -131,7 +135,7 @@ fn fetch(rpc: &str, hint_rpc: Option<&str>, number: u64, out: &Path) -> Result<(
     Ok(())
 }
 
-fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
+fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Result<()> {
     let config = config();
     let mut files: Vec<_> =
         std::fs::read_dir(data)?.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>()?;
@@ -163,7 +167,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
 
         // Correctness and dependency trace at every thread count before timing.
         let store = Store::new(&pre);
-        let traced = ParallelOutcome::execute(&config, &block, &store, 1, true)?;
+        let traced = ParallelOutcome::execute(&config, &block, &store, 1, schedule, true)?;
         let critical = CriticalPath::new(&traced.traces, None, false);
         let bounds = [
             critical.path_nanos,
@@ -172,7 +176,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
         ];
         for &t in threads {
             let store = Store::new(&pre);
-            let out = ParallelOutcome::execute(&config, &block, &store, t, false)?;
+            let out = ParallelOutcome::execute(&config, &block, &store, t, schedule, false)?;
             ensure!(out.txs == expected, "{}: receipts differ at {t} threads", file.display());
             let diffs = store.diff(&bundle);
             ensure!(
@@ -193,7 +197,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
             for (k, &t) in threads.iter().enumerate() {
                 let store = Store::new(&pre);
                 let start = Instant::now();
-                let out = ParallelOutcome::execute(&config, &block, &store, t, false)?;
+                let out = ParallelOutcome::execute(&config, &block, &store, t, schedule, false)?;
                 par[k] = par[k].min(start.elapsed().as_nanos() as u64);
                 stats[k] = out.stats;
             }
@@ -297,6 +301,8 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Bench { data, threads, iters } => bench(&data, &threads, iters),
+        Cmd::Bench { data, threads, iters, sender_gate } => {
+            bench(&data, &threads, iters, Schedule { sender_gate })
+        }
     }
 }

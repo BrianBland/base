@@ -776,6 +776,15 @@ pub struct ParallelOutcome {
     pub traces: Vec<TxTrace>,
 }
 
+/// Scheduling policy of a parallel execution.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Schedule {
+    /// Defer speculating a transaction until the same sender's previous transaction has
+    /// executed. Speculative sender reads already assume the signed nonce, so this only avoids
+    /// executions that would read the sender's stale balance or code.
+    pub sender_gate: bool,
+}
+
 type Config = BaseEvmConfig;
 
 const PENDING: u8 = 0;
@@ -804,6 +813,9 @@ struct Scheduler<'a> {
     invalidations: Vec<AtomicU64>,
     /// Transaction each one last blocked on (`usize::MAX` = none).
     waiting: Vec<AtomicUsize>,
+    /// Previous transaction from the same sender when [`Schedule::sender_gate`] is set: its nonce
+    /// and balance changes are known dependencies, so speculating before it executes is wasted.
+    sender_prev: Vec<Option<usize>>,
     slots: Vec<Mutex<Option<Speculation>>>,
     /// Lowest uncommitted transaction.
     frontier: AtomicUsize,
@@ -907,8 +919,11 @@ impl Scheduler<'_> {
     }
 
     fn claim(&self, tx: usize) -> bool {
+        let executed = |dep: usize| self.status[dep].load(Ordering::SeqCst) == EXECUTED;
         let waiting = self.waiting[tx].load(Ordering::SeqCst);
-        if waiting != usize::MAX && self.status[waiting].load(Ordering::SeqCst) != EXECUTED {
+        if (waiting != usize::MAX && !executed(waiting))
+            || self.sender_prev[tx].is_some_and(|dep| !executed(dep))
+        {
             return false;
         }
         self.status[tx]
@@ -1048,12 +1063,13 @@ impl Scheduler<'_> {
 }
 
 impl ParallelOutcome {
-    /// Executes `block` with `threads` threads that each speculate and commit.
+    /// Executes `block` with `threads` threads that each speculate and commit under `schedule`.
     pub fn execute(
         config: &Config,
         block: &RecoveredBlock<BaseBlock>,
         store: &Store<'_>,
         threads: usize,
+        schedule: Schedule,
         trace: bool,
     ) -> Result<Self> {
         let env = config.evm_env(block.header())?;
@@ -1086,6 +1102,14 @@ impl ParallelOutcome {
             .collect();
         let n = rest.len();
         let cumulative_gas = txs[0].cumulative_gas;
+        let mut last_by_sender = FastMap::<Address, usize>::default();
+        let sender_prev = recovered[1..]
+            .iter()
+            .enumerate()
+            .map(|(tx, recovered)| {
+                last_by_sender.insert(recovered.signer(), tx).filter(|_| schedule.sender_gate)
+            })
+            .collect();
         let scheduler = Scheduler {
             config,
             env,
@@ -1095,6 +1119,7 @@ impl ParallelOutcome {
             status: (0..n).map(|_| AtomicU8::new(PENDING)).collect(),
             invalidations: (0..n).map(|_| AtomicU64::new(0)).collect(),
             waiting: (0..n).map(|_| AtomicUsize::new(usize::MAX)).collect(),
+            sender_prev,
             slots: (0..n).map(|_| Mutex::new(None)).collect(),
             frontier: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
