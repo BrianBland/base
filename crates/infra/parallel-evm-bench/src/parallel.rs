@@ -17,7 +17,7 @@ use std::{
     convert::Infallible,
     sync::{
         Mutex,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence},
     },
     time::Instant,
 };
@@ -364,13 +364,60 @@ pub enum Value {
 
 /// Multi-version memory: the latest speculative write of each location by each uncommitted
 /// transaction, plus which transactions read each location.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MvMemory {
     writes: DashMap<Loc, BTreeMap<usize, Value>>,
-    readers: DashMap<Loc, Vec<usize>>,
+    readers: DashMap<Loc, Readers>,
+    txs: usize,
+}
+
+/// Set of transactions that read a location. Registration after the first reader of a location
+/// only takes a shared shard lock and sets a bit.
+#[derive(Debug)]
+pub struct Readers(Box<[AtomicU64]>);
+
+impl Readers {
+    /// Creates an empty set for a block of `txs` transactions.
+    pub fn new(txs: usize) -> Self {
+        Self((0..txs.div_ceil(64)).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    /// Records `tx` as a reader.
+    pub fn insert(&self, tx: usize) {
+        self.0[tx / 64].fetch_or(1 << (tx % 64), Ordering::SeqCst);
+    }
+
+    /// Readers with an index above `tx`.
+    pub fn above(&self, tx: usize) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().enumerate().skip(tx / 64).flat_map(move |(word, bits)| {
+            let mut bits = bits.load(Ordering::SeqCst);
+            if word == tx / 64 {
+                bits &= !0 << (tx % 64) << 1;
+            }
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    word * 64 + bit
+                })
+            })
+        })
+    }
 }
 
 impl MvMemory {
+    /// Creates an empty multi-version memory for a block of `txs` transactions.
+    pub fn new(txs: usize) -> Self {
+        Self { writes: DashMap::new(), readers: DashMap::new(), txs }
+    }
+
+    fn register(&self, loc: Loc, tx: usize) {
+        match self.readers.get(&loc) {
+            Some(readers) => readers.insert(tx),
+            None => self.readers.entry(loc).or_insert_with(|| Readers::new(self.txs)).insert(tx),
+        }
+    }
+
     fn latest(&self, loc: &Loc, tx: usize) -> Option<(usize, Value)> {
         self.writes.get(loc)?.range(..tx).next_back().map(|(w, v)| (*w, v.clone()))
     }
@@ -452,7 +499,7 @@ pub struct RecordingDb<'a> {
 impl RecordingDb<'_> {
     fn register(&self, loc: Loc) {
         if let Some((mv, _)) = self.speculation {
-            mv.readers.entry(loc).or_default().push(self.tx);
+            mv.register(loc, self.tx);
         }
     }
 
@@ -465,8 +512,10 @@ impl RecordingDb<'_> {
                 Loc::Slot(address, slot) => Value::Slot(self.store.slot(address, slot)),
             });
         };
-        // Register before reading so a concurrent writer either sees us or we see it.
+        // Register before reading so a concurrent writer either sees us or we see it; pairs with
+        // the fence between publishing and reading readers in `Scheduler::run`.
         self.register(loc);
+        fence(Ordering::SeqCst);
         match mv.latest(&loc, self.tx) {
             Some((writer, _)) if status[writer].load(Ordering::SeqCst) != EXECUTED => {
                 Err(Blocked(writer))
@@ -762,6 +811,8 @@ pub struct Stats {
     pub reads: usize,
     /// Reads checked by commit validation.
     pub validated_reads: usize,
+    /// Distinct locations with a registered speculative reader.
+    pub reader_locs: usize,
     /// Pre-execution system calls, the L1 info deposit and scheduler setup.
     pub setup_nanos: u64,
     /// Commit-role time executing frontier transactions no thread had claimed.
@@ -789,6 +840,7 @@ impl Stats {
         self.committed_execution_nanos += other.committed_execution_nanos;
         self.reads += other.reads;
         self.validated_reads += other.validated_reads;
+        self.reader_locs += other.reader_locs;
         self.setup_nanos += other.setup_nanos;
         self.commit_exec_nanos += other.commit_exec_nanos;
         self.validate_nanos += other.validate_nanos;
@@ -971,9 +1023,11 @@ impl Scheduler<'_> {
             }
         };
         let previous = self.slots[tx].lock().unwrap().take().map(|s| s.writes).unwrap_or_default();
-        for loc in self.mv.publish(self.store, tx, &spec.writes, &previous) {
+        let changed = self.mv.publish(self.store, tx, &spec.writes, &previous);
+        fence(Ordering::SeqCst);
+        for loc in changed {
             if let Some(readers) = self.mv.readers.get(&loc) {
-                for &reader in readers.iter().filter(|&&r| r > tx) {
+                for reader in readers.above(tx) {
                     self.invalidations[reader].fetch_add(1, Ordering::SeqCst);
                     self.invalidate(reader);
                 }
@@ -1219,7 +1273,7 @@ impl ParallelOutcome {
             env,
             l1_info,
             store,
-            mv: MvMemory::default(),
+            mv: MvMemory::new(n),
             txs: rest,
             status: (0..n).map(|_| AtomicU8::new(PENDING)).collect(),
             invalidations: (0..n).map(|_| AtomicU64::new(0)).collect(),
@@ -1265,6 +1319,7 @@ impl ParallelOutcome {
             committed_execution_nanos: committed.execution_nanos,
             reads: scheduler.reads.into_inner(),
             validated_reads: committed.validated_reads,
+            reader_locs: scheduler.mv.readers.len(),
             setup_nanos,
             commit_exec_nanos: committed.exec_nanos,
             validate_nanos: committed.validate_nanos,
@@ -1348,5 +1403,24 @@ impl CriticalPath {
                 hot
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readers_above_returns_strictly_higher_readers_across_words() {
+        let readers = Readers::new(200);
+        for tx in [0, 5, 63, 64, 65, 127, 128, 199] {
+            readers.insert(tx);
+        }
+        readers.insert(64);
+        assert_eq!(readers.above(0).collect::<Vec<_>>(), [5, 63, 64, 65, 127, 128, 199]);
+        assert_eq!(readers.above(63).collect::<Vec<_>>(), [64, 65, 127, 128, 199]);
+        assert_eq!(readers.above(64).collect::<Vec<_>>(), [65, 127, 128, 199]);
+        assert_eq!(readers.above(127).collect::<Vec<_>>(), [128, 199]);
+        assert_eq!(readers.above(199).count(), 0);
     }
 }
