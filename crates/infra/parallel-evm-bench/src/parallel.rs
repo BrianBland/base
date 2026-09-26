@@ -927,7 +927,7 @@ struct Scheduler<'a> {
     /// L1 block info as the sequential handler caches it for the block.
     l1_info: L1BlockInfo,
     store: &'a Store<'a>,
-    mv: MvMemory,
+    mv: &'a MvMemory,
     recovered: &'a [Recovered<&'a BaseTxEnvelope>],
     /// Transaction environments, built by the first execution of each transaction so workers
     /// build them in parallel instead of serially before execution starts.
@@ -1034,7 +1034,7 @@ impl Scheduler<'_> {
     ) -> Result<Speculation, usize> {
         let start = Instant::now();
         let db = evm.ctx_mut().db_mut();
-        db.speculation = speculative.then_some((&self.mv, self.status.as_slice()));
+        db.speculation = speculative.then_some((self.mv, self.status.as_slice()));
         db.tx = tx;
         db.accounts.clear();
         let tx_env = self.tx_env(tx);
@@ -1349,6 +1349,14 @@ impl Workers {
             None => work(),
         }
     }
+
+    /// Drops `value` on a pool thread, off the block's critical path.
+    pub fn discard(&self, value: impl Send + 'static) {
+        match &self.pool {
+            Some(pool) => pool.spawn(move || drop(value)),
+            None => drop(value),
+        }
+    }
 }
 
 impl ParallelOutcome {
@@ -1408,12 +1416,13 @@ impl ParallelOutcome {
                 last_by_sender.insert(recovered.signer(), tx).filter(|_| schedule.sender_gate)
             })
             .collect();
+        let mv = MvMemory::new(n);
         let scheduler = Scheduler {
             config,
             env,
             l1_info,
             store,
-            mv: MvMemory::new(n),
+            mv: &mv,
             recovered: rest,
             txs: (0..n).map(|_| OnceLock::new()).collect(),
             status: (0..n).map(|_| AtomicU8::new(PENDING)).collect(),
@@ -1479,6 +1488,8 @@ impl ParallelOutcome {
             .load(Ordering::Relaxed)
             .saturating_sub(scheduler.all_entered.load(Ordering::Relaxed));
         drop(scheduler);
+        // Every written location and reader set is a separate allocation.
+        workers.discard(mv);
         stats.fixed_nanos = started.elapsed().as_nanos() as u64 - loop_nanos;
         if let Some(error) = error {
             return Err(error);
@@ -1600,7 +1611,7 @@ mod tests {
             env: config.evm_env(&Header { gas_limit: 30_000_000, ..Default::default() }).unwrap(),
             l1_info: L1BlockInfo::default(),
             store: &store,
-            mv: MvMemory::new(3),
+            mv: &MvMemory::new(3),
             recovered: &[],
             txs: (0..3)
                 .map(|nonce| {
