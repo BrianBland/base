@@ -131,10 +131,6 @@ fn fetch(rpc: &str, hint_rpc: Option<&str>, number: u64, out: &Path) -> Result<(
     Ok(())
 }
 
-fn median(mut xs: Vec<u64>) -> u64 {
-    xs.sort_unstable();
-    xs[xs.len() / 2]
-}
 
 fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
     let config = config();
@@ -183,11 +179,21 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
             );
         }
 
-        let seq = median(
-            (0..iters)
-                .map(|_| sequential(&config, &pre, &block).map(|r| r.2))
-                .collect::<Result<_>>()?,
-        );
+        // Arms are interleaved per iteration and the minimum is kept, so background load on the
+        // host skews every arm alike and mostly drops out.
+        let mut seq = u64::MAX;
+        let mut par = vec![u64::MAX; threads.len()];
+        let mut reexec = vec![(0, 0); threads.len()];
+        for _ in 0..iters {
+            seq = seq.min(sequential(&config, &pre, &block)?.2);
+            for (k, &t) in threads.iter().enumerate() {
+                let store = Store::new(&pre);
+                let start = Instant::now();
+                let out = ParallelOutcome::execute(&config, &block, &store, t, false)?;
+                par[k] = par[k].min(start.elapsed().as_nanos() as u64);
+                reexec[k] = (out.executions, out.reexecuted);
+            }
+        }
         seq_total += seq;
         for (total, bound) in path_total.iter_mut().zip(bounds) {
             *total += bound;
@@ -207,26 +213,14 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
             critical.total_nanos as f64 / bounds[1] as f64,
             critical.total_nanos as f64 / bounds[2] as f64,
         );
-        for (k, &t) in threads.iter().enumerate() {
-            let mut reexec = (0, 0);
-            let par = median(
-                (0..iters)
-                    .map(|_| {
-                        let store = Store::new(&pre);
-                        let start = Instant::now();
-                        let out = ParallelOutcome::execute(&config, &block, &store, t, false)?;
-                        reexec = (out.executions, out.reexecuted);
-                        Ok(start.elapsed().as_nanos() as u64)
-                    })
-                    .collect::<Result<_>>()?,
-            );
+        for (k, par) in par.into_iter().enumerate() {
             par_total[k] += par;
             row += &format!(
                 ",{},{:.2},{}:{}",
                 par / 1000,
                 seq as f64 / par as f64,
-                reexec.0,
-                reexec.1
+                reexec[k].0,
+                reexec[k].1
             );
         }
         println!("{row}");
