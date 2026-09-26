@@ -121,7 +121,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
     let mut seq_total = 0u64;
     let mut par_total = vec![0u64; threads.len()];
     let (mut path_total, mut exec_total) = (0u64, 0u64);
-    println!("block,txs,gas_m,dependent_txs,seq_us,ideal_speedup,{}", threads.iter().map(|t| format!("par{t}_us,par{t}_speedup,par{t}_reexec")).collect::<Vec<_>>().join(","));
+    println!("block,txs,gas_m,dependent_txs,seq_us,ideal_speedup,{}", threads.iter().map(|t| format!("par{t}_us,par{t}_speedup,par{t}_execs:commit_fails")).collect::<Vec<_>>().join(","));
     for file in files {
         let fixture: BlockFixture = serde_json::from_slice(&std::fs::read(&file)?)?;
         let block = fixture.block()?;
@@ -154,20 +154,20 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
             critical.total_nanos as f64 / critical.path_nanos as f64,
         );
         for (k, &t) in threads.iter().enumerate() {
-            let mut reexec = 0;
+            let mut reexec = (0, 0);
             let par = median(
                 (0..iters)
                     .map(|_| {
                         let store = Store::new(&pre);
                         let start = Instant::now();
                         let out = ParallelOutcome::execute(&config, &block, &store, t, false)?;
-                        reexec = out.reexecuted;
+                        reexec = (out.executions, out.reexecuted);
                         Ok(start.elapsed().as_nanos() as u64)
                     })
                     .collect::<Result<_>>()?,
             );
             par_total[k] += par;
-            row += &format!(",{},{:.2},{}", par / 1000, seq as f64 / par as f64, reexec);
+            row += &format!(",{},{:.2},{}:{}", par / 1000, seq as f64 / par as f64, reexec.0, reexec.1);
         }
         println!("{row}");
         println!("#   hot: {:?}", critical.hot);

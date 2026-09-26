@@ -10,10 +10,11 @@
 
 use std::{
     cell::RefCell,
+    collections::BTreeMap,
     convert::Infallible,
     sync::{
-        OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -240,18 +241,115 @@ impl DatabaseRef for Store<'_> {
     }
 }
 
-/// Database view that records every value a transaction reads from the committed state.
+/// A value written to a [`Loc`].
+#[derive(Debug, Clone)]
+pub enum Value {
+    /// Account (`None` = destroyed).
+    Account(Option<AccountInfo>),
+    /// Storage value.
+    Slot(U256),
+}
+
+impl Value {
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Account(a), Self::Account(b)) => account_key(a) == account_key(b),
+            (Self::Slot(a), Self::Slot(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Multi-version memory: the latest speculative write of each location by each uncommitted
+/// transaction, plus which transactions read each location.
+#[derive(Debug, Default)]
+pub struct MvMemory {
+    writes: DashMap<Loc, BTreeMap<usize, Value>>,
+    readers: DashMap<Loc, Vec<usize>>,
+}
+
+impl MvMemory {
+    fn latest(&self, loc: &Loc, tx: usize) -> Option<Value> {
+        self.writes.get(loc)?.range(..tx).next_back().map(|(_, v)| v.clone())
+    }
+
+    fn visible(&self, store: &Store<'_>, loc: &Loc, tx: usize) -> Value {
+        self.latest(loc, tx).unwrap_or_else(|| match loc {
+            Loc::Account(address) => Value::Account(store.account(*address)),
+            Loc::Slot(address, slot) => Value::Slot(store.slot(*address, *slot)),
+        })
+    }
+
+    /// Publishes a new incarnation's writes, returning the locations whose visible value
+    /// changed for higher transactions.
+    fn publish(
+        &self,
+        store: &Store<'_>,
+        tx: usize,
+        writes: &[(Loc, Value)],
+        previous: &[(Loc, Value)],
+    ) -> Vec<Loc> {
+        let mut changed = Vec::new();
+        for (loc, value) in writes {
+            // Compute before taking the entry guard: both touch the same shard.
+            let below = self.visible(store, loc, tx);
+            let mut entry = self.writes.entry(*loc).or_default();
+            let old = entry.insert(tx, value.clone());
+            if !old.as_ref().unwrap_or(&below).same(value) {
+                changed.push(*loc);
+            }
+        }
+        for (loc, _) in previous {
+            if !writes.iter().any(|(l, _)| l == loc) {
+                if let Some(mut entry) = self.writes.get_mut(loc) {
+                    entry.remove(&tx);
+                }
+                changed.push(*loc);
+            }
+        }
+        changed
+    }
+
+    fn remove(&self, tx: usize, writes: &[(Loc, Value)]) {
+        for (loc, _) in writes {
+            if let Some(mut entry) = self.writes.get_mut(loc) {
+                entry.remove(&tx);
+            }
+        }
+    }
+}
+
+/// Database view for one execution: resolves reads through the multi-version memory (when
+/// speculating) or the committed state (at the commit frontier), recording every value read.
 #[derive(Debug)]
 pub struct RecordingDb<'a> {
     store: &'a Store<'a>,
+    mv: Option<&'a MvMemory>,
+    tx: usize,
     reads: Vec<Read>,
+}
+
+impl RecordingDb<'_> {
+    fn resolve(&self, loc: Loc) -> Value {
+        match self.mv {
+            Some(mv) => {
+                // Register before reading so a concurrent writer either sees us or we see it.
+                mv.readers.entry(loc).or_default().push(self.tx);
+                mv.visible(self.store, &loc, self.tx)
+            }
+            None => match loc {
+                Loc::Account(address) => Value::Account(self.store.account(address)),
+                Loc::Slot(address, slot) => Value::Slot(self.store.slot(address, slot)),
+            },
+        }
+    }
 }
 
 impl Database for RecordingDb<'_> {
     type Error = Infallible;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let account = self.store.account(address);
+        let Value::Account(account) = self.resolve(Loc::Account(address)) else { unreachable!() };
         self.reads.push(Read::Account(address, account_key(&account)));
         Ok(account)
     }
@@ -261,7 +359,7 @@ impl Database for RecordingDb<'_> {
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        let value = self.store.slot(address, index);
+        let Value::Slot(value) = self.resolve(Loc::Slot(address, index)) else { unreachable!() };
         self.reads.push(Read::Slot(address, index, value));
         Ok(value)
     }
@@ -394,11 +492,12 @@ struct Speculation {
     result: Option<ExecutionResult<BaseHaltReason>>,
     state: EvmState,
     reads: Vec<Read>,
+    writes: Vec<(Loc, Value)>,
     fees: Vec<(Address, U256)>,
     nanos: u64,
 }
 
-/// Per-transaction trace of the committed (exact) execution, for dependency analysis.
+/// Per-transaction trace of the committed execution, for dependency analysis.
 #[derive(Debug, Clone)]
 pub struct TxTrace {
     /// Locations read.
@@ -414,7 +513,9 @@ pub struct TxTrace {
 pub struct ParallelOutcome {
     /// Per-transaction outcomes.
     pub txs: Vec<TxOutcome>,
-    /// Transactions re-executed on the committer.
+    /// Total executions, including re-executions.
+    pub executions: usize,
+    /// Transactions whose speculative result failed commit validation.
     pub reexecuted: usize,
     /// Committed-execution traces (only when requested).
     pub traces: Vec<TxTrace>,
@@ -422,27 +523,102 @@ pub struct ParallelOutcome {
 
 type Config = BaseEvmConfig;
 
-fn execute(
-    config: &Config,
-    env: &EvmEnv<BaseSpecId>,
-    store: &Store<'_>,
-    tx: &BaseTransaction<TxEnv>,
-) -> Speculation {
-    let start = Instant::now();
-    let db = RecordingDb { store, reads: Vec::new() };
-    let mut evm = config.evm_with_env(db, env.clone());
-    evm.ctx_mut().set_tx(tx.clone());
-    let mut handler: LazyFeeHandler<_, EVMError<Infallible, BaseTransactionError>, _> =
-        LazyFeeHandler::default();
-    let result = handler.run(&mut evm).ok();
-    let state = evm.ctx_mut().journal_mut().finalize();
-    let reads = std::mem::take(&mut evm.ctx_mut().db_mut().reads);
-    Speculation {
-        result,
-        state,
-        reads,
-        fees: handler.fees.take(),
-        nanos: start.elapsed().as_nanos() as u64,
+const PENDING: u8 = 0;
+const EXECUTING: u8 = 1;
+const EXECUTED: u8 = 2;
+
+/// Shared scheduler state for one block.
+struct Scheduler<'a> {
+    config: &'a Config,
+    env: EvmEnv<BaseSpecId>,
+    store: &'a Store<'a>,
+    mv: MvMemory,
+    txs: Vec<BaseTransaction<TxEnv>>,
+    status: Vec<AtomicU8>,
+    invalidations: Vec<AtomicU64>,
+    slots: Vec<Mutex<Option<Speculation>>>,
+    frontier: AtomicUsize,
+    stop: AtomicBool,
+    executions: AtomicUsize,
+}
+
+impl Scheduler<'_> {
+    fn execute(&self, tx: usize, speculative: bool) -> Speculation {
+        let start = Instant::now();
+        let db = RecordingDb { store: self.store, mv: speculative.then_some(&self.mv), tx, reads: Vec::new() };
+        let mut evm = self.config.evm_with_env(db, self.env.clone());
+        evm.ctx_mut().set_tx(self.txs[tx].clone());
+        let mut handler: LazyFeeHandler<_, EVMError<Infallible, BaseTransactionError>, _> =
+            LazyFeeHandler::default();
+        let result = handler.run(&mut evm).ok();
+        let state = evm.ctx_mut().journal_mut().finalize();
+        let reads = std::mem::take(&mut evm.ctx_mut().db_mut().reads);
+        let writes = state
+            .iter()
+            .filter(|(_, a)| a.is_touched())
+            .flat_map(|(address, account)| {
+                let info = (!account.is_selfdestructed() && !account.is_empty())
+                    .then(|| account.info.clone());
+                std::iter::once((Loc::Account(*address), Value::Account(info))).chain(
+                    account
+                        .changed_storage_slots()
+                        .map(|(slot, v)| (Loc::Slot(*address, *slot), Value::Slot(v.present_value))),
+                )
+            })
+            .collect();
+        self.executions.fetch_add(1, Ordering::Relaxed);
+        Speculation {
+            result,
+            state,
+            reads,
+            writes,
+            fees: handler.fees.take(),
+            nanos: start.elapsed().as_nanos() as u64,
+        }
+    }
+
+    /// Runs a transaction the caller moved to `EXECUTING`, publishes its writes, and invalidates
+    /// higher transactions that read a location whose value changed.
+    fn run(&self, tx: usize, speculative: bool) {
+        let seen = self.invalidations[tx].load(Ordering::SeqCst);
+        let spec = self.execute(tx, speculative);
+        let previous = self.slots[tx].lock().unwrap().take().map(|s| s.writes).unwrap_or_default();
+        for loc in self.mv.publish(self.store, tx, &spec.writes, &previous) {
+            if let Some(readers) = self.mv.readers.get(&loc) {
+                for &reader in readers.iter().filter(|&&r| r > tx) {
+                    self.invalidations[reader].fetch_add(1, Ordering::SeqCst);
+                    let _ = self.status[reader].compare_exchange(
+                        EXECUTED,
+                        PENDING,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                }
+            }
+        }
+        *self.slots[tx].lock().unwrap() = Some(spec);
+        self.status[tx].store(EXECUTED, Ordering::SeqCst);
+        if self.invalidations[tx].load(Ordering::SeqCst) != seen {
+            let _ = self.status[tx].compare_exchange(EXECUTED, PENDING, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
+
+    fn claim(&self, tx: usize) -> bool {
+        self.status[tx].compare_exchange(PENDING, EXECUTING, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    }
+
+    /// Executes the lowest pending transaction above the commit frontier, if any.
+    fn step(&self) -> bool {
+        let from = self.frontier.load(Ordering::SeqCst) + 1;
+        (from..self.txs.len()).find(|&tx| self.claim(tx)).map(|tx| self.run(tx, true)).is_some()
+    }
+
+    fn work(&self) {
+        while !self.stop.load(Ordering::Relaxed) {
+            if !self.step() {
+                std::thread::yield_now();
+            }
+        }
     }
 }
 
@@ -483,90 +659,90 @@ impl ParallelOutcome {
             .map(|tx| BaseTransaction::from_recovered_tx(tx.inner(), tx.signer()))
             .collect();
         let n = rest.len();
-        let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
-        let done: Vec<OnceLock<Speculation>> = (0..n).map(|_| OnceLock::new()).collect();
-        let cursor = AtomicUsize::new(0);
+        let scheduler = Scheduler {
+            config,
+            env,
+            store,
+            mv: MvMemory::default(),
+            txs: rest,
+            status: (0..n).map(|_| AtomicU8::new(PENDING)).collect(),
+            invalidations: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            slots: (0..n).map(|_| Mutex::new(None)).collect(),
+            frontier: AtomicUsize::new(0),
+            stop: AtomicBool::new(false),
+            executions: AtomicUsize::new(0),
+        };
         let mut reexecuted = 0;
         let mut traces = Vec::new();
         let mut cumulative_gas = txs[0].cumulative_gas;
 
         std::thread::scope(|scope| -> Result<()> {
             for _ in 1..threads {
-                scope.spawn(|| {
-                    loop {
-                        let i = cursor.fetch_add(1, Ordering::Relaxed);
-                        if i >= n {
-                            break;
-                        }
-                        if !claimed[i].swap(true, Ordering::AcqRel) {
-                            let _ = done[i].set(execute(config, &env, store, &rest[i]));
-                        }
-                    }
-                });
+                scope.spawn(|| scheduler.work());
             }
-
-            let finish = |cursor: &AtomicUsize| cursor.store(n, Ordering::Relaxed);
-            for i in 0..n {
-                let spec = if claimed[i].swap(true, Ordering::AcqRel) {
+            let result = (|| {
+                for i in 0..n {
+                    scheduler.frontier.store(i, Ordering::SeqCst);
+                    // Every lower transaction is committed, so an execution by the committer
+                    // reads the exact prefix state and needs no validation.
                     let spec = loop {
-                        if let Some(spec) = done[i].get() {
-                            break spec;
+                        if scheduler.claim(i) {
+                            scheduler.run(i, false);
+                            break scheduler.slots[i].lock().unwrap().take().unwrap();
+                        }
+                        if scheduler.status[i].load(Ordering::SeqCst) == EXECUTED {
+                            let spec = scheduler.slots[i].lock().unwrap().take().unwrap();
+                            if spec.result.is_some() && spec.reads.iter().all(|r| store.is_current(r)) {
+                                break spec;
+                            }
+                            reexecuted += 1;
+                            *scheduler.slots[i].lock().unwrap() = Some(spec);
+                            scheduler.status[i].store(EXECUTING, Ordering::SeqCst);
+                            scheduler.run(i, false);
+                            break scheduler.slots[i].lock().unwrap().take().unwrap();
+                        }
+                        // Help speculate while a worker finishes the frontier transaction.
+                        if scheduler.step() {
+                            continue;
                         }
                         std::hint::spin_loop();
                     };
-                    if spec.result.is_some() && spec.reads.iter().all(|r| store.is_current(r)) {
-                        None
-                    } else {
-                        reexecuted += 1;
-                        Some(execute(config, &env, store, &rest[i]))
-                    }
-                } else {
-                    Some(execute(config, &env, store, &rest[i]))
-                };
-                let spec = spec.as_ref().unwrap_or_else(|| done[i].get().unwrap());
-                let Some(result) = &spec.result else {
-                    finish(&cursor);
-                    return Err(eyre!("transaction {} failed at its exact prefix state", i + 1));
-                };
-                cumulative_gas += result.tx_gas_used();
-                txs.push(TxOutcome {
-                    success: result.is_success(),
-                    cumulative_gas,
-                    logs: result.logs().to_vec(),
-                });
-                if trace {
-                    traces.push(TxTrace {
-                        reads: spec.reads.iter().map(Read::loc).collect(),
-                        writes: spec
-                            .state
-                            .iter()
-                            .filter(|(_, a)| a.is_touched())
-                            .flat_map(|(address, account)| {
-                                let after = (!account.is_selfdestructed() && !account.is_empty())
-                                    .then(|| account.info.clone());
-                                (account_key(&after) != account_key(&store.account(*address)))
-                                    .then_some(Loc::Account(*address))
-                                    .into_iter()
-                                    .chain(
-                                        account
-                                            .changed_storage_slots()
-                                            .map(|(slot, _)| Loc::Slot(*address, *slot)),
-                                    )
-                            })
-                            .chain(spec.fees.iter().filter(|(_, a)| !a.is_zero()).map(|(r, _)| Loc::Account(*r)))
-                            .collect(),
-                        nanos: spec.nanos,
+                    let Some(result) = &spec.result else {
+                        return Err(eyre!("transaction {} failed at its exact prefix state", i + 1));
+                    };
+                    cumulative_gas += result.tx_gas_used();
+                    txs.push(TxOutcome {
+                        success: result.is_success(),
+                        cumulative_gas,
+                        logs: result.logs().to_vec(),
                     });
+                    if trace {
+                        let writes = spec
+                            .writes
+                            .iter()
+                            .filter(|(loc, value)| !scheduler.mv.visible(store, loc, 0).same(value))
+                            .map(|(loc, _)| *loc)
+                            .chain(spec.fees.iter().filter(|(_, a)| !a.is_zero()).map(|(r, _)| Loc::Account(*r)))
+                            .collect();
+                        traces.push(TxTrace {
+                            reads: spec.reads.iter().map(Read::loc).collect(),
+                            writes,
+                            nanos: spec.nanos,
+                        });
+                    }
+                    store.apply_state(&spec.state);
+                    for (recipient, amount) in &spec.fees {
+                        store.credit(*recipient, *amount);
+                    }
+                    scheduler.mv.remove(i, &spec.writes);
                 }
-                store.apply_state(&spec.state);
-                for (recipient, amount) in &spec.fees {
-                    store.credit(*recipient, *amount);
-                }
-            }
-            Ok(())
+                Ok(())
+            })();
+            scheduler.stop.store(true, Ordering::Relaxed);
+            result
         })?;
 
-        Ok(Self { txs, reexecuted, traces })
+        Ok(Self { txs, executions: scheduler.executions.into_inner(), reexecuted, traces })
     }
 }
 
