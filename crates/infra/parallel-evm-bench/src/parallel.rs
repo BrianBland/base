@@ -875,19 +875,28 @@ impl Scheduler<'_> {
         };
         let state = evm.ctx_mut().journal_mut().finalize();
         let reads = std::mem::take(&mut evm.ctx_mut().db_mut().reads);
-        let writes = state
-            .iter()
-            .filter(|(_, a)| a.is_touched())
-            .flat_map(|(address, account)| {
-                let info = (!account.is_selfdestructed() && !account.is_empty())
-                    .then(|| account.info.clone());
-                std::iter::once((Loc::Account(*address), Value::Account(info))).chain(
-                    account.changed_storage_slots().map(|(slot, v)| {
-                        (Loc::Slot(*address, *slot), Value::Slot(v.present_value))
-                    }),
-                )
+        // Merely touched accounts (every call target) keep the value the transaction read, so
+        // publishing them would only make higher readers block on this transaction.
+        let unchanged = |address: &Address, info: &Option<AccountInfo>| {
+            reads.iter().any(|read| {
+                matches!(read, Read::Account(a, seen, read_balance)
+                    if a == address && *seen == info_key(info) && read_balance.seen == balance(info))
             })
-            .collect();
+        };
+        let writes =
+            state
+                .iter()
+                .filter(|(_, a)| a.is_touched())
+                .flat_map(|(address, account)| {
+                    let info = (!account.is_selfdestructed() && !account.is_empty())
+                        .then(|| account.info.clone());
+                    let account_write = (!unchanged(address, &info))
+                        .then(|| (Loc::Account(*address), Value::Account(info)));
+                    account_write.into_iter().chain(account.changed_storage_slots().map(
+                        |(slot, v)| (Loc::Slot(*address, *slot), Value::Slot(v.present_value)),
+                    ))
+                })
+                .collect();
         Ok(Speculation { result, state, reads, writes, fees: handler.fees.take(), nanos })
     }
 
