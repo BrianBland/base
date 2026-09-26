@@ -16,3 +16,21 @@ cargo run --release -p base-parallel-evm-bench -- bench --data fixtures --thread
 ```
 
 All state is in memory, so timings exclude database I/O.
+
+## Scheduler stress diagnostics
+
+Every benchmark iteration must match the sequential receipts and full post-state, not only
+the initial correctness pass. `stress.sh` repeats the benchmark with an external 300-second
+timeout; any nonzero exit (including timeout) fails the run and preserves its log.
+
+Build with `--features scheduler-watchdog` to enable an independent watchdog thread per block.
+If the commit frontier does not advance for two consecutive polling intervals, it dumps the
+frontier, commit role, stop flag, and every transaction's status, dependencies, invalidation
+count and result slot, then exits unsuccessfully. Dumps are best-effort concurrent snapshots;
+slot locks are never waited on. `PEVM_STALL_MS` sets the polling interval (default 5000 ms).
+The feature is disabled by default and adds no worker-loop instructions.
+
+```sh
+CARGO_TARGET_DIR=/Users/brianbland/code/scratch/target-live cargo build --release -p base-parallel-evm-bench --features scheduler-watchdog
+bash crates/infra/parallel-evm-bench/stress.sh /Users/brianbland/code/scratch/target-live/release/base-parallel-evm-bench /Users/brianbland/code/scratch/fixtures-dev 20 /tmp/pevm-stress
+```

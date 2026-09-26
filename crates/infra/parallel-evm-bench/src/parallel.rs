@@ -940,6 +940,40 @@ struct Scheduler<'a> {
 type WorkerEvm<'a> = EvmFor<Config, RecordingDb<'a>>;
 
 impl Scheduler<'_> {
+    #[cfg(feature = "scheduler-watchdog")]
+    fn watch(&self, done: std::sync::mpsc::Receiver<()>) {
+        use std::{sync::mpsc::RecvTimeoutError, time::Duration};
+
+        let interval =
+            Duration::from_millis(std::env::var("PEVM_STALL_MS").map_or(5000, |value| {
+                value.parse::<u64>().expect("PEVM_STALL_MS must be milliseconds")
+            }));
+        let mut previous = None;
+        while matches!(done.recv_timeout(interval), Err(RecvTimeoutError::Timeout)) {
+            let frontier = self.frontier.load(Ordering::SeqCst);
+            if previous == Some(frontier) {
+                eprintln!(
+                    "scheduler stalled: frontier={frontier}/{} committing={} stop={}",
+                    self.txs.len(),
+                    self.committing.load(Ordering::SeqCst),
+                    self.stop.load(Ordering::SeqCst),
+                );
+                for tx in 0..self.txs.len() {
+                    eprintln!(
+                        "tx={tx} status={} waiting={} sender_prev={:?} invalidations={} slot={:?}",
+                        self.status[tx].load(Ordering::SeqCst),
+                        self.waiting[tx].load(Ordering::SeqCst),
+                        self.sender_prev[tx],
+                        self.invalidations[tx].load(Ordering::SeqCst),
+                        self.slots[tx].try_lock().as_deref(),
+                    );
+                }
+                std::process::exit(1);
+            }
+            previous = Some(frontier);
+        }
+    }
+
     fn tx_env(&self, tx: usize) -> &BaseTransaction<TxEnv> {
         self.txs[tx].get_or_init(|| {
             let recovered = &self.recovered[tx];
@@ -1307,10 +1341,16 @@ impl ParallelOutcome {
         };
         let setup_nanos = started.elapsed().as_nanos() as u64;
         std::thread::scope(|scope| {
+            #[cfg(feature = "scheduler-watchdog")]
+            let (done, receiver) = std::sync::mpsc::channel();
+            #[cfg(feature = "scheduler-watchdog")]
+            scope.spawn(|| scheduler.watch(receiver));
             for _ in 1..threads {
                 scope.spawn(|| scheduler.work());
             }
             scheduler.work();
+            #[cfg(feature = "scheduler-watchdog")]
+            drop(done);
         });
         if let Some(error) = scheduler.error.into_inner().unwrap() {
             return Err(error);

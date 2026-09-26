@@ -202,6 +202,18 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
                 let start = Instant::now();
                 let out = ParallelOutcome::execute(&config, &block, &store, t, schedule, false)?;
                 par[k] = par[k].min(start.elapsed().as_nanos() as u64);
+                ensure!(
+                    out.txs == expected,
+                    "{}: timed receipts differ at {t} threads",
+                    file.display()
+                );
+                let diffs = store.diff(&bundle);
+                ensure!(
+                    diffs.is_empty(),
+                    "{}: timed state differs at {t} threads: {:?}",
+                    file.display(),
+                    &diffs[..diffs.len().min(5)]
+                );
                 stats[k] = out.stats;
             }
         }
