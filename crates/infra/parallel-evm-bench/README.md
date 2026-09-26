@@ -6,7 +6,8 @@ Experiment harness: does parallel transaction execution speed up real Base block
   state they touch into JSON fixtures (verified against the header's gas used and logs bloom).
 - `bench` executes each fixture with the production sequential executor and with a minimal
   optimistic parallel executor (speculative parallel execution, in-order value-validated commit,
-  deferred fee-vault credits), checks receipts and post-state match exactly, and reports timings
+  deferred fee-vault credits, balances validated by what execution observed and rebased onto the
+  committed balance), checks receipts and post-state match exactly, and reports timings
   plus a dependency critical-path bound on the achievable speedup.
 
 ```sh

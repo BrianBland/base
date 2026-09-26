@@ -7,6 +7,8 @@
 //! read); otherwise the transaction is re-executed on the committer against the exact prefix
 //! state. Fee credits to the beneficiary and fee vaults are deferred to commit time so they do not
 //! serialize every transaction.
+//!
+//! Balances are validated by what execution observed rather than by value: see [`BalanceRead`].
 
 use std::{
     cell::RefCell,
@@ -23,7 +25,7 @@ use alloy_evm::{EvmEnv, FromRecoveredTx};
 use alloy_primitives::{Address, B256, Log, U256, map::HashMap as FastMap};
 use base_common_consensus::{BaseBlock, Predeploys};
 use base_common_evm::{
-    BaseContextTr, BaseHaltReason, BaseHandler, BaseSpecId, BaseTransaction, BaseTransactionError,
+    BaseContext, BaseHaltReason, BaseHandler, BaseSpecId, BaseTransaction, BaseTransactionError,
     BaseTxTr, DEPOSIT_TRANSACTION_TYPE, IsTxError,
 };
 use base_common_genesis::BaseUpgrade;
@@ -37,7 +39,7 @@ use revm::{
     Database, DatabaseRef,
     context::{ContextSetters, TxEnv},
     context_interface::{
-        Block, Cfg, ContextTr, JournalTr, Transaction,
+        Block, ContextTr, JournalTr, Transaction,
         cfg::gas::InitialAndFloorGas,
         result::{EVMError, ExecutionResult, FromStringError, ResultGas},
     },
@@ -47,7 +49,7 @@ use revm::{
     state::{AccountInfo, Bytecode, EvmState},
 };
 
-use crate::data::PreDb;
+use crate::{balance::BalanceOpcodes, data::PreDb};
 
 /// Per-transaction outcome compared against the sequential executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,17 +65,87 @@ pub struct TxOutcome {
 /// A state location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Loc {
-    /// Account balance / nonce / code.
+    /// Account existence, nonce and code.
     Account(Address),
+    /// Account balance.
+    Balance(Address),
     /// Storage slot.
     Slot(Address, U256),
+}
+
+impl Loc {
+    /// Locations whose value differs between `before` and `after`, both written to `self`.
+    fn changes(self, before: &Value, after: &Value) -> impl Iterator<Item = Self> + use<> {
+        let changed = match (self, before, after) {
+            (Self::Account(address), Value::Account(a), Value::Account(b)) => [
+                (info_key(a) != info_key(b)).then_some(self),
+                (balance(a) != balance(b)).then_some(Self::Balance(address)),
+            ],
+            (_, Value::Slot(a), Value::Slot(b)) => [(a != b).then_some(self), None],
+            _ => unreachable!("values written to one location have one kind"),
+        };
+        changed.into_iter().flatten()
+    }
+}
+
+/// The committed balances a transaction's execution stays valid for.
+///
+/// Execution changes an account's balance only by credits and by debits guarded by sufficiency
+/// checks (`current >= amount`), and otherwise observes it only through `BALANCE`, `SELFBALANCE`
+/// and `SELFDESTRUCT`. If none of those observed it, running the transaction against committed
+/// balance `b` instead of `seen` takes the same path and ends with `b + (written - seen)`, so it
+/// commits by rebasing its write. Each sufficiency check narrows the range to the committed
+/// balances under which it has the same outcome; an absolute observation narrows it to `seen`.
+/// Accounts that may be empty stay exact, because EIP-161 emptiness depends on the balance.
+#[derive(Debug, Clone, Copy)]
+pub struct BalanceRead {
+    /// Balance the execution read.
+    pub seen: U256,
+    /// Lowest committed balance the execution is valid for.
+    pub min: U256,
+    /// Highest committed balance the execution is valid for.
+    pub max: U256,
+}
+
+impl BalanceRead {
+    const fn exact(seen: U256) -> Self {
+        Self { seen, min: seen, max: seen }
+    }
+
+    const fn unobserved(seen: U256) -> Self {
+        Self { seen, min: U256::ZERO, max: U256::MAX }
+    }
+
+    /// Whether the execution is valid for committed balance `balance`.
+    pub fn admits(&self, balance: U256) -> bool {
+        self.min <= balance && balance <= self.max
+    }
+
+    fn is_exact(&self) -> bool {
+        self.min == self.max
+    }
+
+    /// Records that execution compared its `current` balance (`seen` plus local changes) against
+    /// `amount`: from committed balance `b` it would compare `b + current - seen` instead.
+    fn require(&mut self, current: U256, amount: U256) {
+        let Some(threshold) = amount.checked_add(self.seen) else {
+            *self = Self::exact(self.seen);
+            return;
+        };
+        if current >= amount {
+            self.min = self.min.max(threshold.saturating_sub(current));
+        } else {
+            // `threshold - current > seen >= 0`.
+            self.max = self.max.min(threshold - current - U256::from(1));
+        }
+    }
 }
 
 /// A recorded read.
 #[derive(Debug, Clone)]
 pub enum Read {
-    /// Account read and the `(balance, nonce, code_hash)` observed.
-    Account(Address, Option<(U256, u64, B256)>),
+    /// Account read: `(nonce, code_hash)` if it existed, and the constraint on its balance.
+    Account(Address, Option<(u64, B256)>, BalanceRead),
     /// Storage read and the value observed.
     Slot(Address, U256, U256),
 }
@@ -81,7 +153,7 @@ pub enum Read {
 impl Read {
     const fn loc(&self) -> Loc {
         match self {
-            Self::Account(address, _) => Loc::Account(*address),
+            Self::Account(address, ..) => Loc::Account(*address),
             Self::Slot(address, slot, _) => Loc::Slot(*address, *slot),
         }
     }
@@ -89,6 +161,21 @@ impl Read {
 
 fn account_key(info: &Option<AccountInfo>) -> Option<(U256, u64, B256)> {
     info.as_ref().map(|info| (info.balance, info.nonce, info.code_hash))
+}
+
+fn info_key(info: &Option<AccountInfo>) -> Option<(u64, B256)> {
+    info.as_ref().map(|info| (info.nonce, info.code_hash))
+}
+
+fn balance(info: &Option<AccountInfo>) -> U256 {
+    info.as_ref().map_or(U256::ZERO, |info| info.balance)
+}
+
+/// Whether EIP-161 emptiness of the account can depend on its balance.
+fn may_be_empty(info: &Option<AccountInfo>) -> bool {
+    info.as_ref().is_none_or(|info| {
+        info.nonce == 0 && (info.code_hash == KECCAK_EMPTY || info.code_hash.is_zero())
+    })
 }
 
 /// Committed state: the read-only pre-state plus an overlay of committed writes.
@@ -124,7 +211,12 @@ impl<'a> Store<'a> {
 
     fn is_current(&self, read: &Read) -> bool {
         match read {
-            Read::Account(address, seen) => account_key(&self.account(*address)) == *seen,
+            Read::Account(address, seen, balance) => match self.account(*address) {
+                Some(now) => {
+                    *seen == Some((now.nonce, now.code_hash)) && balance.admits(now.balance)
+                }
+                None => seen.is_none(),
+            },
             Read::Slot(address, slot, seen) => self.slot(*address, *slot) == *seen,
         }
     }
@@ -132,7 +224,17 @@ impl<'a> Store<'a> {
     // ponytail: destroyed accounts do not wipe their pre-existing storage; post-Cancun
     // SELFDESTRUCT only destroys same-transaction contracts, which have none. The final state
     // comparison against the sequential executor catches any violation.
-    fn apply_state(&self, state: &EvmState) {
+    /// Applies a validated execution, rebasing each balance it read by the committed drift.
+    /// Returns whether any read balance had drifted.
+    fn apply_state(&self, state: &EvmState, reads: &[Read]) -> bool {
+        let rebased: Vec<(Address, U256, U256)> = reads
+            .iter()
+            .filter_map(|read| {
+                let Read::Account(address, Some(_), balance) = read else { return None };
+                let now = self.account(*address)?.balance;
+                (now != balance.seen).then_some((*address, balance.seen, now))
+            })
+            .collect();
         for (address, account) in state {
             if !account.is_touched() {
                 continue;
@@ -144,11 +246,16 @@ impl<'a> Store<'a> {
             if let Some(code) = &account.info.code {
                 self.codes.entry(account.info.code_hash).or_insert_with(|| code.clone());
             }
-            self.accounts.insert(*address, Some(account.info.clone()));
+            let mut info = account.info.clone();
+            if let Some((_, seen, now)) = rebased.iter().find(|(a, ..)| a == address) {
+                info.balance = info.balance.wrapping_add(*now).wrapping_sub(*seen);
+            }
+            self.accounts.insert(*address, Some(info));
             for (slot, value) in account.changed_storage_slots() {
                 self.storage.insert((*address, *slot), value.present_value);
             }
         }
+        !rebased.is_empty()
     }
 
     fn apply_bundle(&self, bundle: &BundleState) {
@@ -252,16 +359,6 @@ pub enum Value {
     Slot(U256),
 }
 
-impl Value {
-    fn same(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Account(a), Self::Account(b)) => account_key(a) == account_key(b),
-            (Self::Slot(a), Self::Slot(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-
 /// Multi-version memory: the latest speculative write of each location by each uncommitted
 /// transaction, plus which transactions read each location.
 #[derive(Debug, Default)]
@@ -277,7 +374,9 @@ impl MvMemory {
 
     fn visible(&self, store: &Store<'_>, loc: &Loc, tx: usize) -> Value {
         self.latest(loc, tx).map(|(_, v)| v).unwrap_or_else(|| match loc {
-            Loc::Account(address) => Value::Account(store.account(*address)),
+            Loc::Account(address) | Loc::Balance(address) => {
+                Value::Account(store.account(*address))
+            }
             Loc::Slot(address, slot) => Value::Slot(store.slot(*address, *slot)),
         })
     }
@@ -297,16 +396,14 @@ impl MvMemory {
             let below = self.visible(store, loc, tx);
             let mut entry = self.writes.entry(*loc).or_default();
             let old = entry.insert(tx, value.clone());
-            if !old.as_ref().unwrap_or(&below).same(value) {
-                changed.push(*loc);
-            }
+            changed.extend(loc.changes(old.as_ref().unwrap_or(&below), value));
         }
-        for (loc, _) in previous {
+        for (loc, old) in previous {
             if !writes.iter().any(|(l, _)| l == loc) {
                 if let Some(mut entry) = self.writes.get_mut(loc) {
                     entry.remove(&tx);
                 }
-                changed.push(*loc);
+                changed.extend(loc.changes(old, &self.visible(store, loc, tx)));
             }
         }
         changed
@@ -343,24 +440,57 @@ pub struct RecordingDb<'a> {
     speculation: Option<(&'a MvMemory, &'a [AtomicU8])>,
     tx: usize,
     reads: Vec<Read>,
+    /// Index in `reads` of each account read.
+    accounts: FastMap<Address, usize>,
 }
 
 impl RecordingDb<'_> {
+    fn register(&self, loc: Loc) {
+        if let Some((mv, _)) = self.speculation {
+            mv.readers.entry(loc).or_default().push(self.tx);
+        }
+    }
+
     fn resolve(&self, loc: Loc) -> Result<Value, Blocked> {
         let Some((mv, status)) = self.speculation else {
             return Ok(match loc {
-                Loc::Account(address) => Value::Account(self.store.account(address)),
+                Loc::Account(address) | Loc::Balance(address) => {
+                    Value::Account(self.store.account(address))
+                }
                 Loc::Slot(address, slot) => Value::Slot(self.store.slot(address, slot)),
             });
         };
         // Register before reading so a concurrent writer either sees us or we see it.
-        mv.readers.entry(loc).or_default().push(self.tx);
+        self.register(loc);
         match mv.latest(&loc, self.tx) {
             Some((writer, _)) if status[writer].load(Ordering::SeqCst) != EXECUTED => {
                 Err(Blocked(writer))
             }
             Some((_, value)) => Ok(value),
             None => Ok(mv.visible(self.store, &loc, self.tx)),
+        }
+    }
+
+    fn balance_read(&mut self, address: Address) -> Option<&mut BalanceRead> {
+        match &mut self.reads[*self.accounts.get(&address)?] {
+            Read::Account(_, _, balance) => Some(balance),
+            Read::Slot(..) => unreachable!("account reads index account entries"),
+        }
+    }
+
+    /// Records that execution observed `address`'s absolute balance.
+    pub fn observe_balance(&mut self, address: Address) {
+        let Some(balance) = self.balance_read(address) else { return };
+        if !balance.is_exact() {
+            *balance = BalanceRead::exact(balance.seen);
+            self.register(Loc::Balance(address));
+        }
+    }
+
+    /// Records that execution compared `address`'s `current` balance against `amount`.
+    pub fn require_balance(&mut self, address: Address, current: U256, amount: U256) {
+        if let Some(balance) = self.balance_read(address) {
+            balance.require(current, amount);
         }
     }
 }
@@ -370,7 +500,14 @@ impl Database for RecordingDb<'_> {
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let Value::Account(account) = self.resolve(Loc::Account(address))? else { unreachable!() };
-        self.reads.push(Read::Account(address, account_key(&account)));
+        let balance_read = if may_be_empty(&account) {
+            self.register(Loc::Balance(address));
+            BalanceRead::exact(balance(&account))
+        } else {
+            BalanceRead::unobserved(balance(&account))
+        };
+        self.accounts.entry(address).or_insert(self.reads.len());
+        self.reads.push(Read::Account(address, info_key(&account), balance_read));
         Ok(account)
     }
 
@@ -389,7 +526,8 @@ impl Database for RecordingDb<'_> {
     }
 }
 
-/// [`BaseHandler`] that records fee credits instead of writing them to the fee recipients.
+/// [`BaseHandler`] that records fee credits instead of writing them to the fee recipients, and
+/// records the caller balance checks of transaction validation.
 #[derive(Debug)]
 pub struct LazyFeeHandler<EVM, ERROR, FRAME> {
     inner: BaseHandler<EVM, ERROR, FRAME>,
@@ -403,9 +541,9 @@ impl<EVM, ERROR, FRAME> Default for LazyFeeHandler<EVM, ERROR, FRAME> {
     }
 }
 
-impl<EVM, ERROR, FRAME> Handler for LazyFeeHandler<EVM, ERROR, FRAME>
+impl<'db, EVM, ERROR, FRAME> Handler for LazyFeeHandler<EVM, ERROR, FRAME>
 where
-    EVM: EvmTr<Context: BaseContextTr, Frame = FRAME>,
+    EVM: EvmTr<Context = BaseContext<RecordingDb<'db>>, Frame = FRAME>,
     ERROR: EvmTrError<EVM> + From<BaseTransactionError> + FromStringError + IsTxError,
     FRAME: FrameTr<FrameResult = FrameResult, FrameInit = FrameInit>,
 {
@@ -422,7 +560,35 @@ where
         evm: &mut Self::Evm,
         gas: &mut InitialAndFloorGas,
     ) -> Result<(), Self::Error> {
-        self.inner.validate_against_state_and_deduct_caller(evm, gas)
+        self.inner.validate_against_state_and_deduct_caller(evm, gas)?;
+        let ctx = evm.ctx();
+        let caller = ctx.tx.caller();
+        let db = &mut ctx.journaled_state.database;
+        if ctx.tx.tx_type() == DEPOSIT_TRANSACTION_TYPE {
+            db.observe_balance(caller);
+            return Ok(());
+        }
+        let Some(seen) = db.balance_read(caller).map(|balance| balance.seen) else {
+            return Ok(());
+        };
+        // Validation required `seen >= additional_cost + max_balance_spending`, then deducted
+        // `spent = additional_cost + effective_balance_spending - value`.
+        let remaining = ctx.journaled_state.inner.state[&caller].info.balance;
+        let basefee = ctx.block.basefee() as u128;
+        let blob_price = ctx.block.blob_gasprice().unwrap_or_default();
+        let threshold = seen
+            .checked_sub(remaining)
+            .and_then(|spent| spent.checked_add(ctx.tx.value()))
+            .zip(ctx.tx.effective_balance_spending(basefee, blob_price).ok())
+            .and_then(|(v, effective)| v.checked_sub(effective))
+            .zip(ctx.tx.max_balance_spending().ok())
+            .and_then(|(additional_cost, max)| additional_cost.checked_add(max));
+        let db = &mut ctx.journaled_state.database;
+        match threshold {
+            Some(threshold) => db.require_balance(caller, seen, threshold),
+            None => db.observe_balance(caller),
+        }
+        Ok(())
     }
 
     fn last_frame_result(
@@ -467,7 +633,7 @@ where
         let used = gas.used();
         let tip_price = ctx.tx().effective_gas_price(basefee).saturating_sub(basefee);
         let tip = U256::from(tip_price * used.saturating_sub(gas.reservoir()) as u128);
-        let spec = ctx.cfg().spec();
+        let spec = ctx.cfg.spec;
         let beneficiary = ctx.block().beneficiary();
         let Some(enveloped) = ctx.tx().enveloped_tx().cloned() else {
             return Err(ERROR::from_string("missing enveloped transaction".into()));
@@ -502,7 +668,13 @@ where
         evm: &mut Self::Evm,
         error: Self::Error,
     ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
-        self.inner.catch_error(evm, error)
+        let result = self.inner.catch_error(evm, error);
+        let ctx = evm.ctx();
+        if ctx.tx.tx_type() == DEPOSIT_TRANSACTION_TYPE {
+            let caller = ctx.tx.caller();
+            ctx.journaled_state.database.observe_balance(caller);
+        }
+        result
     }
 }
 
@@ -524,8 +696,6 @@ pub struct TxTrace {
     pub reads: Vec<Loc>,
     /// Locations written, including deferred fee credits.
     pub writes: Vec<Loc>,
-    /// Subset of `writes` that only changed the balance of an account with code.
-    pub contract_balance_writes: Vec<Loc>,
     /// Execution time of the committed incarnation.
     pub nanos: u64,
 }
@@ -541,6 +711,8 @@ pub struct ParallelOutcome {
     pub reexecuted: usize,
     /// Speculative executions aborted on a read of a not-yet-executed write.
     pub blocked: usize,
+    /// Transactions committed although a balance they read had since changed.
+    pub rebased: usize,
     /// Committed-execution traces (only when requested).
     pub traces: Vec<TxTrace>,
 }
@@ -573,8 +745,15 @@ impl Scheduler<'_> {
     fn execute(&self, tx: usize, speculative: bool) -> Result<Speculation, usize> {
         let start = Instant::now();
         let speculation = speculative.then_some((&self.mv, self.status.as_slice()));
-        let db = RecordingDb { store: self.store, speculation, tx, reads: Vec::new() };
+        let db = RecordingDb {
+            store: self.store,
+            speculation,
+            tx,
+            reads: Vec::new(),
+            accounts: FastMap::default(),
+        };
         let mut evm = self.config.evm_with_env(db, self.env.clone());
+        BalanceOpcodes::install(evm.all_mut().1);
         evm.ctx_mut().set_tx(self.txs[tx].clone());
         let mut handler: LazyFeeHandler<_, EVMError<Blocked, BaseTransactionError>, _> =
             LazyFeeHandler::default();
@@ -726,7 +905,7 @@ impl ParallelOutcome {
             executions: AtomicUsize::new(0),
             blocked: AtomicUsize::new(0),
         };
-        let mut reexecuted = 0;
+        let (mut reexecuted, mut rebased) = (0, 0);
         let mut traces = Vec::new();
         let mut cumulative_gas = txs[0].cumulative_gas;
 
@@ -776,41 +955,36 @@ impl ParallelOutcome {
                         logs: result.logs().to_vec(),
                     });
                     if trace {
-                        let changed: Vec<_> = spec
-                            .writes
+                        // A balance constraint binds only if the block's pre-state violates it.
+                        let reads = spec
+                            .reads
                             .iter()
-                            .filter_map(|(loc, value)| {
-                                let before = scheduler.mv.visible(store, loc, 0);
-                                let balance_only = matches!(
-                                    (&before, value),
-                                    (Value::Account(Some(a)), Value::Account(Some(b)))
-                                        if a.nonce == b.nonce
-                                            && a.code_hash == b.code_hash
-                                            && a.code_hash != KECCAK_EMPTY
-                                );
-                                (!before.same(value)).then_some((*loc, balance_only))
+                            .flat_map(|read| {
+                                let balance_dep = match read {
+                                    Read::Account(address, _, constraint) => (!constraint
+                                        .admits(balance(&store.pre.basic_ref(*address).unwrap())))
+                                    .then_some(Loc::Balance(*address)),
+                                    Read::Slot(..) => None,
+                                };
+                                std::iter::once(read.loc()).chain(balance_dep)
                             })
                             .collect();
-                        let writes = changed
+                        let writes = spec
+                            .writes
                             .iter()
-                            .map(|(loc, _)| *loc)
+                            .flat_map(|(loc, value)| {
+                                loc.changes(&scheduler.mv.visible(store, loc, 0), value)
+                            })
                             .chain(
                                 spec.fees
                                     .iter()
                                     .filter(|(_, a)| !a.is_zero())
-                                    .map(|(r, _)| Loc::Account(*r)),
+                                    .map(|(r, _)| Loc::Balance(*r)),
                             )
                             .collect();
-                        let contract_balance_writes =
-                            changed.iter().filter(|(_, b)| *b).map(|(loc, _)| *loc).collect();
-                        traces.push(TxTrace {
-                            reads: spec.reads.iter().map(Read::loc).collect(),
-                            writes,
-                            contract_balance_writes,
-                            nanos: spec.nanos,
-                        });
+                        traces.push(TxTrace { reads, writes, nanos: spec.nanos });
                     }
-                    store.apply_state(&spec.state);
+                    rebased += usize::from(store.apply_state(&spec.state, &spec.reads));
                     for (recipient, amount) in &spec.fees {
                         store.credit(*recipient, *amount);
                     }
@@ -827,6 +1001,7 @@ impl ParallelOutcome {
             executions: scheduler.executions.into_inner(),
             reexecuted,
             blocked: scheduler.blocked.into_inner(),
+            rebased,
             traces,
         })
     }
@@ -849,11 +1024,14 @@ pub struct CriticalPath {
 
 impl CriticalPath {
     /// Computes the critical path (list-scheduled in block order on `cores` workers, unbounded
-    /// when `None`). Fee credits count as writes, so any transaction that reads a fee recipient
-    /// depends on every earlier fee-paying transaction. With `ignore_contract_balance`, balance-only
-    /// changes to contracts are not conflicts: an optimistic bound for engines that track
-    /// balance reads precisely instead of per account.
-    pub fn new(traces: &[TxTrace], cores: Option<usize>, ignore_contract_balance: bool) -> Self {
+    /// when `None`). Fee credits count as writes, so any transaction that observes a fee
+    /// recipient's balance depends on every earlier fee-paying transaction. With `per_account`,
+    /// every account read conflicts with any earlier write to that account, balance included.
+    pub fn new(traces: &[TxTrace], cores: Option<usize>, per_account: bool) -> Self {
+        let key = |loc: &Loc| match *loc {
+            Loc::Balance(address) if per_account => Loc::Account(address),
+            loc => loc,
+        };
         let mut free = vec![0u64; cores.unwrap_or(traces.len()).max(1)];
         // Max finish time over all earlier writers of each location (conservative for blind
         // writes, exact for commutative fee credits).
@@ -867,7 +1045,7 @@ impl CriticalPath {
             let binding = trace
                 .reads
                 .iter()
-                .filter_map(|loc| written.get(loc).map(|f| (*f, *loc)))
+                .filter_map(|loc| written.get(&key(loc)).map(|f| (*f, key(loc))))
                 .max_by_key(|(f, _)| *f);
             if let Some((_, loc)) = binding {
                 *hot.entry(loc).or_default() += 1;
@@ -880,17 +1058,13 @@ impl CriticalPath {
             depth[i] = 1 + trace
                 .reads
                 .iter()
-                .filter_map(|loc| written_depth.get(loc).copied())
+                .filter_map(|loc| written_depth.get(&key(loc)).copied())
                 .max()
                 .unwrap_or_default();
-            for loc in trace
-                .writes
-                .iter()
-                .filter(|l| !ignore_contract_balance || !trace.contract_balance_writes.contains(l))
-            {
-                let entry = written.entry(*loc).or_default();
+            for loc in trace.writes.iter().map(key) {
+                let entry = written.entry(loc).or_default();
                 *entry = (*entry).max(finish[i]);
-                let entry = written_depth.entry(*loc).or_default();
+                let entry = written_depth.entry(loc).or_default();
                 *entry = (*entry).max(depth[i]);
             }
         }

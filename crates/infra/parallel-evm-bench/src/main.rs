@@ -131,7 +131,6 @@ fn fetch(rpc: &str, hint_rpc: Option<&str>, number: u64, out: &Path) -> Result<(
     Ok(())
 }
 
-
 fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
     let config = config();
     let mut files: Vec<_> =
@@ -140,14 +139,14 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
     files.sort();
     let mut seq_total = 0u64;
     let mut par_total = vec![0u64; threads.len()];
-    // Critical-path bounds: [unbounded, 8 cores, unbounded ignoring contract balance-only writes].
+    // Critical-path bounds: [unbounded, 8 cores, unbounded with per-account conflicts].
     let mut path_total = [0u64; 3];
     let mut exec_total = 0u64;
     println!(
-        "block,canonical,txs,gas_m,dependent_txs,chain_txs,seq_us,ideal_speedup,ideal8_speedup,ideal_nobal_speedup,{}",
+        "block,canonical,txs,gas_m,dependent_txs,chain_txs,seq_us,ideal_speedup,ideal8_speedup,ideal_peraccount_speedup,{}",
         threads
             .iter()
-            .map(|t| format!("par{t}_us,par{t}_speedup,par{t}_execs:commit_fails:blocked"))
+            .map(|t| format!("par{t}_us,par{t}_speedup,par{t}_execs:commit_fails:blocked:rebased"))
             .collect::<Vec<_>>()
             .join(",")
     );
@@ -183,7 +182,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
         // host skews every arm alike and mostly drops out.
         let mut seq = u64::MAX;
         let mut par = vec![u64::MAX; threads.len()];
-        let mut reexec = vec![(0, 0, 0); threads.len()];
+        let mut reexec = vec![(0, 0, 0, 0); threads.len()];
         for _ in 0..iters {
             seq = seq.min(sequential(&config, &pre, &block)?.2);
             for (k, &t) in threads.iter().enumerate() {
@@ -191,7 +190,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
                 let start = Instant::now();
                 let out = ParallelOutcome::execute(&config, &block, &store, t, false)?;
                 par[k] = par[k].min(start.elapsed().as_nanos() as u64);
-                reexec[k] = (out.executions, out.reexecuted, out.blocked);
+                reexec[k] = (out.executions, out.reexecuted, out.blocked, out.rebased);
             }
         }
         seq_total += seq;
@@ -217,12 +216,13 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
         for (k, par) in par.into_iter().enumerate() {
             par_total[k] += par;
             row += &format!(
-                ",{},{:.2},{}:{}:{}",
+                ",{},{:.2},{}:{}:{}:{}",
                 par / 1000,
                 seq as f64 / par as f64,
                 reexec[k].0,
                 reexec[k].1,
-                reexec[k].2
+                reexec[k].2,
+                reexec[k].3
             );
         }
         println!("{row}");
@@ -230,7 +230,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
     }
     let ideal = path_total.map(|p| exec_total as f64 / p as f64);
     println!(
-        "# total seq {} ms; ideal speedup: unbounded {:.2}, 8 cores {:.2}, unbounded w/o contract-balance conflicts {:.2}",
+        "# total seq {} ms; ideal speedup: unbounded {:.2}, 8 cores {:.2}, unbounded with per-account conflicts {:.2}",
         seq_total / 1_000_000,
         ideal[0],
         ideal[1],
