@@ -442,6 +442,8 @@ pub struct RecordingDb<'a> {
     reads: Vec<Read>,
     /// Index in `reads` of each account read.
     accounts: FastMap<Address, usize>,
+    /// Caller and nonce of a speculated non-deposit transaction (see [`Self::assume_nonce`]).
+    sender: Option<(Address, u64)>,
 }
 
 impl RecordingDb<'_> {
@@ -469,6 +471,25 @@ impl RecordingDb<'_> {
             Some((_, value)) => Ok(value),
             None => Ok(mv.visible(self.store, &loc, self.tx)),
         }
+    }
+
+    /// Reads the sender without waiting on its earlier transactions: the latest executed version
+    /// (or the committed one), carrying the nonce the transaction was signed with. Commit
+    /// validation checks the assumed nonce like any read and rebases the balance, so the read is
+    /// not registered for invalidation by the sender's earlier transactions.
+    fn assume_nonce(&self, address: Address, nonce: u64) -> Option<AccountInfo> {
+        let latest = self.speculation.and_then(|(mv, status)| {
+            match mv.latest(&Loc::Account(address), self.tx)? {
+                (writer, Value::Account(account))
+                    if status[writer].load(Ordering::SeqCst) == EXECUTED =>
+                {
+                    Some(account)
+                }
+                _ => None,
+            }
+        });
+        let account = latest.unwrap_or_else(|| self.store.account(address));
+        account.map(|account| AccountInfo { nonce, ..account })
     }
 
     fn balance_read(&mut self, address: Address) -> Option<&mut BalanceRead> {
@@ -499,7 +520,15 @@ impl Database for RecordingDb<'_> {
     type Error = Blocked;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let Value::Account(account) = self.resolve(Loc::Account(address))? else { unreachable!() };
+        let account = match self.sender {
+            Some((sender, nonce)) if sender == address => self.assume_nonce(address, nonce),
+            _ => {
+                let Value::Account(account) = self.resolve(Loc::Account(address))? else {
+                    unreachable!()
+                };
+                account
+            }
+        };
         let balance_read = if may_be_empty(&account) {
             self.register(Loc::Balance(address));
             BalanceRead::exact(balance(&account))
@@ -751,6 +780,8 @@ impl Scheduler<'_> {
             tx,
             reads: Vec::new(),
             accounts: FastMap::default(),
+            sender: (speculative && self.txs[tx].tx_type() != DEPOSIT_TRANSACTION_TYPE)
+                .then(|| (self.txs[tx].caller(), self.txs[tx].nonce())),
         };
         let mut evm = self.config.evm_with_env(db, self.env.clone());
         BalanceOpcodes::install(evm.all_mut().1);
@@ -955,19 +986,29 @@ impl ParallelOutcome {
                         logs: result.logs().to_vec(),
                     });
                     if trace {
-                        // A balance constraint binds only if the block's pre-state violates it.
+                        // A balance constraint binds only if the block's pre-state violates it;
+                        // the sender's nonce is assumed, so only a code change binds its read.
+                        let tx = &scheduler.txs[i];
+                        let sender =
+                            (tx.tx_type() != DEPOSIT_TRANSACTION_TYPE).then(|| tx.caller());
                         let reads = spec
                             .reads
                             .iter()
                             .flat_map(|read| {
-                                let balance_dep = match read {
-                                    Read::Account(address, _, constraint) => (!constraint
-                                        .admits(balance(&store.pre.basic_ref(*address).unwrap())))
-                                    .then_some(Loc::Balance(*address)),
-                                    Read::Slot(..) => None,
+                                let Read::Account(address, info, constraint) = read else {
+                                    return [Some(read.loc()), None];
                                 };
-                                std::iter::once(read.loc()).chain(balance_dep)
+                                let pre = store.pre.basic_ref(*address).unwrap();
+                                let code = |info: Option<(u64, B256)>| info.map(|(_, code)| code);
+                                let assumed =
+                                    sender == Some(*address) && code(*info) == code(info_key(&pre));
+                                [
+                                    (!assumed).then_some(read.loc()),
+                                    (!constraint.admits(balance(&pre)))
+                                        .then_some(Loc::Balance(*address)),
+                                ]
                             })
+                            .flatten()
                             .collect();
                         let writes = spec
                             .writes
