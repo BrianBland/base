@@ -22,12 +22,13 @@ use std::{
     time::Instant,
 };
 
+use alloy_eips::Typed2718;
 use alloy_evm::{EvmEnv, FromRecoveredTx};
 use alloy_primitives::{Address, B256, Log, U256, map::HashMap as FastMap};
 use base_common_consensus::{BaseBlock, Predeploys};
 use base_common_evm::{
     BaseContext, BaseHaltReason, BaseHandler, BaseSpecId, BaseTransaction, BaseTransactionError,
-    BaseTxTr, DEPOSIT_TRANSACTION_TYPE, IsTxError,
+    BaseTxTr, DEPOSIT_TRANSACTION_TYPE, IsTxError, L1BlockInfo,
 };
 use base_common_genesis::BaseUpgrade;
 use base_execution_evm::BaseEvmConfig;
@@ -44,6 +45,7 @@ use revm::{
         cfg::gas::InitialAndFloorGas,
         result::{EVMError, ExecutionResult, FromStringError, ResultGas},
     },
+    database_interface::WrapDatabaseRef,
     handler::{EvmTr, FrameResult, Handler, evm::FrameTr, handler::EvmTrError},
     interpreter::{GasTracker, interpreter_action::FrameInit},
     primitives::KECCAK_EMPTY,
@@ -845,6 +847,8 @@ struct Committed {
 struct Scheduler<'a> {
     config: &'a Config,
     env: EvmEnv<BaseSpecId>,
+    /// L1 block info as the sequential handler caches it for the block.
+    l1_info: L1BlockInfo,
     store: &'a Store<'a>,
     mv: MvMemory,
     txs: Vec<BaseTransaction<TxEnv>>,
@@ -891,6 +895,7 @@ impl Scheduler<'_> {
         let mut evm = self.config.evm_with_env(db, self.env.clone());
         BalanceOpcodes::install(evm.all_mut().1);
         evm.ctx_mut().set_tx(self.txs[tx].clone());
+        *evm.ctx_mut().chain_mut() = self.l1_info.clone();
         let mut handler: LazyFeeHandler<_, EVMError<Blocked, BaseTransactionError>, _> =
             LazyFeeHandler::default();
         self.executions.fetch_add(1, Ordering::Relaxed);
@@ -1065,7 +1070,8 @@ impl Scheduler<'_> {
 
     fn apply(&self, committed: &mut Committed, i: usize, spec: Speculation) -> Result<()> {
         let Some(result) = &spec.result else {
-            return Err(eyre!("transaction {} failed at its exact prefix state", i + 1));
+            let index = committed.txs.len();
+            return Err(eyre!("transaction {index} failed at its exact prefix state"));
         };
         committed.cumulative_gas += result.tx_gas_used();
         committed.execution_nanos += spec.nanos;
@@ -1142,35 +1148,46 @@ impl ParallelOutcome {
         let env = config.evm_env(block.header())?;
         let recovered: Vec<_> = block.transactions_recovered().collect();
 
-        // Pre-execution system calls and the L1 info deposit run through the production executor;
-        // every later transaction reads the L1 block info it writes.
+        // Pre-execution system calls and the leading deposits (the L1 info deposit plus any user
+        // deposits) run through the production executor. The sequential handler loads the L1 block
+        // info once per block, at the first non-deposit transaction, so it is loaded here from
+        // exactly that prefix state and handed to every execution instead of being re-read.
+        let deposits =
+            recovered.iter().take_while(|tx| tx.ty() == DEPOSIT_TRANSACTION_TYPE).count();
         let mut txs = Vec::with_capacity(recovered.len());
         {
             let mut state = State::builder().with_database_ref(store).with_bundle_update().build();
             let mut executor = config.executor_for_block(&mut state, block.sealed_block())?;
             executor.apply_pre_execution_changes()?;
-            let gas = executor.execute_transaction(recovered[0])?;
-            let receipt = &executor.receipts()[0];
-            txs.push(TxOutcome {
+            for tx in &recovered[..deposits] {
+                executor.execute_transaction(*tx)?;
+            }
+            txs.extend(executor.receipts().iter().map(|receipt| TxOutcome {
                 success: alloy_consensus::TxReceipt::status(receipt),
-                cumulative_gas: gas.tx_gas_used(),
+                cumulative_gas: alloy_consensus::TxReceipt::cumulative_gas_used(receipt),
                 logs: alloy_consensus::TxReceipt::logs(receipt).to_vec(),
-            });
+            }));
             drop(executor);
             state.merge_transitions(
                 reth_revm::db::states::bundle_state::BundleRetention::PlainState,
             );
             store.apply_bundle(&state.take_bundle());
         }
+        let l1_info = L1BlockInfo::try_fetch(
+            &mut WrapDatabaseRef(store),
+            U256::from(block.header().number),
+            env.cfg_env.spec,
+        )
+        .unwrap_or_else(|never| match never {});
 
-        let rest: Vec<BaseTransaction<TxEnv>> = recovered[1..]
+        let rest: Vec<BaseTransaction<TxEnv>> = recovered[deposits..]
             .iter()
             .map(|tx| BaseTransaction::from_recovered_tx(tx.inner(), tx.signer()))
             .collect();
         let n = rest.len();
-        let cumulative_gas = txs[0].cumulative_gas;
+        let cumulative_gas = txs.last().map(|tx| tx.cumulative_gas).unwrap_or_default();
         let mut last_by_sender = FastMap::<Address, usize>::default();
-        let sender_prev = recovered[1..]
+        let sender_prev = recovered[deposits..]
             .iter()
             .enumerate()
             .map(|(tx, recovered)| {
@@ -1180,6 +1197,7 @@ impl ParallelOutcome {
         let scheduler = Scheduler {
             config,
             env,
+            l1_info,
             store,
             mv: MvMemory::default(),
             txs: rest,
