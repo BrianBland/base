@@ -933,6 +933,8 @@ struct Scheduler<'a> {
     execution_nanos: AtomicU64,
     blocked_nanos: AtomicU64,
     reads: AtomicUsize,
+    #[cfg(test)]
+    after_execution: Option<fn(&Scheduler<'_>)>,
 }
 
 /// An EVM owned by one thread and reused for every execution it runs, as the sequential executor
@@ -1080,9 +1082,18 @@ impl Scheduler<'_> {
             }
         }
         *self.slots[tx].lock().unwrap() = Some(spec);
-        self.status[tx].store(EXECUTED, Ordering::SeqCst);
-        if self.invalidations[tx].load(Ordering::SeqCst) != seen {
-            self.invalidate(tx);
+        // Publication transfers ownership: a newer incarnation may execute and commit immediately.
+        // Racing invalidations missed here are still caught by committed-value validation.
+        let status = if self.invalidations[tx].load(Ordering::SeqCst) != seen {
+            self.invalidated.fetch_add(1, Ordering::Relaxed);
+            PENDING
+        } else {
+            EXECUTED
+        };
+        self.status[tx].store(status, Ordering::SeqCst);
+        #[cfg(test)]
+        if speculative && let Some(after_execution) = self.after_execution {
+            after_execution(self);
         }
     }
 
@@ -1338,6 +1349,8 @@ impl ParallelOutcome {
             execution_nanos: AtomicU64::new(0),
             blocked_nanos: AtomicU64::new(0),
             reads: AtomicUsize::new(0),
+            #[cfg(test)]
+            after_execution: None,
         };
         let setup_nanos = started.elapsed().as_nanos() as u64;
         std::thread::scope(|scope| {
@@ -1459,6 +1472,106 @@ impl CriticalPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use alloy_consensus::Header;
+    use alloy_primitives::TxKind;
+    use base_execution_chainspec::BaseChainSpecBuilder;
+
+    use crate::{PreAccount, Prestate};
+
+    fn finish_predecessor_and_commit(scheduler: &Scheduler<'_>) {
+        let mut evm = scheduler.evm();
+        assert!(scheduler.claim(0));
+        scheduler.run(&mut evm, 0, false);
+        scheduler.commit_ready(&mut evm).unwrap();
+        assert_eq!(scheduler.committed.lock().unwrap().txs.len(), 2);
+    }
+
+    fn late_execution_tail(sender_gate: bool) {
+        let config = Config::base(Arc::new(BaseChainSpecBuilder::base_mainnet().build()));
+        let sender = Address::repeat_byte(1);
+        let recipient = Address::repeat_byte(2);
+        let mut prestate = Prestate::default();
+        prestate.accounts.insert(
+            sender,
+            Some(PreAccount {
+                balance: U256::from(1_000_000_000),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY,
+            }),
+        );
+        let pre = PreDb::new(&prestate);
+        let store = Store::new(&pre);
+        let scheduler = Scheduler {
+            config: &config,
+            env: config.evm_env(&Header { gas_limit: 30_000_000, ..Default::default() }).unwrap(),
+            l1_info: L1BlockInfo::default(),
+            store: &store,
+            mv: MvMemory::new(3),
+            recovered: &[],
+            txs: (0..3)
+                .map(|nonce| {
+                    OnceLock::from(BaseTransaction {
+                        base: TxEnv {
+                            caller: sender,
+                            kind: TxKind::Call(recipient),
+                            nonce,
+                            value: U256::from(1),
+                            gas_limit: 100_000,
+                            chain_id: None,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                })
+                .collect(),
+            status: [PENDING, PENDING, EXECUTING].map(AtomicU8::new).into(),
+            invalidations: (0..3).map(|_| AtomicU64::new(0)).collect(),
+            waiting: [usize::MAX, usize::MAX, if sender_gate { usize::MAX } else { 1 }]
+                .map(AtomicUsize::new)
+                .into(),
+            sender_prev: vec![None, None, sender_gate.then_some(1)],
+            slots: (0..3).map(|_| Mutex::new(None)).collect(),
+            frontier: AtomicUsize::new(0),
+            stop: AtomicBool::new(false),
+            window: None,
+            trace: false,
+            committing: AtomicBool::new(false),
+            committed: Mutex::default(),
+            error: Mutex::default(),
+            idle_nanos: AtomicU64::new(0),
+            executions: AtomicUsize::new(0),
+            blocked: AtomicUsize::new(0),
+            invalidated: AtomicUsize::new(0),
+            execution_nanos: AtomicU64::new(0),
+            blocked_nanos: AtomicU64::new(0),
+            reads: AtomicUsize::new(0),
+            after_execution: Some(finish_predecessor_and_commit),
+        };
+        let mut evm = scheduler.evm();
+        assert!(scheduler.claim(1));
+        scheduler.run(&mut evm, 1, true);
+        scheduler.status[2].store(PENDING, Ordering::SeqCst);
+        assert!(scheduler.claim(2), "committed predecessor must release its dependent");
+        assert!(!scheduler.claim(1), "committed transaction must not execute again");
+        scheduler.run(&mut evm, 2, false);
+        scheduler.commit_ready(&mut evm).unwrap();
+        assert_eq!(scheduler.committed.lock().unwrap().txs.len(), 3);
+        assert_eq!(store.account(recipient).unwrap().balance, U256::from(3));
+        assert_eq!(scheduler.executions.load(Ordering::Relaxed), 4);
+        assert_eq!(scheduler.invalidated.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn late_execution_tail_does_not_strand_blocked_reader() {
+        late_execution_tail(false);
+    }
+
+    #[test]
+    fn late_execution_tail_does_not_strand_sender_gate() {
+        late_execution_tail(true);
+    }
 
     #[test]
     fn readers_above_returns_strictly_higher_readers_across_words() {

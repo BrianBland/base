@@ -30,6 +30,21 @@ count and result slot, then exits unsuccessfully. Dumps are best-effort concurre
 slot locks are never waited on. `PEVM_STALL_MS` sets the polling interval (default 5000 ms).
 The feature is disabled by default and adds no worker-loop instructions.
 
+### Execution publication contract
+
+Publishing a completed incarnation's `PENDING` or `EXECUTED` status transfers ownership:
+the old executor must not mutate scheduler state afterward. Otherwise a paused executor can
+invalidate a newer incarnation that another thread has already committed, leaving dependents
+waiting forever on a committed transaction marked `PENDING`.
+
+The invalidation counter is an early-retry hint, not the commit correctness gate. Check it
+while the incarnation is still `EXECUTING`, count any invalidated execution, and publish its
+final status once. A lower writer racing between that check and publication can miss an
+early retry, but the unchanged in-order committed-value validation rejects stale reads and
+re-executes against the exact prefix. No balance, nonce, read-resolution, or apply semantics
+change. All lower publishers have finished their invalidation loops before their final status
+can be committed; with no post-publication mutation, committed statuses remain `EXECUTED`.
+
 ```sh
 CARGO_TARGET_DIR=/Users/brianbland/code/scratch/target-live cargo build --release -p base-parallel-evm-bench --features scheduler-watchdog
 bash crates/infra/parallel-evm-bench/stress.sh /Users/brianbland/code/scratch/target-live/release/base-parallel-evm-bench /Users/brianbland/code/scratch/fixtures-dev 20 /tmp/pevm-stress
