@@ -190,8 +190,8 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
             );
         }
 
-        // Arms are interleaved per iteration and the minimum is kept, so background load on the
-        // host skews every arm alike and mostly drops out.
+        // Arms are interleaved per iteration and the minimum is kept (with its counters), so
+        // background load on the host skews every arm alike and mostly drops out.
         let mut seq = u64::MAX;
         let mut par = vec![u64::MAX; threads.len()];
         let mut stats = vec![Stats::default(); threads.len()];
@@ -201,7 +201,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
                 let store = Store::new(&pre);
                 let start = Instant::now();
                 let out = ParallelOutcome::execute(&config, &block, &store, t, schedule, false)?;
-                par[k] = par[k].min(start.elapsed().as_nanos() as u64);
+                let nanos = start.elapsed().as_nanos() as u64;
                 ensure!(
                     out.txs == expected,
                     "{}: timed receipts differ at {t} threads",
@@ -214,7 +214,10 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
                     file.display(),
                     &diffs[..diffs.len().min(5)]
                 );
-                stats[k] = out.stats;
+                if nanos < par[k] {
+                    par[k] = nanos;
+                    stats[k] = out.stats;
+                }
             }
         }
         seq_total += seq;
@@ -267,6 +270,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
         ideal[2]
     );
     let ms = |nanos: u64| nanos / 1_000_000;
+    let blocks = execs_per_tx.first().map_or(0, Vec::len).max(1) as u64;
     for (k, t) in threads.iter().enumerate() {
         let s = &stats_total[k];
         let per_tx = |count: usize| count as f64 / scheduled_txs.max(1) as f64;
@@ -288,7 +292,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
             ms(s.execution_nanos - s.committed_execution_nanos - s.blocked_nanos),
         );
         println!(
-            "# {t} threads engine: reads/exec {:.2}, validated_reads {}, reader_locs {}; ms: setup {} commit exec {} validate {} reexec {} apply {}",
+            "# {t} threads engine: reads/exec {:.2}, validated_reads {}, reader_locs {}; ms: setup {} commit exec {} validate {} reexec {} apply {}; us/block: fixed {} thread time outside executions and idling {}",
             s.reads as f64 / s.executions.max(1) as f64,
             s.validated_reads,
             s.reader_locs,
@@ -297,6 +301,10 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
             ms(s.validate_nanos),
             ms(s.reexec_nanos),
             ms(s.apply_nanos),
+            s.fixed_nanos / blocks / 1000,
+            (par_total[k] * *t as u64).saturating_sub(s.execution_nanos + s.idle_nanos)
+                / blocks
+                / 1000,
         );
     }
     Ok(())

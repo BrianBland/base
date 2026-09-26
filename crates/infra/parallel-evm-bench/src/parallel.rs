@@ -824,6 +824,9 @@ pub struct Stats {
     pub reexec_nanos: u64,
     /// Commit-role time applying writes, fee credits and multi-version cleanup.
     pub apply_nanos: u64,
+    /// Wall time not spent with every thread in the scheduling loop: setup, thread start (EVM
+    /// construction included), join and teardown.
+    pub fixed_nanos: u64,
 }
 
 impl Stats {
@@ -847,6 +850,7 @@ impl Stats {
         self.validate_nanos += other.validate_nanos;
         self.reexec_nanos += other.reexec_nanos;
         self.apply_nanos += other.apply_nanos;
+        self.fixed_nanos += other.fixed_nanos;
     }
 }
 
@@ -935,6 +939,11 @@ struct Scheduler<'a> {
     reads: AtomicUsize,
     #[cfg(test)]
     after_execution: Option<fn(&Scheduler<'_>)>,
+    started: Instant,
+    /// Nanoseconds after `started` at which the last thread entered the scheduling loop.
+    all_entered: AtomicU64,
+    /// Nanoseconds after `started` at which the first thread left the scheduling loop.
+    first_left: AtomicU64,
 }
 
 /// An EVM owned by one thread and reused for every execution it runs, as the sequential executor
@@ -1253,7 +1262,9 @@ impl Scheduler<'_> {
     }
 
     fn work(&self) {
+        let since_start = || self.started.elapsed().as_nanos() as u64;
         let mut evm = self.evm();
+        self.all_entered.fetch_max(since_start(), Ordering::Relaxed);
         while !self.stop.load(Ordering::Relaxed) {
             self.commit(&mut evm);
             if !self.step(&mut evm) && !self.stop.load(Ordering::Relaxed) {
@@ -1262,6 +1273,7 @@ impl Scheduler<'_> {
                 self.idle_nanos.fetch_add(idle.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
         }
+        self.first_left.fetch_min(since_start(), Ordering::Relaxed);
     }
 }
 
@@ -1351,6 +1363,9 @@ impl ParallelOutcome {
             reads: AtomicUsize::new(0),
             #[cfg(test)]
             after_execution: None,
+            started,
+            all_entered: AtomicU64::new(0),
+            first_left: AtomicU64::new(u64::MAX),
         };
         let setup_nanos = started.elapsed().as_nanos() as u64;
         std::thread::scope(|scope| {
@@ -1365,22 +1380,20 @@ impl ParallelOutcome {
             #[cfg(feature = "scheduler-watchdog")]
             drop(done);
         });
-        if let Some(error) = scheduler.error.into_inner().unwrap() {
-            return Err(error);
-        }
-        let committed = scheduler.committed.into_inner().unwrap();
-        let stats = Stats {
-            executions: scheduler.executions.into_inner(),
-            blocked: scheduler.blocked.into_inner(),
-            invalidated: scheduler.invalidated.into_inner(),
+        let error = scheduler.error.lock().unwrap().take();
+        let committed = std::mem::take(&mut *scheduler.committed.lock().unwrap());
+        let mut stats = Stats {
+            executions: scheduler.executions.load(Ordering::Relaxed),
+            blocked: scheduler.blocked.load(Ordering::Relaxed),
+            invalidated: scheduler.invalidated.load(Ordering::Relaxed),
             commit_fails: committed.commit_fails,
             rebased: committed.rebased,
             commit_nanos: committed.nanos,
-            idle_nanos: scheduler.idle_nanos.into_inner(),
-            execution_nanos: scheduler.execution_nanos.into_inner(),
-            blocked_nanos: scheduler.blocked_nanos.into_inner(),
+            idle_nanos: scheduler.idle_nanos.load(Ordering::Relaxed),
+            execution_nanos: scheduler.execution_nanos.load(Ordering::Relaxed),
+            blocked_nanos: scheduler.blocked_nanos.load(Ordering::Relaxed),
             committed_execution_nanos: committed.execution_nanos,
-            reads: scheduler.reads.into_inner(),
+            reads: scheduler.reads.load(Ordering::Relaxed),
             validated_reads: committed.validated_reads,
             reader_locs: scheduler.mv.readers.len(),
             setup_nanos,
@@ -1388,7 +1401,17 @@ impl ParallelOutcome {
             validate_nanos: committed.validate_nanos,
             reexec_nanos: committed.reexec_nanos,
             apply_nanos: committed.apply_nanos,
+            fixed_nanos: 0,
         };
+        let loop_nanos = scheduler
+            .first_left
+            .load(Ordering::Relaxed)
+            .saturating_sub(scheduler.all_entered.load(Ordering::Relaxed));
+        drop(scheduler);
+        stats.fixed_nanos = started.elapsed().as_nanos() as u64 - loop_nanos;
+        if let Some(error) = error {
+            return Err(error);
+        }
         Ok(Self { txs: committed.txs, stats, traces: committed.traces })
     }
 }
@@ -1548,6 +1571,9 @@ mod tests {
             blocked_nanos: AtomicU64::new(0),
             reads: AtomicUsize::new(0),
             after_execution: Some(finish_predecessor_and_commit),
+            started: Instant::now(),
+            all_entered: AtomicU64::new(0),
+            first_left: AtomicU64::new(u64::MAX),
         };
         let mut evm = scheduler.evm();
         assert!(scheduler.claim(1));
