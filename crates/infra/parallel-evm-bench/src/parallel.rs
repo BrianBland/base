@@ -25,7 +25,10 @@ use std::{
 use alloy_consensus::transaction::Recovered;
 use alloy_eips::Typed2718;
 use alloy_evm::{EvmEnv, FromRecoveredTx};
-use alloy_primitives::{Address, B256, Log, U256, map::HashMap as FastMap};
+use alloy_primitives::{
+    Address, B256, Log, U256,
+    map::{DefaultHashBuilder, HashMap as FastMap},
+};
 use base_common_consensus::{BaseBlock, BaseTxEnvelope, Predeploys};
 use base_common_evm::{
     BaseContext, BaseHaltReason, BaseHandler, BaseSpecId, BaseTransaction, BaseTransactionError,
@@ -187,15 +190,20 @@ fn may_be_empty(info: &Option<AccountInfo>) -> bool {
 #[derive(Debug)]
 pub struct Store<'a> {
     pre: &'a PreDb,
-    accounts: DashMap<Address, Option<AccountInfo>>,
-    storage: DashMap<(Address, U256), U256>,
-    codes: DashMap<B256, Bytecode>,
+    accounts: DashMap<Address, Option<AccountInfo>, DefaultHashBuilder>,
+    storage: DashMap<(Address, U256), U256, DefaultHashBuilder>,
+    codes: DashMap<B256, Bytecode, DefaultHashBuilder>,
 }
 
 impl<'a> Store<'a> {
     /// Creates an empty overlay over `pre`.
     pub fn new(pre: &'a PreDb) -> Self {
-        Self { pre, accounts: DashMap::new(), storage: DashMap::new(), codes: DashMap::new() }
+        Self {
+            pre,
+            accounts: DashMap::default(),
+            storage: DashMap::default(),
+            codes: DashMap::default(),
+        }
     }
 
     /// Committed account.
