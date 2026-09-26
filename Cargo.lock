@@ -5216,6 +5216,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "base-parallel-evm-bench"
+version = "0.0.0"
+dependencies = [
+ "alloy-consensus 2.4.1",
+ "alloy-eips 2.4.1",
+ "alloy-evm",
+ "alloy-primitives",
+ "alloy-provider",
+ "base-common-consensus",
+ "base-common-evm",
+ "base-common-genesis",
+ "base-common-network",
+ "base-execution-chainspec",
+ "base-execution-evm",
+ "clap",
+ "dashmap",
+ "eyre",
+ "reth-evm",
+ "reth-primitives-traits",
+ "reth-revm",
+ "revm",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "base-precompile-macros"
 version = "0.0.0"
 dependencies = [
