@@ -1111,10 +1111,12 @@ impl Scheduler<'_> {
         let changed = self.mv.publish(self.store, tx, &spec.writes, &previous);
         fence(Ordering::SeqCst);
         self.invalidate_readers(tx, changed);
+        let affected = self.invalidations[tx].load(Ordering::SeqCst) != seen
+            && !self.reads_visible(tx, &spec.reads);
         *self.slots[tx].lock().unwrap() = Some(spec);
         // Publication transfers ownership: a newer incarnation may execute and commit immediately.
         // Racing invalidations missed here are still caught by committed-value validation.
-        let status = if self.invalidations[tx].load(Ordering::SeqCst) != seen {
+        let status = if affected {
             self.invalidated.fetch_add(1, Ordering::Relaxed);
             PENDING
         } else {
@@ -1125,6 +1127,31 @@ impl Scheduler<'_> {
         if let Some(after_execution) = self.after_execution {
             after_execution(self);
         }
+    }
+
+    /// Whether every read of `tx`'s execution still admits the value now visible to it, so a
+    /// lower write published while it ran did not affect it. Commit validation decides
+    /// regardless; this only spares re-executing transactions the write did not touch.
+    fn reads_visible(&self, tx: usize, reads: &[Read]) -> bool {
+        reads.iter().all(|read| match read {
+            Read::Slot(address, slot, seen) => matches!(
+                self.mv.visible(self.store, &Loc::Slot(*address, *slot), tx),
+                Value::Slot(now) if now == *seen
+            ),
+            Read::Account(address, info, balance) => {
+                let Value::Account(now) = self.mv.visible(self.store, &Loc::Account(*address), tx)
+                else {
+                    return false;
+                };
+                let Value::Account(funds) =
+                    self.mv.visible(self.store, &Loc::Balance(*address), tx)
+                else {
+                    return false;
+                };
+                *info == info_key(&now)
+                    && balance.admits(funds.as_ref().map_or(U256::ZERO, |a| a.balance))
+            }
+        })
     }
 
     /// Invalidates the transactions above `tx` that read any of the `changed` locations.
