@@ -34,7 +34,7 @@ use base_common_genesis::BaseUpgrade;
 use base_execution_evm::BaseEvmConfig;
 use dashmap::DashMap;
 use eyre::{Result, eyre};
-use reth_evm::{ConfigureEvm, execute::BlockExecutor};
+use reth_evm::{ConfigureEvm, EvmFor, execute::BlockExecutor};
 use reth_primitives_traits::RecoveredBlock;
 use reth_revm::{State, db::BundleState};
 use revm::{
@@ -879,27 +879,48 @@ struct Scheduler<'a> {
     reads: AtomicUsize,
 }
 
+/// An EVM owned by one thread and reused for every execution it runs, as the sequential executor
+/// reuses one EVM for a whole block. The balance-recording opcodes are installed once.
+type WorkerEvm<'a> = EvmFor<Config, RecordingDb<'a>>;
+
 impl Scheduler<'_> {
-    fn execute(&self, tx: usize, speculative: bool) -> Result<Speculation, usize> {
-        let start = Instant::now();
-        let speculation = speculative.then_some((&self.mv, self.status.as_slice()));
+    fn evm<'s>(&'s self) -> WorkerEvm<'s> {
         let db = RecordingDb {
             store: self.store,
-            speculation,
-            tx,
+            speculation: None,
+            tx: 0,
             reads: Vec::new(),
             accounts: FastMap::default(),
-            sender: (speculative && self.txs[tx].tx_type() != DEPOSIT_TRANSACTION_TYPE)
-                .then(|| (self.txs[tx].caller(), self.txs[tx].nonce())),
+            sender: None,
         };
         let mut evm = self.config.evm_with_env(db, self.env.clone());
         BalanceOpcodes::install(evm.all_mut().1);
+        evm
+    }
+
+    fn execute<'s>(
+        &'s self,
+        evm: &mut WorkerEvm<'s>,
+        tx: usize,
+        speculative: bool,
+    ) -> Result<Speculation, usize> {
+        let start = Instant::now();
+        let db = evm.ctx_mut().db_mut();
+        db.speculation = speculative.then_some((&self.mv, self.status.as_slice()));
+        db.tx = tx;
+        db.accounts.clear();
+        db.sender = (speculative && self.txs[tx].tx_type() != DEPOSIT_TRANSACTION_TYPE)
+            .then(|| (self.txs[tx].caller(), self.txs[tx].nonce()));
         evm.ctx_mut().set_tx(self.txs[tx].clone());
         *evm.ctx_mut().chain_mut() = self.l1_info.clone();
         let mut handler: LazyFeeHandler<_, EVMError<Blocked, BaseTransactionError>, _> =
             LazyFeeHandler::default();
         self.executions.fetch_add(1, Ordering::Relaxed);
-        let result = handler.run(&mut evm);
+        let result = handler.run(evm);
+        // Reset everything a failed run can leave behind so the next execution starts clean.
+        *evm.ctx_mut().error() = Ok(());
+        let state = evm.ctx_mut().journal_mut().finalize();
+        let reads = std::mem::take(&mut evm.ctx_mut().db_mut().reads);
         let nanos = start.elapsed().as_nanos() as u64;
         self.execution_nanos.fetch_add(nanos, Ordering::Relaxed);
         let result = match result {
@@ -910,8 +931,6 @@ impl Scheduler<'_> {
             }
             Err(_) => None,
         };
-        let state = evm.ctx_mut().journal_mut().finalize();
-        let reads = std::mem::take(&mut evm.ctx_mut().db_mut().reads);
         self.reads.fetch_add(reads.len(), Ordering::Relaxed);
         // Merely touched accounts (every call target) keep the value the transaction read, so
         // publishing them would only make higher readers block on this transaction.
@@ -940,9 +959,9 @@ impl Scheduler<'_> {
 
     /// Runs a transaction the caller moved to `EXECUTING`, publishes its writes, and invalidates
     /// higher transactions that read a location whose value changed.
-    fn run(&self, tx: usize, speculative: bool) {
+    fn run<'s>(&'s self, evm: &mut WorkerEvm<'s>, tx: usize, speculative: bool) {
         let seen = self.invalidations[tx].load(Ordering::SeqCst);
-        let spec = match self.execute(tx, speculative) {
+        let spec = match self.execute(evm, tx, speculative) {
             Ok(spec) => spec,
             Err(writer) => {
                 self.blocked.fetch_add(1, Ordering::Relaxed);
@@ -991,16 +1010,16 @@ impl Scheduler<'_> {
 
     /// Executes the lowest pending transaction within the window above the commit frontier, if
     /// any.
-    fn step(&self) -> bool {
+    fn step<'s>(&'s self, evm: &mut WorkerEvm<'s>) -> bool {
         let from = self.frontier.load(Ordering::SeqCst) + 1;
         let to = self.window.map_or(self.txs.len(), |w| self.txs.len().min(from + w));
-        (from..to).find(|&tx| self.claim(tx)).map(|tx| self.run(tx, true)).is_some()
+        (from..to).find(|&tx| self.claim(tx)).map(|tx| self.run(evm, tx, true)).is_some()
     }
 
     /// Commits frontier transactions while any is committable. Every thread calls this between
     /// executions, so whichever thread makes the frontier transaction committable commits it
     /// instead of waiting on a dedicated committer.
-    fn commit(&self) {
+    fn commit<'s>(&'s self, evm: &mut WorkerEvm<'s>) {
         loop {
             let i = self.frontier.load(Ordering::SeqCst);
             if i == self.txs.len() {
@@ -1017,7 +1036,7 @@ impl Scheduler<'_> {
             {
                 return;
             }
-            let result = self.commit_ready();
+            let result = self.commit_ready(evm);
             self.committing.store(false, Ordering::SeqCst);
             if let Err(error) = result {
                 *self.error.lock().unwrap() = Some(error);
@@ -1028,7 +1047,7 @@ impl Scheduler<'_> {
     }
 
     /// Commits transactions in order from the frontier until one is still executing.
-    fn commit_ready(&self) -> Result<()> {
+    fn commit_ready<'s>(&'s self, evm: &mut WorkerEvm<'s>) -> Result<()> {
         let started = Instant::now();
         let mut committed = self.committed.lock().unwrap();
         let mut i = self.frontier.load(Ordering::SeqCst);
@@ -1037,7 +1056,7 @@ impl Scheduler<'_> {
             // state and needs no validation.
             let phase = Instant::now();
             let spec = if self.claim(i) {
-                self.run(i, false);
+                self.run(evm, i, false);
                 committed.exec_nanos += phase.elapsed().as_nanos() as u64;
                 self.slots[i].lock().unwrap().take().unwrap()
             } else if self.status[i].load(Ordering::SeqCst) == EXECUTED {
@@ -1053,7 +1072,7 @@ impl Scheduler<'_> {
                     committed.commit_fails += 1;
                     *self.slots[i].lock().unwrap() = Some(spec);
                     self.status[i].store(EXECUTING, Ordering::SeqCst);
-                    self.run(i, false);
+                    self.run(evm, i, false);
                     committed.reexec_nanos += phase.elapsed().as_nanos() as u64;
                     self.slots[i].lock().unwrap().take().unwrap()
                 }
@@ -1123,9 +1142,10 @@ impl Scheduler<'_> {
     }
 
     fn work(&self) {
+        let mut evm = self.evm();
         while !self.stop.load(Ordering::Relaxed) {
-            self.commit();
-            if !self.step() && !self.stop.load(Ordering::Relaxed) {
+            self.commit(&mut evm);
+            if !self.step(&mut evm) && !self.stop.load(Ordering::Relaxed) {
                 let idle = Instant::now();
                 std::thread::yield_now();
                 self.idle_nanos.fetch_add(idle.elapsed().as_nanos() as u64, Ordering::Relaxed);
