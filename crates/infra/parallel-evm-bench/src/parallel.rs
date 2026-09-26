@@ -461,6 +461,25 @@ impl MvMemory {
         changed
     }
 
+    /// Locations whose visible value changes for higher transactions when frontier transaction
+    /// `tx`, with `previous` published, commits `writes` without publishing them.
+    fn frontier_changes(
+        &self,
+        store: &Store<'_>,
+        tx: usize,
+        writes: &[(Loc, Value)],
+        previous: &[(Loc, Value)],
+    ) -> Vec<Loc> {
+        let written = writes
+            .iter()
+            .flat_map(|(loc, value)| loc.changes(&self.visible(store, loc, tx + 1), value));
+        let unwritten = previous
+            .iter()
+            .filter(|(loc, _)| !writes.iter().any(|(l, _)| l == loc))
+            .flat_map(|(loc, old)| loc.changes(old, &self.visible(store, loc, tx)));
+        written.chain(unwritten).collect()
+    }
+
     fn remove(&self, tx: usize, writes: &[(Loc, Value)]) {
         for (loc, _) in writes {
             if let Some(mut entry) = self.writes.get_mut(loc) {
@@ -1067,11 +1086,11 @@ impl Scheduler<'_> {
         Ok(Speculation { result, state, reads, writes, fees: handler.fees.take(), nanos })
     }
 
-    /// Runs a transaction the caller moved to `EXECUTING`, publishes its writes, and invalidates
-    /// higher transactions that read a location whose value changed.
-    fn run<'s>(&'s self, evm: &mut WorkerEvm<'s>, tx: usize, speculative: bool) {
+    /// Speculatively runs a transaction the caller moved to `EXECUTING`, publishes its writes, and
+    /// invalidates higher transactions that read a location whose value changed.
+    fn run<'s>(&'s self, evm: &mut WorkerEvm<'s>, tx: usize) {
         let seen = self.invalidations[tx].load(Ordering::SeqCst);
-        let spec = match self.execute(evm, tx, speculative) {
+        let spec = match self.execute(evm, tx, true) {
             Ok(spec) => spec,
             Err(writer) => {
                 self.blocked.fetch_add(1, Ordering::Relaxed);
@@ -1083,14 +1102,7 @@ impl Scheduler<'_> {
         let previous = self.slots[tx].lock().unwrap().take().map(|s| s.writes).unwrap_or_default();
         let changed = self.mv.publish(self.store, tx, &spec.writes, &previous);
         fence(Ordering::SeqCst);
-        for loc in changed {
-            if let Some(readers) = self.mv.readers.get(&loc) {
-                for reader in readers.above(tx) {
-                    self.invalidations[reader].fetch_add(1, Ordering::SeqCst);
-                    self.invalidate(reader);
-                }
-            }
-        }
+        self.invalidate_readers(tx, changed);
         *self.slots[tx].lock().unwrap() = Some(spec);
         // Publication transfers ownership: a newer incarnation may execute and commit immediately.
         // Racing invalidations missed here are still caught by committed-value validation.
@@ -1102,8 +1114,20 @@ impl Scheduler<'_> {
         };
         self.status[tx].store(status, Ordering::SeqCst);
         #[cfg(test)]
-        if speculative && let Some(after_execution) = self.after_execution {
+        if let Some(after_execution) = self.after_execution {
             after_execution(self);
+        }
+    }
+
+    /// Invalidates the transactions above `tx` that read any of the `changed` locations.
+    fn invalidate_readers(&self, tx: usize, changed: Vec<Loc>) {
+        for loc in changed {
+            if let Some(readers) = self.mv.readers.get(&loc) {
+                for reader in readers.above(tx) {
+                    self.invalidations[reader].fetch_add(1, Ordering::SeqCst);
+                    self.invalidate(reader);
+                }
+            }
         }
     }
 
@@ -1134,7 +1158,7 @@ impl Scheduler<'_> {
     fn step<'s>(&'s self, evm: &mut WorkerEvm<'s>) -> bool {
         let from = self.frontier.load(Ordering::SeqCst) + 1;
         let to = self.window.map_or(self.txs.len(), |w| self.txs.len().min(from + w));
-        (from..to).find(|&tx| self.claim(tx)).map(|tx| self.run(evm, tx, true)).is_some()
+        (from..to).find(|&tx| self.claim(tx)).map(|tx| self.run(evm, tx)).is_some()
     }
 
     /// Commits frontier transactions while any is committable. Every thread calls this between
@@ -1174,12 +1198,15 @@ impl Scheduler<'_> {
         let mut i = self.frontier.load(Ordering::SeqCst);
         while i < self.txs.len() {
             // Every lower transaction is committed, so an execution here reads the exact prefix
-            // state and needs no validation.
+            // state, needs no validation, and is committed without being published.
+            const AT_FRONTIER: &str =
+                "executions at the frontier read committed state and never block";
             let phase = Instant::now();
-            let spec = if self.claim(i) {
-                self.run(evm, i, false);
+            let (spec, previous) = if self.claim(i) {
+                let previous = self.slots[i].lock().unwrap().take().map(|s| s.writes);
+                let spec = self.execute(evm, i, false).expect(AT_FRONTIER);
                 committed.exec_nanos += phase.elapsed().as_nanos() as u64;
-                self.slots[i].lock().unwrap().take().unwrap()
+                (spec, Some(previous.unwrap_or_default()))
             } else if self.status[i].load(Ordering::SeqCst) == EXECUTED {
                 let spec = self.slots[i].lock().unwrap().take().unwrap();
                 committed.validated_reads += spec.reads.len();
@@ -1187,20 +1214,19 @@ impl Scheduler<'_> {
                     spec.result.is_some() && spec.reads.iter().all(|r| self.store.is_current(r));
                 committed.validate_nanos += phase.elapsed().as_nanos() as u64;
                 if valid {
-                    spec
+                    (spec, None)
                 } else {
                     let phase = Instant::now();
                     committed.commit_fails += 1;
-                    *self.slots[i].lock().unwrap() = Some(spec);
                     self.status[i].store(EXECUTING, Ordering::SeqCst);
-                    self.run(evm, i, false);
+                    let reexecuted = self.execute(evm, i, false).expect(AT_FRONTIER);
                     committed.reexec_nanos += phase.elapsed().as_nanos() as u64;
-                    self.slots[i].lock().unwrap().take().unwrap()
+                    (reexecuted, Some(spec.writes))
                 }
             } else {
                 break;
             };
-            self.apply(&mut committed, i, spec)?;
+            self.apply(&mut committed, i, spec, previous)?;
             i += 1;
             self.frontier.store(i, Ordering::SeqCst);
         }
@@ -1208,7 +1234,16 @@ impl Scheduler<'_> {
         Ok(())
     }
 
-    fn apply(&self, committed: &mut Committed, i: usize, spec: Speculation) -> Result<()> {
+    /// Commits `spec` as transaction `i`. `previous` is `None` if `spec` is the published
+    /// speculative execution, and otherwise holds the writes `i`'s earlier execution published,
+    /// which `spec` (executed at the frontier, unpublished) supersedes.
+    fn apply(
+        &self,
+        committed: &mut Committed,
+        i: usize,
+        spec: Speculation,
+        previous: Option<Vec<(Loc, Value)>>,
+    ) -> Result<()> {
         let Some(result) = &spec.result else {
             let index = committed.txs.len();
             return Err(eyre!("transaction {index} failed at its exact prefix state"));
@@ -1253,11 +1288,21 @@ impl Scheduler<'_> {
             committed.traces.push(TxTrace { reads, writes, nanos: spec.nanos });
         }
         let phase = Instant::now();
+        let changed = previous
+            .as_ref()
+            .map(|previous| self.mv.frontier_changes(self.store, i, &spec.writes, previous));
         committed.rebased += usize::from(self.store.apply_state(&spec.state, &spec.reads));
         for (recipient, amount) in &spec.fees {
             self.store.credit(*recipient, *amount);
         }
-        self.mv.remove(i, &spec.writes);
+        self.mv.remove(i, previous.as_deref().unwrap_or(&spec.writes));
+        if let Some(changed) = changed {
+            // Pairs with the fence between registering and reading in `RecordingDb::resolve`:
+            // a reader this misses reads the committed value.
+            fence(Ordering::SeqCst);
+            self.invalidate_readers(i, changed);
+            self.status[i].store(EXECUTED, Ordering::SeqCst);
+        }
         committed.apply_nanos += phase.elapsed().as_nanos() as u64;
         Ok(())
     }
@@ -1531,8 +1576,6 @@ mod tests {
 
     fn finish_predecessor_and_commit(scheduler: &Scheduler<'_>) {
         let mut evm = scheduler.evm();
-        assert!(scheduler.claim(0));
-        scheduler.run(&mut evm, 0, false);
         scheduler.commit_ready(&mut evm).unwrap();
         assert_eq!(scheduler.committed.lock().unwrap().txs.len(), 2);
     }
@@ -1603,11 +1646,9 @@ mod tests {
         };
         let mut evm = scheduler.evm();
         assert!(scheduler.claim(1));
-        scheduler.run(&mut evm, 1, true);
+        scheduler.run(&mut evm, 1);
         scheduler.status[2].store(PENDING, Ordering::SeqCst);
-        assert!(scheduler.claim(2), "committed predecessor must release its dependent");
         assert!(!scheduler.claim(1), "committed transaction must not execute again");
-        scheduler.run(&mut evm, 2, false);
         scheduler.commit_ready(&mut evm).unwrap();
         assert_eq!(scheduler.committed.lock().unwrap().txs.len(), 3);
         assert_eq!(store.account(recipient).unwrap().balance, U256::from(3));
