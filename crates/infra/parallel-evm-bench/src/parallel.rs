@@ -729,19 +729,54 @@ pub struct TxTrace {
     pub nanos: u64,
 }
 
+/// Scheduling counters of one parallel execution. Every execution ends exactly once as committed,
+/// blocked, invalidated, or failing commit validation, so
+/// `executions == txs + blocked + invalidated + commit_fails`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Stats {
+    /// Total executions, including wasted ones.
+    pub executions: usize,
+    /// Executions aborted on reading a write of a transaction that is not executed.
+    pub blocked: usize,
+    /// Completed executions invalidated by a lower transaction's write before commit.
+    pub invalidated: usize,
+    /// Speculative results that failed commit validation.
+    pub commit_fails: usize,
+    /// Transactions committed although a balance they read had since changed.
+    pub rebased: usize,
+    /// Committer time spent executing, validating, and applying frontier transactions.
+    pub commit_work_nanos: u64,
+    /// Committer time spent speculating on higher transactions while waiting.
+    pub commit_help_nanos: u64,
+    /// Help time after which the frontier transaction was already executed: an upper bound on
+    /// how long helping delayed the frontier.
+    pub commit_stall_nanos: u64,
+    /// Committer time spent idle waiting for the frontier transaction.
+    pub commit_wait_nanos: u64,
+}
+
+impl Stats {
+    /// Adds `other`'s counters to `self`.
+    pub const fn accumulate(&mut self, other: &Self) {
+        self.executions += other.executions;
+        self.blocked += other.blocked;
+        self.invalidated += other.invalidated;
+        self.commit_fails += other.commit_fails;
+        self.rebased += other.rebased;
+        self.commit_work_nanos += other.commit_work_nanos;
+        self.commit_help_nanos += other.commit_help_nanos;
+        self.commit_stall_nanos += other.commit_stall_nanos;
+        self.commit_wait_nanos += other.commit_wait_nanos;
+    }
+}
+
 /// Result of a parallel block execution.
 #[derive(Debug)]
 pub struct ParallelOutcome {
     /// Per-transaction outcomes.
     pub txs: Vec<TxOutcome>,
-    /// Total executions, including re-executions.
-    pub executions: usize,
-    /// Transactions whose speculative result failed commit validation.
-    pub reexecuted: usize,
-    /// Speculative executions aborted on a read of a not-yet-executed write.
-    pub blocked: usize,
-    /// Transactions committed although a balance they read had since changed.
-    pub rebased: usize,
+    /// Scheduling counters.
+    pub stats: Stats,
     /// Committed-execution traces (only when requested).
     pub traces: Vec<TxTrace>,
 }
@@ -768,6 +803,7 @@ struct Scheduler<'a> {
     stop: AtomicBool,
     executions: AtomicUsize,
     blocked: AtomicUsize,
+    invalidated: AtomicUsize,
 }
 
 impl Scheduler<'_> {
@@ -837,24 +873,23 @@ impl Scheduler<'_> {
             if let Some(readers) = self.mv.readers.get(&loc) {
                 for &reader in readers.iter().filter(|&&r| r > tx) {
                     self.invalidations[reader].fetch_add(1, Ordering::SeqCst);
-                    let _ = self.status[reader].compare_exchange(
-                        EXECUTED,
-                        PENDING,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    );
+                    self.invalidate(reader);
                 }
             }
         }
         *self.slots[tx].lock().unwrap() = Some(spec);
         self.status[tx].store(EXECUTED, Ordering::SeqCst);
         if self.invalidations[tx].load(Ordering::SeqCst) != seen {
-            let _ = self.status[tx].compare_exchange(
-                EXECUTED,
-                PENDING,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
+            self.invalidate(tx);
+        }
+    }
+
+    fn invalidate(&self, tx: usize) {
+        if self.status[tx]
+            .compare_exchange(EXECUTED, PENDING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.invalidated.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -935,8 +970,9 @@ impl ParallelOutcome {
             stop: AtomicBool::new(false),
             executions: AtomicUsize::new(0),
             blocked: AtomicUsize::new(0),
+            invalidated: AtomicUsize::new(0),
         };
-        let (mut reexecuted, mut rebased) = (0, 0);
+        let mut stats = Stats::default();
         let mut traces = Vec::new();
         let mut cumulative_gas = txs[0].cumulative_gas;
 
@@ -949,6 +985,7 @@ impl ParallelOutcome {
                     scheduler.frontier.store(i, Ordering::SeqCst);
                     // Every lower transaction is committed, so an execution by the committer
                     // reads the exact prefix state and needs no validation.
+                    let started = Instant::now();
                     let spec = loop {
                         if scheduler.claim(i) {
                             scheduler.run(i, false);
@@ -961,17 +998,25 @@ impl ParallelOutcome {
                             {
                                 break spec;
                             }
-                            reexecuted += 1;
+                            stats.commit_fails += 1;
                             *scheduler.slots[i].lock().unwrap() = Some(spec);
                             scheduler.status[i].store(EXECUTING, Ordering::SeqCst);
                             scheduler.run(i, false);
                             break scheduler.slots[i].lock().unwrap().take().unwrap();
                         }
                         // Help speculate while a worker finishes the frontier transaction.
-                        if scheduler.step() {
+                        let waited = Instant::now();
+                        let helped = scheduler.step();
+                        let nanos = waited.elapsed().as_nanos() as u64;
+                        if !helped {
+                            stats.commit_wait_nanos += nanos;
+                            std::hint::spin_loop();
                             continue;
                         }
-                        std::hint::spin_loop();
+                        stats.commit_help_nanos += nanos;
+                        if scheduler.status[i].load(Ordering::SeqCst) == EXECUTED {
+                            stats.commit_stall_nanos += nanos;
+                        }
                     };
                     let Some(result) = &spec.result else {
                         return Err(eyre!(
@@ -1025,11 +1070,12 @@ impl ParallelOutcome {
                             .collect();
                         traces.push(TxTrace { reads, writes, nanos: spec.nanos });
                     }
-                    rebased += usize::from(store.apply_state(&spec.state, &spec.reads));
+                    stats.rebased += usize::from(store.apply_state(&spec.state, &spec.reads));
                     for (recipient, amount) in &spec.fees {
                         store.credit(*recipient, *amount);
                     }
                     scheduler.mv.remove(i, &spec.writes);
+                    stats.commit_work_nanos += started.elapsed().as_nanos() as u64;
                 }
                 Ok(())
             })();
@@ -1037,14 +1083,11 @@ impl ParallelOutcome {
             result
         })?;
 
-        Ok(Self {
-            txs,
-            executions: scheduler.executions.into_inner(),
-            reexecuted,
-            blocked: scheduler.blocked.into_inner(),
-            rebased,
-            traces,
-        })
+        stats.executions = scheduler.executions.into_inner();
+        stats.blocked = scheduler.blocked.into_inner();
+        stats.invalidated = scheduler.invalidated.into_inner();
+        stats.commit_work_nanos -= stats.commit_help_nanos + stats.commit_wait_nanos;
+        Ok(Self { txs, stats, traces })
     }
 }
 

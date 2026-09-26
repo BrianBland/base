@@ -12,7 +12,7 @@ use base_common_consensus::BaseBlock;
 use base_execution_chainspec::BaseChainSpecBuilder;
 use base_execution_evm::BaseEvmConfig;
 use base_parallel_evm_bench::{
-    BlockFixture, CriticalPath, ParallelOutcome, PreDb, RpcRecorder, Store, TxOutcome,
+    BlockFixture, CriticalPath, ParallelOutcome, PreDb, RpcRecorder, Stats, Store, TxOutcome,
 };
 use clap::{Parser, Subcommand};
 use eyre::{Result, ensure};
@@ -142,11 +142,16 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
     // Critical-path bounds: [unbounded, 8 cores, unbounded with per-account conflicts].
     let mut path_total = [0u64; 3];
     let mut exec_total = 0u64;
+    let mut stats_total = vec![Stats::default(); threads.len()];
+    let mut execs_per_tx = vec![Vec::new(); threads.len()];
+    let mut scheduled_txs = 0usize;
     println!(
         "block,canonical,txs,gas_m,dependent_txs,chain_txs,seq_us,ideal_speedup,ideal8_speedup,ideal_peraccount_speedup,{}",
         threads
             .iter()
-            .map(|t| format!("par{t}_us,par{t}_speedup,par{t}_execs:commit_fails:blocked:rebased"))
+            .map(|t| format!(
+                "par{t}_us,par{t}_speedup,par{t}_execs:blocked:invalidated:commit_fails:rebased"
+            ))
             .collect::<Vec<_>>()
             .join(",")
     );
@@ -182,7 +187,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
         // host skews every arm alike and mostly drops out.
         let mut seq = u64::MAX;
         let mut par = vec![u64::MAX; threads.len()];
-        let mut reexec = vec![(0, 0, 0, 0); threads.len()];
+        let mut stats = vec![Stats::default(); threads.len()];
         for _ in 0..iters {
             seq = seq.min(sequential(&config, &pre, &block)?.2);
             for (k, &t) in threads.iter().enumerate() {
@@ -190,10 +195,12 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
                 let start = Instant::now();
                 let out = ParallelOutcome::execute(&config, &block, &store, t, false)?;
                 par[k] = par[k].min(start.elapsed().as_nanos() as u64);
-                reexec[k] = (out.executions, out.reexecuted, out.blocked, out.rebased);
+                stats[k] = out.stats;
             }
         }
         seq_total += seq;
+        let scheduled = block.body().transactions.len() - 1;
+        scheduled_txs += scheduled;
         for (total, bound) in path_total.iter_mut().zip(bounds) {
             *total += bound;
         }
@@ -215,15 +222,19 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
         );
         for (k, par) in par.into_iter().enumerate() {
             par_total[k] += par;
+            let s = &stats[k];
             row += &format!(
-                ",{},{:.2},{}:{}:{}:{}",
+                ",{},{:.2},{}:{}:{}:{}:{}",
                 par / 1000,
                 seq as f64 / par as f64,
-                reexec[k].0,
-                reexec[k].1,
-                reexec[k].2,
-                reexec[k].3
+                s.executions,
+                s.blocked,
+                s.invalidated,
+                s.commit_fails,
+                s.rebased
             );
+            stats_total[k].accumulate(s);
+            execs_per_tx[k].push(s.executions as f64 / scheduled.max(1) as f64);
         }
         println!("{row}");
         println!("#   hot: {:?}", critical.hot);
@@ -236,11 +247,25 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
         ideal[1],
         ideal[2]
     );
+    let ms = |nanos: u64| nanos / 1_000_000;
     for (k, t) in threads.iter().enumerate() {
+        let s = &stats_total[k];
+        let per_tx = |count: usize| count as f64 / scheduled_txs.max(1) as f64;
+        execs_per_tx[k].sort_by(f64::total_cmp);
         println!(
-            "# {t} threads: {} ms, speedup {:.2}",
+            "# {t} threads: {} ms, speedup {:.2}; execs/tx {:.3} (block p50 {:.2}); wasted/tx: blocked {:.3} invalidated {:.3} commit_fail {:.3}; rebased/tx {:.3}; committer ms: work {} help {} (stall {}) wait {}",
             par_total[k] / 1_000_000,
-            seq_total as f64 / par_total[k] as f64
+            seq_total as f64 / par_total[k] as f64,
+            per_tx(s.executions),
+            execs_per_tx[k].get(execs_per_tx[k].len() / 2).copied().unwrap_or_default(),
+            per_tx(s.blocked),
+            per_tx(s.invalidated),
+            per_tx(s.commit_fails),
+            per_tx(s.rebased),
+            ms(s.commit_work_nanos),
+            ms(s.commit_help_nanos),
+            ms(s.commit_stall_nanos),
+            ms(s.commit_wait_nanos),
         );
     }
     Ok(())
