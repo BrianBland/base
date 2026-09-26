@@ -35,6 +35,7 @@ use base_common_genesis::BaseUpgrade;
 use base_execution_evm::BaseEvmConfig;
 use dashmap::DashMap;
 use eyre::{Result, eyre};
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use reth_evm::{ConfigureEvm, EvmFor, execute::BlockExecutor};
 use reth_primitives_traits::RecoveredBlock;
 use reth_revm::{State, db::BundleState};
@@ -1277,13 +1278,41 @@ impl Scheduler<'_> {
     }
 }
 
+/// The threads that execute blocks: the calling thread plus a persistent pool for the rest, so a
+/// block does not pay for spawning and joining threads.
+#[derive(Debug)]
+pub struct Workers {
+    pool: Option<ThreadPool>,
+}
+
+impl Workers {
+    /// Creates `threads` workers, starting a pool for all but the calling thread.
+    pub fn new(threads: usize) -> Result<Self> {
+        let pool = (threads > 1)
+            .then(|| ThreadPoolBuilder::new().num_threads(threads - 1).build())
+            .transpose()?;
+        Ok(Self { pool })
+    }
+
+    /// Runs `work` once on every worker and returns when all have finished.
+    pub fn run(&self, work: impl Fn() + Sync) {
+        match &self.pool {
+            Some(pool) => pool.in_place_scope(|scope| {
+                scope.spawn_broadcast(|_, _| work());
+                work();
+            }),
+            None => work(),
+        }
+    }
+}
+
 impl ParallelOutcome {
-    /// Executes `block` with `threads` threads that each speculate and commit under `schedule`.
+    /// Executes `block` on `workers`, each of which speculates and commits under `schedule`.
     pub fn execute(
         config: &Config,
         block: &RecoveredBlock<BaseBlock>,
         store: &Store<'_>,
-        threads: usize,
+        workers: &Workers,
         schedule: Schedule,
         trace: bool,
     ) -> Result<Self> {
@@ -1368,18 +1397,15 @@ impl ParallelOutcome {
             first_left: AtomicU64::new(u64::MAX),
         };
         let setup_nanos = started.elapsed().as_nanos() as u64;
+        #[cfg(feature = "scheduler-watchdog")]
         std::thread::scope(|scope| {
-            #[cfg(feature = "scheduler-watchdog")]
             let (done, receiver) = std::sync::mpsc::channel();
-            #[cfg(feature = "scheduler-watchdog")]
             scope.spawn(|| scheduler.watch(receiver));
-            for _ in 1..threads {
-                scope.spawn(|| scheduler.work());
-            }
-            scheduler.work();
-            #[cfg(feature = "scheduler-watchdog")]
+            workers.run(|| scheduler.work());
             drop(done);
         });
+        #[cfg(not(feature = "scheduler-watchdog"))]
+        workers.run(|| scheduler.work());
         let error = scheduler.error.lock().unwrap().take();
         let committed = std::mem::take(&mut *scheduler.committed.lock().unwrap());
         let mut stats = Stats {
@@ -1611,5 +1637,19 @@ mod tests {
         assert_eq!(readers.above(64).collect::<Vec<_>>(), [65, 127, 128, 199]);
         assert_eq!(readers.above(127).collect::<Vec<_>>(), [128, 199]);
         assert_eq!(readers.above(199).count(), 0);
+    }
+
+    #[test]
+    fn workers_run_work_once_on_each_of_their_threads_every_time() {
+        for threads in [1, 3] {
+            let workers = Workers::new(threads).unwrap();
+            for _ in 0..2 {
+                let ran = Mutex::new(Vec::new());
+                workers.run(|| ran.lock().unwrap().push(std::thread::current().id()));
+                let ran = ran.into_inner().unwrap();
+                let distinct: std::collections::HashSet<_> = ran.iter().collect();
+                assert_eq!((ran.len(), distinct.len()), (threads, threads));
+            }
+        }
     }
 }

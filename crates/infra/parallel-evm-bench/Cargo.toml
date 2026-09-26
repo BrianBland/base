@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 revm = { workspace = true, features = ["std"] }
 eyre.workspace = true
+rayon.workspace = true
 dashmap.workspace = true
 reth-evm.workspace = true
 reth-revm.workspace = true

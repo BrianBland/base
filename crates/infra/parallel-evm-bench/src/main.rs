@@ -13,7 +13,7 @@ use base_execution_chainspec::BaseChainSpecBuilder;
 use base_execution_evm::BaseEvmConfig;
 use base_parallel_evm_bench::{
     BlockFixture, CriticalPath, ParallelOutcome, PreDb, RpcRecorder, Schedule, Stats, Store,
-    TxOutcome,
+    TxOutcome, Workers,
 };
 use clap::{Parser, Subcommand};
 use eyre::{Result, ensure};
@@ -152,6 +152,8 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
     let mut stats_total = vec![Stats::default(); threads.len()];
     let mut execs_per_tx = vec![Vec::new(); threads.len()];
     let mut scheduled_txs = 0usize;
+    let single = Workers::new(1)?;
+    let workers = threads.iter().map(|&t| Workers::new(t)).collect::<Result<Vec<_>>>()?;
     println!(
         "block,canonical,txs,gas_m,dependent_txs,chain_txs,seq_us,ideal_speedup,ideal8_speedup,ideal_peraccount_speedup,{}",
         threads
@@ -170,16 +172,16 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
 
         // Correctness and dependency trace at every thread count before timing.
         let store = Store::new(&pre);
-        let traced = ParallelOutcome::execute(&config, &block, &store, 1, schedule, true)?;
+        let traced = ParallelOutcome::execute(&config, &block, &store, &single, schedule, true)?;
         let critical = CriticalPath::new(&traced.traces, None, false);
         let bounds = [
             critical.path_nanos,
             CriticalPath::new(&traced.traces, Some(8), false).path_nanos,
             CriticalPath::new(&traced.traces, None, true).path_nanos,
         ];
-        for &t in threads {
+        for (&t, workers) in threads.iter().zip(&workers) {
             let store = Store::new(&pre);
-            let out = ParallelOutcome::execute(&config, &block, &store, t, schedule, false)?;
+            let out = ParallelOutcome::execute(&config, &block, &store, workers, schedule, false)?;
             ensure!(out.txs == expected, "{}: receipts differ at {t} threads", file.display());
             let diffs = store.diff(&bundle);
             ensure!(
@@ -197,10 +199,12 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
         let mut stats = vec![Stats::default(); threads.len()];
         for _ in 0..iters {
             seq = seq.min(sequential(&config, &pre, &block)?.2);
-            for (k, &t) in threads.iter().enumerate() {
+            for (k, workers) in workers.iter().enumerate() {
+                let t = threads[k];
                 let store = Store::new(&pre);
                 let start = Instant::now();
-                let out = ParallelOutcome::execute(&config, &block, &store, t, schedule, false)?;
+                let out =
+                    ParallelOutcome::execute(&config, &block, &store, workers, schedule, false)?;
                 let nanos = start.elapsed().as_nanos() as u64;
                 ensure!(
                     out.txs == expected,
