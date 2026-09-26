@@ -13,7 +13,6 @@ publish = false
 workspace = true
 
 [dependencies]
-revm = { workspace = true, features = ["std"] }
 eyre.workspace = true
 rayon.workspace = true
 dashmap.workspace = true
@@ -35,6 +34,7 @@ base-common-consensus.workspace = true
 base-execution-chainspec.workspace = true
 clap = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+revm = { workspace = true, features = ["std", "blst", "c-kzg", "p256-aws-lc-rs", "secp256k1"] }
 
 [features]
 scheduler-watchdog = []

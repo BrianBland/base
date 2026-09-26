@@ -22,6 +22,11 @@ the pre-state and account-read index use `alloy_primitives::map::HashMap`, and c
 and multi-version maps use that same builder in `DashMap`. Fixture serialization and RPC
 recording are outside this hot path and retain their existing maps.
 
+Precompiles use the production node's native crypto backends: `blst`, `c-kzg`,
+`p256-aws-lc-rs`, and `secp256k1`. Both sequential and parallel benchmark arms share these
+features. Verify the resolved configuration with
+`cargo tree -p base-parallel-evm-bench -e features -i revm-precompile`.
+
 ## Scheduler stress diagnostics
 
 Every benchmark iteration must match the sequential receipts and full post-state, not only
