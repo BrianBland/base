@@ -253,7 +253,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
         let per_tx = |count: usize| count as f64 / scheduled_txs.max(1) as f64;
         execs_per_tx[k].sort_by(f64::total_cmp);
         println!(
-            "# {t} threads: {} ms, speedup {:.2}; execs/tx {:.3} (block p50 {:.2}); wasted/tx: blocked {:.3} invalidated {:.3} commit_fail {:.3}; rebased/tx {:.3}; committer ms: work {} help {} (stall {}) wait {}",
+            "# {t} threads: {} ms, speedup {:.2}; execs/tx {:.3} (block p50 {:.2}); wasted/tx: blocked {:.3} invalidated {:.3} commit_fail {:.3}; rebased/tx {:.3}; ms: commit {} idle {}",
             par_total[k] / 1_000_000,
             seq_total as f64 / par_total[k] as f64,
             per_tx(s.executions),
@@ -262,10 +262,8 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
             per_tx(s.invalidated),
             per_tx(s.commit_fails),
             per_tx(s.rebased),
-            ms(s.commit_work_nanos),
-            ms(s.commit_help_nanos),
-            ms(s.commit_stall_nanos),
-            ms(s.commit_wait_nanos),
+            ms(s.commit_nanos),
+            ms(s.idle_nanos),
         );
     }
     Ok(())

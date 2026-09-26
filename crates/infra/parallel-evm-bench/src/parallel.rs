@@ -1,12 +1,13 @@
 //! Optimistic parallel block execution with in-order, value-validated commits.
 //!
-//! Workers speculatively execute transactions against the latest committed state and record
-//! every value they read. A single committer walks transactions in block order: if every value a
-//! speculative execution read still matches the committed state, its writes are applied as-is
-//! (value-based validation is sound because execution is a deterministic function of the values
-//! read); otherwise the transaction is re-executed on the committer against the exact prefix
-//! state. Fee credits to the beneficiary and fee vaults are deferred to commit time so they do not
-//! serialize every transaction.
+//! Threads speculatively execute transactions against the latest committed state and record
+//! every value they read. Whichever thread finds the frontier transaction committable takes the
+//! single commit role and walks transactions in block order: if every value a speculative
+//! execution read still matches the committed state, its writes are applied as-is (value-based
+//! validation is sound because execution is a deterministic function of the values read);
+//! otherwise the transaction is re-executed against the exact prefix state. Fee credits to the
+//! beneficiary and fee vaults are deferred to commit time so they do not serialize every
+//! transaction.
 //!
 //! Balances are validated by what execution observed rather than by value: see [`BalanceRead`].
 
@@ -744,15 +745,11 @@ pub struct Stats {
     pub commit_fails: usize,
     /// Transactions committed although a balance they read had since changed.
     pub rebased: usize,
-    /// Committer time spent executing, validating, and applying frontier transactions.
-    pub commit_work_nanos: u64,
-    /// Committer time spent speculating on higher transactions while waiting.
-    pub commit_help_nanos: u64,
-    /// Help time after which the frontier transaction was already executed: an upper bound on
-    /// how long helping delayed the frontier.
-    pub commit_stall_nanos: u64,
-    /// Committer time spent idle waiting for the frontier transaction.
-    pub commit_wait_nanos: u64,
+    /// Time spent holding the commit role: executing, validating, and applying frontier
+    /// transactions.
+    pub commit_nanos: u64,
+    /// Thread time spent yielding with nothing to execute or commit, summed over threads.
+    pub idle_nanos: u64,
 }
 
 impl Stats {
@@ -763,10 +760,8 @@ impl Stats {
         self.invalidated += other.invalidated;
         self.commit_fails += other.commit_fails;
         self.rebased += other.rebased;
-        self.commit_work_nanos += other.commit_work_nanos;
-        self.commit_help_nanos += other.commit_help_nanos;
-        self.commit_stall_nanos += other.commit_stall_nanos;
-        self.commit_wait_nanos += other.commit_wait_nanos;
+        self.commit_nanos += other.commit_nanos;
+        self.idle_nanos += other.idle_nanos;
     }
 }
 
@@ -787,6 +782,17 @@ const PENDING: u8 = 0;
 const EXECUTING: u8 = 1;
 const EXECUTED: u8 = 2;
 
+/// Commit-side state, only touched by the thread holding the commit role.
+#[derive(Debug, Default)]
+struct Committed {
+    txs: Vec<TxOutcome>,
+    cumulative_gas: u64,
+    traces: Vec<TxTrace>,
+    commit_fails: usize,
+    nanos: u64,
+    rebased: usize,
+}
+
 /// Shared scheduler state for one block.
 struct Scheduler<'a> {
     config: &'a Config,
@@ -799,8 +805,15 @@ struct Scheduler<'a> {
     /// Transaction each one last blocked on (`usize::MAX` = none).
     waiting: Vec<AtomicUsize>,
     slots: Vec<Mutex<Option<Speculation>>>,
+    /// Lowest uncommitted transaction.
     frontier: AtomicUsize,
     stop: AtomicBool,
+    trace: bool,
+    /// Whether a thread holds the commit role.
+    committing: AtomicBool,
+    committed: Mutex<Committed>,
+    error: Mutex<Option<eyre::Report>>,
+    idle_nanos: AtomicU64,
     executions: AtomicUsize,
     blocked: AtomicUsize,
     invalidated: AtomicUsize,
@@ -909,17 +922,133 @@ impl Scheduler<'_> {
         (from..self.txs.len()).find(|&tx| self.claim(tx)).map(|tx| self.run(tx, true)).is_some()
     }
 
+    /// Commits frontier transactions while any is committable. Every thread calls this between
+    /// executions, so whichever thread makes the frontier transaction committable commits it
+    /// instead of waiting on a dedicated committer.
+    fn commit(&self) {
+        loop {
+            let i = self.frontier.load(Ordering::SeqCst);
+            if i == self.txs.len() {
+                self.stop.store(true, Ordering::Relaxed);
+                return;
+            }
+            // A thread that makes the frontier committable while another holds the role fails
+            // the exchange; the holder re-checks after releasing, so the frontier never strands.
+            if self.status[i].load(Ordering::SeqCst) == EXECUTING
+                || self
+                    .committing
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+            {
+                return;
+            }
+            let result = self.commit_ready();
+            self.committing.store(false, Ordering::SeqCst);
+            if let Err(error) = result {
+                *self.error.lock().unwrap() = Some(error);
+                self.stop.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
+    /// Commits transactions in order from the frontier until one is still executing.
+    fn commit_ready(&self) -> Result<()> {
+        let started = Instant::now();
+        let mut committed = self.committed.lock().unwrap();
+        let mut i = self.frontier.load(Ordering::SeqCst);
+        while i < self.txs.len() {
+            // Every lower transaction is committed, so an execution here reads the exact prefix
+            // state and needs no validation.
+            let spec = if self.claim(i) {
+                self.run(i, false);
+                self.slots[i].lock().unwrap().take().unwrap()
+            } else if self.status[i].load(Ordering::SeqCst) == EXECUTED {
+                let spec = self.slots[i].lock().unwrap().take().unwrap();
+                if spec.result.is_some() && spec.reads.iter().all(|r| self.store.is_current(r)) {
+                    spec
+                } else {
+                    committed.commit_fails += 1;
+                    *self.slots[i].lock().unwrap() = Some(spec);
+                    self.status[i].store(EXECUTING, Ordering::SeqCst);
+                    self.run(i, false);
+                    self.slots[i].lock().unwrap().take().unwrap()
+                }
+            } else {
+                break;
+            };
+            self.apply(&mut committed, i, spec)?;
+            i += 1;
+            self.frontier.store(i, Ordering::SeqCst);
+        }
+        committed.nanos += started.elapsed().as_nanos() as u64;
+        Ok(())
+    }
+
+    fn apply(&self, committed: &mut Committed, i: usize, spec: Speculation) -> Result<()> {
+        let Some(result) = &spec.result else {
+            return Err(eyre!("transaction {} failed at its exact prefix state", i + 1));
+        };
+        committed.cumulative_gas += result.tx_gas_used();
+        committed.txs.push(TxOutcome {
+            success: result.is_success(),
+            cumulative_gas: committed.cumulative_gas,
+            logs: result.logs().to_vec(),
+        });
+        if self.trace {
+            // A balance constraint binds only if the block's pre-state violates it; the sender's
+            // nonce is assumed, so only a code change binds its read.
+            let tx = &self.txs[i];
+            let sender = (tx.tx_type() != DEPOSIT_TRANSACTION_TYPE).then(|| tx.caller());
+            let reads = spec
+                .reads
+                .iter()
+                .flat_map(|read| {
+                    let Read::Account(address, info, constraint) = read else {
+                        return [Some(read.loc()), None];
+                    };
+                    let pre = self.store.pre.basic_ref(*address).unwrap();
+                    let code = |info: Option<(u64, B256)>| info.map(|(_, code)| code);
+                    let assumed = sender == Some(*address) && code(*info) == code(info_key(&pre));
+                    [
+                        (!assumed).then_some(read.loc()),
+                        (!constraint.admits(balance(&pre))).then_some(Loc::Balance(*address)),
+                    ]
+                })
+                .flatten()
+                .collect();
+            let writes = spec
+                .writes
+                .iter()
+                .flat_map(|(loc, value)| loc.changes(&self.mv.visible(self.store, loc, 0), value))
+                .chain(
+                    spec.fees.iter().filter(|(_, a)| !a.is_zero()).map(|(r, _)| Loc::Balance(*r)),
+                )
+                .collect();
+            committed.traces.push(TxTrace { reads, writes, nanos: spec.nanos });
+        }
+        committed.rebased += usize::from(self.store.apply_state(&spec.state, &spec.reads));
+        for (recipient, amount) in &spec.fees {
+            self.store.credit(*recipient, *amount);
+        }
+        self.mv.remove(i, &spec.writes);
+        Ok(())
+    }
+
     fn work(&self) {
         while !self.stop.load(Ordering::Relaxed) {
-            if !self.step() {
+            self.commit();
+            if !self.step() && !self.stop.load(Ordering::Relaxed) {
+                let idle = Instant::now();
                 std::thread::yield_now();
+                self.idle_nanos.fetch_add(idle.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
         }
     }
 }
 
 impl ParallelOutcome {
-    /// Executes `block` with `threads` total threads (one committer plus `threads - 1` workers).
+    /// Executes `block` with `threads` threads that each speculate and commit.
     pub fn execute(
         config: &Config,
         block: &RecoveredBlock<BaseBlock>,
@@ -956,6 +1085,7 @@ impl ParallelOutcome {
             .map(|tx| BaseTransaction::from_recovered_tx(tx.inner(), tx.signer()))
             .collect();
         let n = rest.len();
+        let cumulative_gas = txs[0].cumulative_gas;
         let scheduler = Scheduler {
             config,
             env,
@@ -968,126 +1098,35 @@ impl ParallelOutcome {
             slots: (0..n).map(|_| Mutex::new(None)).collect(),
             frontier: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
+            trace,
+            committing: AtomicBool::new(false),
+            committed: Mutex::new(Committed { txs, cumulative_gas, ..Default::default() }),
+            error: Mutex::new(None),
+            idle_nanos: AtomicU64::new(0),
             executions: AtomicUsize::new(0),
             blocked: AtomicUsize::new(0),
             invalidated: AtomicUsize::new(0),
         };
-        let mut stats = Stats::default();
-        let mut traces = Vec::new();
-        let mut cumulative_gas = txs[0].cumulative_gas;
-
-        std::thread::scope(|scope| -> Result<()> {
+        std::thread::scope(|scope| {
             for _ in 1..threads {
                 scope.spawn(|| scheduler.work());
             }
-            let result = (|| {
-                for i in 0..n {
-                    scheduler.frontier.store(i, Ordering::SeqCst);
-                    // Every lower transaction is committed, so an execution by the committer
-                    // reads the exact prefix state and needs no validation.
-                    let started = Instant::now();
-                    let spec = loop {
-                        if scheduler.claim(i) {
-                            scheduler.run(i, false);
-                            break scheduler.slots[i].lock().unwrap().take().unwrap();
-                        }
-                        if scheduler.status[i].load(Ordering::SeqCst) == EXECUTED {
-                            let spec = scheduler.slots[i].lock().unwrap().take().unwrap();
-                            if spec.result.is_some()
-                                && spec.reads.iter().all(|r| store.is_current(r))
-                            {
-                                break spec;
-                            }
-                            stats.commit_fails += 1;
-                            *scheduler.slots[i].lock().unwrap() = Some(spec);
-                            scheduler.status[i].store(EXECUTING, Ordering::SeqCst);
-                            scheduler.run(i, false);
-                            break scheduler.slots[i].lock().unwrap().take().unwrap();
-                        }
-                        // Help speculate while a worker finishes the frontier transaction.
-                        let waited = Instant::now();
-                        let helped = scheduler.step();
-                        let nanos = waited.elapsed().as_nanos() as u64;
-                        if !helped {
-                            stats.commit_wait_nanos += nanos;
-                            std::hint::spin_loop();
-                            continue;
-                        }
-                        stats.commit_help_nanos += nanos;
-                        if scheduler.status[i].load(Ordering::SeqCst) == EXECUTED {
-                            stats.commit_stall_nanos += nanos;
-                        }
-                    };
-                    let Some(result) = &spec.result else {
-                        return Err(eyre!(
-                            "transaction {} failed at its exact prefix state",
-                            i + 1
-                        ));
-                    };
-                    cumulative_gas += result.tx_gas_used();
-                    txs.push(TxOutcome {
-                        success: result.is_success(),
-                        cumulative_gas,
-                        logs: result.logs().to_vec(),
-                    });
-                    if trace {
-                        // A balance constraint binds only if the block's pre-state violates it;
-                        // the sender's nonce is assumed, so only a code change binds its read.
-                        let tx = &scheduler.txs[i];
-                        let sender =
-                            (tx.tx_type() != DEPOSIT_TRANSACTION_TYPE).then(|| tx.caller());
-                        let reads = spec
-                            .reads
-                            .iter()
-                            .flat_map(|read| {
-                                let Read::Account(address, info, constraint) = read else {
-                                    return [Some(read.loc()), None];
-                                };
-                                let pre = store.pre.basic_ref(*address).unwrap();
-                                let code = |info: Option<(u64, B256)>| info.map(|(_, code)| code);
-                                let assumed =
-                                    sender == Some(*address) && code(*info) == code(info_key(&pre));
-                                [
-                                    (!assumed).then_some(read.loc()),
-                                    (!constraint.admits(balance(&pre)))
-                                        .then_some(Loc::Balance(*address)),
-                                ]
-                            })
-                            .flatten()
-                            .collect();
-                        let writes = spec
-                            .writes
-                            .iter()
-                            .flat_map(|(loc, value)| {
-                                loc.changes(&scheduler.mv.visible(store, loc, 0), value)
-                            })
-                            .chain(
-                                spec.fees
-                                    .iter()
-                                    .filter(|(_, a)| !a.is_zero())
-                                    .map(|(r, _)| Loc::Balance(*r)),
-                            )
-                            .collect();
-                        traces.push(TxTrace { reads, writes, nanos: spec.nanos });
-                    }
-                    stats.rebased += usize::from(store.apply_state(&spec.state, &spec.reads));
-                    for (recipient, amount) in &spec.fees {
-                        store.credit(*recipient, *amount);
-                    }
-                    scheduler.mv.remove(i, &spec.writes);
-                    stats.commit_work_nanos += started.elapsed().as_nanos() as u64;
-                }
-                Ok(())
-            })();
-            scheduler.stop.store(true, Ordering::Relaxed);
-            result
-        })?;
-
-        stats.executions = scheduler.executions.into_inner();
-        stats.blocked = scheduler.blocked.into_inner();
-        stats.invalidated = scheduler.invalidated.into_inner();
-        stats.commit_work_nanos -= stats.commit_help_nanos + stats.commit_wait_nanos;
-        Ok(Self { txs, stats, traces })
+            scheduler.work();
+        });
+        if let Some(error) = scheduler.error.into_inner().unwrap() {
+            return Err(error);
+        }
+        let committed = scheduler.committed.into_inner().unwrap();
+        let stats = Stats {
+            executions: scheduler.executions.into_inner(),
+            blocked: scheduler.blocked.into_inner(),
+            invalidated: scheduler.invalidated.into_inner(),
+            commit_fails: committed.commit_fails,
+            rebased: committed.rebased,
+            commit_nanos: committed.nanos,
+            idle_nanos: scheduler.idle_nanos.into_inner(),
+        };
+        Ok(Self { txs: committed.txs, stats, traces: committed.traces })
     }
 }
 
