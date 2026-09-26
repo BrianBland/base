@@ -144,10 +144,10 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
     let mut path_total = [0u64; 3];
     let mut exec_total = 0u64;
     println!(
-        "block,canonical,txs,gas_m,dependent_txs,seq_us,ideal_speedup,ideal8_speedup,ideal_nobal_speedup,{}",
+        "block,canonical,txs,gas_m,dependent_txs,chain_txs,seq_us,ideal_speedup,ideal8_speedup,ideal_nobal_speedup,{}",
         threads
             .iter()
-            .map(|t| format!("par{t}_us,par{t}_speedup,par{t}_execs:commit_fails"))
+            .map(|t| format!("par{t}_us,par{t}_speedup,par{t}_execs:commit_fails:blocked"))
             .collect::<Vec<_>>()
             .join(",")
     );
@@ -183,7 +183,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
         // host skews every arm alike and mostly drops out.
         let mut seq = u64::MAX;
         let mut par = vec![u64::MAX; threads.len()];
-        let mut reexec = vec![(0, 0); threads.len()];
+        let mut reexec = vec![(0, 0, 0); threads.len()];
         for _ in 0..iters {
             seq = seq.min(sequential(&config, &pre, &block)?.2);
             for (k, &t) in threads.iter().enumerate() {
@@ -191,7 +191,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
                 let start = Instant::now();
                 let out = ParallelOutcome::execute(&config, &block, &store, t, false)?;
                 par[k] = par[k].min(start.elapsed().as_nanos() as u64);
-                reexec[k] = (out.executions, out.reexecuted);
+                reexec[k] = (out.executions, out.reexecuted, out.blocked);
             }
         }
         seq_total += seq;
@@ -200,7 +200,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
         }
         exec_total += critical.total_nanos;
         let mut row = format!(
-            "{},{},{},{:.1},{},{},{:.2},{:.2},{:.2}",
+            "{},{},{},{:.1},{},{},{},{:.2},{:.2},{:.2}",
             block.header().number(),
             expected.last().is_some_and(|o| o.cumulative_gas == block.header().gas_used())
                 && logs_bloom(expected.iter().flat_map(|o| o.logs.iter()))
@@ -208,6 +208,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
             block.body().transactions.len(),
             block.header().gas_used() as f64 / 1e6,
             critical.dependent_txs,
+            critical.path_txs,
             seq / 1000,
             critical.total_nanos as f64 / bounds[0] as f64,
             critical.total_nanos as f64 / bounds[1] as f64,
@@ -216,11 +217,12 @@ fn bench(data: &Path, threads: &[usize], iters: usize) -> Result<()> {
         for (k, par) in par.into_iter().enumerate() {
             par_total[k] += par;
             row += &format!(
-                ",{},{:.2},{}:{}",
+                ",{},{:.2},{}:{}:{}",
                 par / 1000,
                 seq as f64 / par as f64,
                 reexec[k].0,
-                reexec[k].1
+                reexec[k].1,
+                reexec[k].2
             );
         }
         println!("{row}");

@@ -539,6 +539,8 @@ pub struct ParallelOutcome {
     pub executions: usize,
     /// Transactions whose speculative result failed commit validation.
     pub reexecuted: usize,
+    /// Speculative executions aborted on a read of a not-yet-executed write.
+    pub blocked: usize,
     /// Committed-execution traces (only when requested).
     pub traces: Vec<TxTrace>,
 }
@@ -564,6 +566,7 @@ struct Scheduler<'a> {
     frontier: AtomicUsize,
     stop: AtomicBool,
     executions: AtomicUsize,
+    blocked: AtomicUsize,
 }
 
 impl Scheduler<'_> {
@@ -613,6 +616,7 @@ impl Scheduler<'_> {
         let spec = match self.execute(tx, speculative) {
             Ok(spec) => spec,
             Err(writer) => {
+                self.blocked.fetch_add(1, Ordering::Relaxed);
                 self.waiting[tx].store(writer, Ordering::SeqCst);
                 self.status[tx].store(PENDING, Ordering::SeqCst);
                 return;
@@ -720,6 +724,7 @@ impl ParallelOutcome {
             frontier: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
             executions: AtomicUsize::new(0),
+            blocked: AtomicUsize::new(0),
         };
         let mut reexecuted = 0;
         let mut traces = Vec::new();
@@ -817,7 +822,13 @@ impl ParallelOutcome {
             result
         })?;
 
-        Ok(Self { txs, executions: scheduler.executions.into_inner(), reexecuted, traces })
+        Ok(Self {
+            txs,
+            executions: scheduler.executions.into_inner(),
+            reexecuted,
+            blocked: scheduler.blocked.into_inner(),
+            traces,
+        })
     }
 }
 
@@ -828,6 +839,8 @@ pub struct CriticalPath {
     pub total_nanos: u64,
     /// Longest chain of read-after-write dependencies, weighted by execution time.
     pub path_nanos: u64,
+    /// Longest chain of read-after-write dependencies in transactions (unbounded cores).
+    pub path_txs: usize,
     /// Transactions that read a location written by an earlier transaction.
     pub dependent_txs: usize,
     /// Locations most often on a transaction's binding dependency, with counts.
@@ -846,6 +859,8 @@ impl CriticalPath {
         // writes, exact for commutative fee credits).
         let mut written: FastMap<Loc, u64> = FastMap::default();
         let mut finish = vec![0u64; traces.len()];
+        let mut written_depth: FastMap<Loc, usize> = FastMap::default();
+        let mut depth = vec![0usize; traces.len()];
         let mut dependent_txs = 0;
         let mut hot: FastMap<Loc, usize> = FastMap::default();
         for (i, trace) in traces.iter().enumerate() {
@@ -862,6 +877,12 @@ impl CriticalPath {
             let core = (0..free.len()).min_by_key(|&c| free[c]).unwrap();
             finish[i] = ready.unwrap_or_default().max(free[core]) + trace.nanos;
             free[core] = finish[i];
+            depth[i] = 1 + trace
+                .reads
+                .iter()
+                .filter_map(|loc| written_depth.get(loc).copied())
+                .max()
+                .unwrap_or_default();
             for loc in trace
                 .writes
                 .iter()
@@ -869,11 +890,14 @@ impl CriticalPath {
             {
                 let entry = written.entry(*loc).or_default();
                 *entry = (*entry).max(finish[i]);
+                let entry = written_depth.entry(*loc).or_default();
+                *entry = (*entry).max(depth[i]);
             }
         }
         Self {
             total_nanos: traces.iter().map(|t| t.nanos).sum(),
             path_nanos: finish.iter().copied().max().unwrap_or_default(),
+            path_txs: depth.iter().copied().max().unwrap_or_default(),
             dependent_txs,
             hot: {
                 let mut hot: Vec<_> = hot.into_iter().collect();
