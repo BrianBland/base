@@ -756,6 +756,20 @@ pub struct Stats {
     pub blocked_nanos: u64,
     /// Time spent in the executions that were committed.
     pub committed_execution_nanos: u64,
+    /// Reads recorded across all executions.
+    pub reads: usize,
+    /// Reads checked by commit validation.
+    pub validated_reads: usize,
+    /// Pre-execution system calls, the L1 info deposit and scheduler setup.
+    pub setup_nanos: u64,
+    /// Commit-role time executing frontier transactions no thread had claimed.
+    pub commit_exec_nanos: u64,
+    /// Commit-role time validating speculative reads.
+    pub validate_nanos: u64,
+    /// Commit-role time re-executing transactions that failed validation.
+    pub reexec_nanos: u64,
+    /// Commit-role time applying writes, fee credits and multi-version cleanup.
+    pub apply_nanos: u64,
 }
 
 impl Stats {
@@ -771,6 +785,13 @@ impl Stats {
         self.execution_nanos += other.execution_nanos;
         self.blocked_nanos += other.blocked_nanos;
         self.committed_execution_nanos += other.committed_execution_nanos;
+        self.reads += other.reads;
+        self.validated_reads += other.validated_reads;
+        self.setup_nanos += other.setup_nanos;
+        self.commit_exec_nanos += other.commit_exec_nanos;
+        self.validate_nanos += other.validate_nanos;
+        self.reexec_nanos += other.reexec_nanos;
+        self.apply_nanos += other.apply_nanos;
     }
 }
 
@@ -813,6 +834,11 @@ struct Committed {
     nanos: u64,
     rebased: usize,
     execution_nanos: u64,
+    validated_reads: usize,
+    exec_nanos: u64,
+    validate_nanos: u64,
+    reexec_nanos: u64,
+    apply_nanos: u64,
 }
 
 /// Shared scheduler state for one block.
@@ -846,6 +872,7 @@ struct Scheduler<'a> {
     invalidated: AtomicUsize,
     execution_nanos: AtomicU64,
     blocked_nanos: AtomicU64,
+    reads: AtomicUsize,
 }
 
 impl Scheduler<'_> {
@@ -880,6 +907,7 @@ impl Scheduler<'_> {
         };
         let state = evm.ctx_mut().journal_mut().finalize();
         let reads = std::mem::take(&mut evm.ctx_mut().db_mut().reads);
+        self.reads.fetch_add(reads.len(), Ordering::Relaxed);
         // Merely touched accounts (every call target) keep the value the transaction read, so
         // publishing them would only make higher readers block on this transaction.
         let unchanged = |address: &Address, info: &Option<AccountInfo>| {
@@ -1002,18 +1030,26 @@ impl Scheduler<'_> {
         while i < self.txs.len() {
             // Every lower transaction is committed, so an execution here reads the exact prefix
             // state and needs no validation.
+            let phase = Instant::now();
             let spec = if self.claim(i) {
                 self.run(i, false);
+                committed.exec_nanos += phase.elapsed().as_nanos() as u64;
                 self.slots[i].lock().unwrap().take().unwrap()
             } else if self.status[i].load(Ordering::SeqCst) == EXECUTED {
                 let spec = self.slots[i].lock().unwrap().take().unwrap();
-                if spec.result.is_some() && spec.reads.iter().all(|r| self.store.is_current(r)) {
+                committed.validated_reads += spec.reads.len();
+                let valid =
+                    spec.result.is_some() && spec.reads.iter().all(|r| self.store.is_current(r));
+                committed.validate_nanos += phase.elapsed().as_nanos() as u64;
+                if valid {
                     spec
                 } else {
+                    let phase = Instant::now();
                     committed.commit_fails += 1;
                     *self.slots[i].lock().unwrap() = Some(spec);
                     self.status[i].store(EXECUTING, Ordering::SeqCst);
                     self.run(i, false);
+                    committed.reexec_nanos += phase.elapsed().as_nanos() as u64;
                     self.slots[i].lock().unwrap().take().unwrap()
                 }
             } else {
@@ -1070,11 +1106,13 @@ impl Scheduler<'_> {
                 .collect();
             committed.traces.push(TxTrace { reads, writes, nanos: spec.nanos });
         }
+        let phase = Instant::now();
         committed.rebased += usize::from(self.store.apply_state(&spec.state, &spec.reads));
         for (recipient, amount) in &spec.fees {
             self.store.credit(*recipient, *amount);
         }
         self.mv.remove(i, &spec.writes);
+        committed.apply_nanos += phase.elapsed().as_nanos() as u64;
         Ok(())
     }
 
@@ -1100,6 +1138,7 @@ impl ParallelOutcome {
         schedule: Schedule,
         trace: bool,
     ) -> Result<Self> {
+        let started = Instant::now();
         let env = config.evm_env(block.header())?;
         let recovered: Vec<_> = block.transactions_recovered().collect();
 
@@ -1162,7 +1201,9 @@ impl ParallelOutcome {
             invalidated: AtomicUsize::new(0),
             execution_nanos: AtomicU64::new(0),
             blocked_nanos: AtomicU64::new(0),
+            reads: AtomicUsize::new(0),
         };
+        let setup_nanos = started.elapsed().as_nanos() as u64;
         std::thread::scope(|scope| {
             for _ in 1..threads {
                 scope.spawn(|| scheduler.work());
@@ -1184,6 +1225,13 @@ impl ParallelOutcome {
             execution_nanos: scheduler.execution_nanos.into_inner(),
             blocked_nanos: scheduler.blocked_nanos.into_inner(),
             committed_execution_nanos: committed.execution_nanos,
+            reads: scheduler.reads.into_inner(),
+            validated_reads: committed.validated_reads,
+            setup_nanos,
+            commit_exec_nanos: committed.exec_nanos,
+            validate_nanos: committed.validate_nanos,
+            reexec_nanos: committed.reexec_nanos,
+            apply_nanos: committed.apply_nanos,
         };
         Ok(Self { txs: committed.txs, stats, traces: committed.traces })
     }

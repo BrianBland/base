@@ -275,6 +275,16 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
             ms(s.blocked_nanos),
             ms(s.execution_nanos - s.committed_execution_nanos - s.blocked_nanos),
         );
+        println!(
+            "# {t} threads engine: reads/exec {:.2}, validated_reads {}; ms: setup {} commit exec {} validate {} reexec {} apply {}",
+            s.reads as f64 / s.executions.max(1) as f64,
+            s.validated_reads,
+            ms(s.setup_nanos),
+            ms(s.commit_exec_nanos),
+            ms(s.validate_nanos),
+            ms(s.reexec_nanos),
+            ms(s.apply_nanos),
+        );
     }
     Ok(())
 }
