@@ -750,6 +750,12 @@ pub struct Stats {
     pub commit_nanos: u64,
     /// Thread time spent yielding with nothing to execute or commit, summed over threads.
     pub idle_nanos: u64,
+    /// Time spent in all executions, including wasted ones.
+    pub execution_nanos: u64,
+    /// Time spent in executions that aborted as blocked.
+    pub blocked_nanos: u64,
+    /// Time spent in the executions that were committed.
+    pub committed_execution_nanos: u64,
 }
 
 impl Stats {
@@ -762,6 +768,9 @@ impl Stats {
         self.rebased += other.rebased;
         self.commit_nanos += other.commit_nanos;
         self.idle_nanos += other.idle_nanos;
+        self.execution_nanos += other.execution_nanos;
+        self.blocked_nanos += other.blocked_nanos;
+        self.committed_execution_nanos += other.committed_execution_nanos;
     }
 }
 
@@ -800,6 +809,7 @@ struct Committed {
     commit_fails: usize,
     nanos: u64,
     rebased: usize,
+    execution_nanos: u64,
 }
 
 /// Shared scheduler state for one block.
@@ -829,6 +839,8 @@ struct Scheduler<'a> {
     executions: AtomicUsize,
     blocked: AtomicUsize,
     invalidated: AtomicUsize,
+    execution_nanos: AtomicU64,
+    blocked_nanos: AtomicU64,
 }
 
 impl Scheduler<'_> {
@@ -850,9 +862,15 @@ impl Scheduler<'_> {
         let mut handler: LazyFeeHandler<_, EVMError<Blocked, BaseTransactionError>, _> =
             LazyFeeHandler::default();
         self.executions.fetch_add(1, Ordering::Relaxed);
-        let result = match handler.run(&mut evm) {
+        let result = handler.run(&mut evm);
+        let nanos = start.elapsed().as_nanos() as u64;
+        self.execution_nanos.fetch_add(nanos, Ordering::Relaxed);
+        let result = match result {
             Ok(result) => Some(result),
-            Err(EVMError::Database(Blocked(writer))) => return Err(writer),
+            Err(EVMError::Database(Blocked(writer))) => {
+                self.blocked_nanos.fetch_add(nanos, Ordering::Relaxed);
+                return Err(writer);
+            }
             Err(_) => None,
         };
         let state = evm.ctx_mut().journal_mut().finalize();
@@ -870,14 +888,7 @@ impl Scheduler<'_> {
                 )
             })
             .collect();
-        Ok(Speculation {
-            result,
-            state,
-            reads,
-            writes,
-            fees: handler.fees.take(),
-            nanos: start.elapsed().as_nanos() as u64,
-        })
+        Ok(Speculation { result, state, reads, writes, fees: handler.fees.take(), nanos })
     }
 
     /// Runs a transaction the caller moved to `EXECUTING`, publishes its writes, and invalidates
@@ -1005,6 +1016,7 @@ impl Scheduler<'_> {
             return Err(eyre!("transaction {} failed at its exact prefix state", i + 1));
         };
         committed.cumulative_gas += result.tx_gas_used();
+        committed.execution_nanos += spec.nanos;
         committed.txs.push(TxOutcome {
             success: result.is_success(),
             cumulative_gas: committed.cumulative_gas,
@@ -1131,6 +1143,8 @@ impl ParallelOutcome {
             executions: AtomicUsize::new(0),
             blocked: AtomicUsize::new(0),
             invalidated: AtomicUsize::new(0),
+            execution_nanos: AtomicU64::new(0),
+            blocked_nanos: AtomicU64::new(0),
         };
         std::thread::scope(|scope| {
             for _ in 1..threads {
@@ -1150,6 +1164,9 @@ impl ParallelOutcome {
             rebased: committed.rebased,
             commit_nanos: committed.nanos,
             idle_nanos: scheduler.idle_nanos.into_inner(),
+            execution_nanos: scheduler.execution_nanos.into_inner(),
+            blocked_nanos: scheduler.blocked_nanos.into_inner(),
+            committed_execution_nanos: committed.execution_nanos,
         };
         Ok(Self { txs: committed.txs, stats, traces: committed.traces })
     }
