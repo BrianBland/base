@@ -16,16 +16,17 @@ use std::{
     collections::BTreeMap,
     convert::Infallible,
     sync::{
-        Mutex,
+        Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence},
     },
     time::Instant,
 };
 
+use alloy_consensus::transaction::Recovered;
 use alloy_eips::Typed2718;
 use alloy_evm::{EvmEnv, FromRecoveredTx};
 use alloy_primitives::{Address, B256, Log, U256, map::HashMap as FastMap};
-use base_common_consensus::{BaseBlock, Predeploys};
+use base_common_consensus::{BaseBlock, BaseTxEnvelope, Predeploys};
 use base_common_evm::{
     BaseContext, BaseHaltReason, BaseHandler, BaseSpecId, BaseTransaction, BaseTransactionError,
     BaseTxTr, DEPOSIT_TRANSACTION_TYPE, IsTxError, L1BlockInfo,
@@ -903,7 +904,10 @@ struct Scheduler<'a> {
     l1_info: L1BlockInfo,
     store: &'a Store<'a>,
     mv: MvMemory,
-    txs: Vec<BaseTransaction<TxEnv>>,
+    recovered: &'a [Recovered<&'a BaseTxEnvelope>],
+    /// Transaction environments, built by the first execution of each transaction so workers
+    /// build them in parallel instead of serially before execution starts.
+    txs: Vec<OnceLock<BaseTransaction<TxEnv>>>,
     status: Vec<AtomicU8>,
     invalidations: Vec<AtomicU64>,
     /// Transaction each one last blocked on (`usize::MAX` = none).
@@ -936,6 +940,13 @@ struct Scheduler<'a> {
 type WorkerEvm<'a> = EvmFor<Config, RecordingDb<'a>>;
 
 impl Scheduler<'_> {
+    fn tx_env(&self, tx: usize) -> &BaseTransaction<TxEnv> {
+        self.txs[tx].get_or_init(|| {
+            let recovered = &self.recovered[tx];
+            BaseTransaction::from_recovered_tx(recovered.inner(), recovered.signer())
+        })
+    }
+
     fn evm<'s>(&'s self) -> WorkerEvm<'s> {
         let db = RecordingDb {
             store: self.store,
@@ -961,9 +972,10 @@ impl Scheduler<'_> {
         db.speculation = speculative.then_some((&self.mv, self.status.as_slice()));
         db.tx = tx;
         db.accounts.clear();
-        db.sender = (speculative && self.txs[tx].tx_type() != DEPOSIT_TRANSACTION_TYPE)
-            .then(|| (self.txs[tx].caller(), self.txs[tx].nonce()));
-        evm.ctx_mut().set_tx(self.txs[tx].clone());
+        let tx_env = self.tx_env(tx);
+        db.sender = (speculative && tx_env.tx_type() != DEPOSIT_TRANSACTION_TYPE)
+            .then(|| (tx_env.caller(), tx_env.nonce()));
+        evm.ctx_mut().set_tx(tx_env.clone());
         *evm.ctx_mut().chain_mut() = self.l1_info.clone();
         let mut handler: LazyFeeHandler<_, EVMError<Blocked, BaseTransactionError>, _> =
             LazyFeeHandler::default();
@@ -1156,7 +1168,7 @@ impl Scheduler<'_> {
         if self.trace {
             // A balance constraint binds only if the block's pre-state violates it; the sender's
             // nonce is assumed, so only a code change binds its read.
-            let tx = &self.txs[i];
+            let tx = self.tx_env(i);
             let sender = (tx.tx_type() != DEPOSIT_TRANSACTION_TYPE).then(|| tx.caller());
             let reads = spec
                 .reads
@@ -1254,14 +1266,11 @@ impl ParallelOutcome {
         )
         .unwrap_or_else(|never| match never {});
 
-        let rest: Vec<BaseTransaction<TxEnv>> = recovered[deposits..]
-            .iter()
-            .map(|tx| BaseTransaction::from_recovered_tx(tx.inner(), tx.signer()))
-            .collect();
+        let rest = &recovered[deposits..];
         let n = rest.len();
         let cumulative_gas = txs.last().map(|tx| tx.cumulative_gas).unwrap_or_default();
         let mut last_by_sender = FastMap::<Address, usize>::default();
-        let sender_prev = recovered[deposits..]
+        let sender_prev = rest
             .iter()
             .enumerate()
             .map(|(tx, recovered)| {
@@ -1274,7 +1283,8 @@ impl ParallelOutcome {
             l1_info,
             store,
             mv: MvMemory::new(n),
-            txs: rest,
+            recovered: rest,
+            txs: (0..n).map(|_| OnceLock::new()).collect(),
             status: (0..n).map(|_| AtomicU8::new(PENDING)).collect(),
             invalidations: (0..n).map(|_| AtomicU64::new(0)).collect(),
             waiting: (0..n).map(|_| AtomicUsize::new(usize::MAX)).collect(),
