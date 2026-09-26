@@ -17,6 +17,11 @@ cargo run --release -p base-parallel-evm-bench -- bench --data fixtures --thread
 
 All state is in memory, so timings exclude database I/O.
 
+The execution read path uses Alloy's non-SipHash `DefaultHashBuilder` consistently:
+the pre-state and account-read index use `alloy_primitives::map::HashMap`, and committed-state
+and multi-version maps use that same builder in `DashMap`. Fixture serialization and RPC
+recording are outside this hot path and retain their existing maps.
+
 ## Scheduler stress diagnostics
 
 Every benchmark iteration must match the sequential receipts and full post-state, not only

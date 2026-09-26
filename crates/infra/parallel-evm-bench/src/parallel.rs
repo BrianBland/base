@@ -376,8 +376,8 @@ pub enum Value {
 /// transaction, plus which transactions read each location.
 #[derive(Debug)]
 pub struct MvMemory {
-    writes: DashMap<Loc, BTreeMap<usize, Value>>,
-    readers: DashMap<Loc, Readers>,
+    writes: DashMap<Loc, BTreeMap<usize, Value>, DefaultHashBuilder>,
+    readers: DashMap<Loc, Readers, DefaultHashBuilder>,
     txs: usize,
 }
 
@@ -418,7 +418,7 @@ impl Readers {
 impl MvMemory {
     /// Creates an empty multi-version memory for a block of `txs` transactions.
     pub fn new(txs: usize) -> Self {
-        Self { writes: DashMap::new(), readers: DashMap::new(), txs }
+        Self { writes: DashMap::default(), readers: DashMap::default(), txs }
     }
 
     fn register(&self, loc: Loc, tx: usize) {
