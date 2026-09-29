@@ -271,7 +271,7 @@ where
                 match payload.execute(self.evm.db_mut(), env, self.receipts.len()) {
                     Ok(results) => self.parallel_results = Some(results.into()),
                     Err(error) => {
-                        tracing::debug!(%error, "parallel execution fell back to sequential")
+                        tracing::warn!(%error, "parallel execution fell back to sequential")
                     }
                 }
             }

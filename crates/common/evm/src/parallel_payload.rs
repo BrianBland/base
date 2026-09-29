@@ -87,6 +87,7 @@ impl ParallelPayload {
                 if threads == 0 {
                     return None;
                 }
+                tracing::info!(threads, "parallel payload execution enabled");
                 Some(Arc::new(Workers::new(threads.checked_add(1)?).ok()?))
             })
             .clone()
@@ -175,7 +176,10 @@ impl ParallelPayload {
         );
         let result = failure.map_or(result, Err);
         if result.is_ok() {
-            COMPLETED_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let runs = COMPLETED_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if runs.is_power_of_two() || runs % 500 == 0 {
+                tracing::info!(runs, "parallel payload executions completed");
+            }
         }
         result
     }
