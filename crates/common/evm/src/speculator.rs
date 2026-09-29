@@ -174,6 +174,10 @@ pub struct SpeculatorStats {
     pub consumed: usize,
     /// Completed results rejected by committed-state validation.
     pub validation_failures: usize,
+    /// Requested predictions that were still executing or queued.
+    pub not_ready: usize,
+    /// Requested identities absent from the prediction.
+    pub absent: usize,
 }
 
 /// One advisory predicted order shared by its worker jobs.
@@ -289,7 +293,11 @@ impl Speculator {
     /// Nonblocking extraction; absence or signer mismatch is an ordinary inline miss.
     pub fn take(&self, hash: B256, signer: Address) -> Option<SpeculativeResult> {
         let mut queue = self.shared.0.lock().unwrap();
-        let slot = queue.slots.remove(&hash)?;
+        let Some(slot) = queue.slots.remove(&hash) else {
+            queue.stats.absent += 1;
+            return None;
+        };
+        queue.stats.not_ready += usize::from(slot.result.is_none());
         (slot.job.transaction.signer() == signer).then_some(slot.result).flatten()
     }
 
@@ -469,6 +477,62 @@ mod tests {
                 Box::new(db)
             }),
         )
+    }
+
+    #[test]
+    fn take_waits_for_a_pending_prediction() {
+        let workers = Speculator::new(1, true).unwrap();
+        let mut epoch = parent();
+        let database = Arc::clone(&epoch.database);
+        epoch.database = Arc::new(move || {
+            std::thread::sleep(Duration::from_millis(2));
+            database()
+        });
+        workers.reset(epoch);
+        let tx = transaction(10);
+        workers.submit(std::slice::from_ref(&tx));
+        assert!(workers.take(tx.inner().tx_hash(), tx.signer()).is_some());
+    }
+
+    #[test]
+    fn frontier_repairs_predictions_after_an_inline_storage_commit() {
+        let workers = Speculator::new(2, true).unwrap();
+        let mut epoch = parent();
+        epoch.database = Arc::new(|| {
+            let mut db = CacheDB::new(EmptyDB::default());
+            db.insert_account_info(Address::repeat_byte(1), AccountInfo {
+                balance: U256::from(1_000_000), ..Default::default()
+            });
+            db.insert_account_info(Address::repeat_byte(2), AccountInfo::default().with_code(
+                revm::state::Bytecode::new_raw(alloy_primitives::Bytes::from_static(
+                    &[0x60, 0, 0x54, 0x60, 1, 0x01, 0x60, 0, 0x55, 0],
+                )),
+            ));
+            Box::new(db)
+        });
+        let mut owner = CacheDB::new((epoch.database)());
+        workers.reset(epoch);
+        let tx = Recovered::new_unchecked(
+            BaseTxEnvelope::Legacy(TxLegacy {
+                gas_limit: 100_000, to: TxKind::Call(Address::repeat_byte(2)),
+                ..Default::default()
+            }.into_signed(Signature::new(U256::from(1), U256::from(2), false))),
+            Address::repeat_byte(1),
+        );
+        workers.submit(std::slice::from_ref(&tx));
+        assert!(workers.wait_idle(Duration::from_secs(5)));
+        let target = Address::repeat_byte(2);
+        let mut changed = Account::from(owner.basic(target).unwrap().unwrap());
+        changed.mark_touch();
+        changed.storage.insert(U256::ZERO, revm::state::EvmStorageSlot::new_changed(
+            U256::ZERO, U256::from(7), TransactionId::ZERO,
+        ));
+        let state = EvmState::from_iter([(target, changed)]);
+        workers.on_commit(B256::repeat_byte(9), &state);
+        revm::DatabaseCommit::commit(&mut owner, state);
+        let mut result = workers.take(tx.inner().tx_hash(), tx.signer()).unwrap();
+        assert!(result.validate_and_rebase(&mut owner).unwrap());
+        assert_eq!(result.output.state[&target].storage[&U256::ZERO].present_value, U256::from(8));
     }
 
     #[test]

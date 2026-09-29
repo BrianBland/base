@@ -1,13 +1,19 @@
-# Builder speculation contract (Phase 1)
+# Builder speculation contract (Phase 1b)
 
 The basic builder alone selects and orders transactions. A speculator predicts work, never
-admission. `take` is nonblocking; misses, unsupported transactions, panics, cancellation and
-failed validation all fall back to ordinary execution. No real builder is wired in Phase 1.
+admission. `take` waits at most 10 ms for the chosen frontier, waking on cancellation/reset.
+Unsupported transactions, panics and timeouts fall back to ordinary execution. No real builder
+is wired. Owner-thread validation remains mandatory even after engine validation.
 
 Each parent epoch fixes the EVM factory, environment and immutable parent database factory.
 Workers own their providers. Reset/cancel prevents results from an earlier epoch escaping.
-Submit replaces the predicted window, retaining matching work; discarded predictions may
-only waste execution. Forwarding is optional and is never a correctness gate.
+Submit retains a matching ordered suffix and appends new candidates to its plan. Skips remove
+speculative writes and invalidate readers; reordered plans start a new generation. A bounded
+generation rolls over when its index capacity is exhausted, retaining the committed overlay.
+Workers forward writes, invalidate affected readers and block on ESTIMATE dependencies.
+The builder alone advances the committed prefix through on_commit, including inline execution,
+fees and system changes. A returned result is only a proposal: a later choice without a commit
+discards its writes. Frontier retries execute on workers against the committed Store.
 
 Consumption on the owner thread checks transaction identity, environment, every account
 existence/nonce/code read, every storage value, and every recorded balance range against

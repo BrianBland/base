@@ -259,7 +259,7 @@ impl BuilderSim {
         let mut timings = vec![Vec::new(); arms.len()];
         let mut totals = vec![(0usize, 0usize, 0usize, 0usize); arms.len()];
         println!(
-            "block,k,threads,forwarding,prewarm_ms,invalid,seq_ms,sim_ms,consumed,total,validation_failures,waste,included"
+"block,k,threads,forwarding,prewarm_ms,invalid,seq_ms,sim_ms,consumed,total,validation_failures,waste,included,not_ready,absent"
         );
         for file in files {
             let fixture: BlockFixture = serde_json::from_slice(&std::fs::read(file)?)?;
@@ -307,7 +307,7 @@ impl BuilderSim {
                 totals[index].2 += stats.validation_failures;
                 totals[index].3 += waste;
                 println!(
-                    "{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{}",
+"{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{}",
                     fixture.header.number,
                     arm.window,
                     arm.threads,
@@ -320,7 +320,9 @@ impl BuilderSim {
                     best.considered,
                     stats.validation_failures,
                     waste,
-                    best.included.len()
+best.included.len(),
+stats.not_ready,
+stats.absent
                 );
             }
         }
