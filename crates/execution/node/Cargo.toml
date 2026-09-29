@@ -48,7 +48,7 @@ base-execution-payload-builder.workspace = true
 base-execution-exex = { workspace = true, features = ["metrics"] }
 base-execution-trie = { workspace = true, features = ["metrics"] }
 base-execution-consensus = { workspace = true, features = ["std"] }
-base-execution-evm = { workspace = true, features = ["std", "rpc"] }
+base-execution-evm = { workspace = true, features = ["std", "rpc", "parallel"] }
 
 # revm with required Base features
 # Note: this must be kept to ensure all features are properly enabled/forwarded

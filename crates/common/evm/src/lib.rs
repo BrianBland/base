@@ -7,6 +7,27 @@ extern crate alloc;
 
 pub use base_common_genesis::BaseUpgrade;
 
+#[cfg(feature = "parallel")]
+mod parallel_balance;
+#[cfg(feature = "parallel")]
+pub use parallel_balance::BalanceOpcodes;
+
+#[cfg(feature = "parallel")]
+mod parallel;
+#[cfg(feature = "parallel")]
+pub use parallel::{
+    BalanceRead, Blocked, CriticalPath, LazyFeeHandler, Loc, MvMemory, ParallelDatabase,
+    ParallelOutcome, Read, Readers, RecordingDb, Schedule, Stats, StopOnUnwind, Store, TxOutcome,
+    TxTrace, Value, WorkSignal, Workers,
+};
+
+#[cfg(feature = "parallel")]
+mod parallel_payload;
+#[cfg(all(test, feature = "parallel"))]
+pub use parallel_payload::{OwnerDb, ReadFailure};
+#[cfg(feature = "parallel")]
+pub use parallel_payload::{ParallelPayload, ParallelTransaction, ReadRequest, ReadServiceDb};
+
 mod spec;
 pub use spec::BaseSpecId;
 

@@ -12,7 +12,7 @@ use base_common_consensus::BaseBlock;
 use base_execution_chainspec::BaseChainSpecBuilder;
 use base_execution_evm::BaseEvmConfig;
 use base_parallel_evm_bench::{
-    BlockFixture, CriticalPath, ParallelOutcome, PreDb, RpcRecorder, Schedule, Stats, Store,
+    BenchExecution, BlockFixture, CriticalPath, PreDb, RpcRecorder, Schedule, Stats, Store,
     TxOutcome, Workers,
 };
 use clap::{Parser, Subcommand};
@@ -56,6 +56,9 @@ enum Cmd {
     },
     /// Benchmark sequential vs parallel execution over fixtures.
     Bench {
+        /// Validate receipts, bundles, reverts and state hooks through the production executor.
+        #[arg(long)]
+        via_executor: bool,
         #[arg(long)]
         data: PathBuf,
         #[arg(long, value_delimiter = ',', default_value = "1,2,4,8,12")]
@@ -172,7 +175,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
 
         // Correctness and dependency trace at every thread count before timing.
         let store = Store::new(&pre);
-        let traced = ParallelOutcome::execute(&config, &block, &store, &single, schedule, true)?;
+        let traced = BenchExecution::execute(&config, &block, &store, &single, schedule, true)?;
         let critical = CriticalPath::new(&traced.traces, None, false);
         let bounds = [
             critical.path_nanos,
@@ -181,7 +184,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
         ];
         for (&t, workers) in threads.iter().zip(&workers) {
             let store = Store::new(&pre);
-            let out = ParallelOutcome::execute(&config, &block, &store, workers, schedule, false)?;
+            let out = BenchExecution::execute(&config, &block, &store, workers, schedule, false)?;
             ensure!(out.txs == expected, "{}: receipts differ at {t} threads", file.display());
             let diffs = store.diff(&bundle);
             ensure!(
@@ -204,7 +207,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
                 let store = Store::new(&pre);
                 let start = Instant::now();
                 let out =
-                    ParallelOutcome::execute(&config, &block, &store, workers, schedule, false)?;
+                    BenchExecution::execute(&config, &block, &store, workers, schedule, false)?;
                 let nanos = start.elapsed().as_nanos() as u64;
                 ensure!(
                     out.txs == expected,
@@ -343,7 +346,10 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Bench { data, threads, iters, sender_gate, window } => {
+        Cmd::Bench { data, threads, iters, sender_gate, window, via_executor } => {
+            if via_executor {
+                return base_parallel_evm_bench::ExecutorBench::validate(config(), &data, &threads);
+            }
             bench(&data, &threads, iters, Schedule { sender_gate, window })
         }
     }

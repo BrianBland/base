@@ -53,6 +53,12 @@ pub struct BaseBlockExecutor<Evm, R: BaseReceiptBuilder, Spec> {
     pub is_regolith: bool,
     /// Utility to call system smart contracts.
     pub system_caller: SystemCaller<Spec>,
+    /// Validated parallel suffix, consumed through the normal transaction commit path.
+    #[cfg(feature = "parallel")]
+    pub parallel_results: Option<std::collections::VecDeque<crate::ParallelTransaction>>,
+    /// Whether any precomputed output has escaped to the caller.
+    #[cfg(feature = "parallel")]
+    pub parallel_returned: bool,
 }
 
 impl<E, R, Spec> BaseBlockExecutor<E, R, Spec>
@@ -74,6 +80,10 @@ where
             gas_used: 0,
             da_footprint_used: 0,
             ctx,
+            #[cfg(feature = "parallel")]
+            parallel_results: None,
+            #[cfg(feature = "parallel")]
+            parallel_returned: false,
         }
     }
 }
@@ -251,11 +261,55 @@ where
             0
         };
 
-        // Execute transaction and return the result
-        let result = self.evm.transact(tx_env).map_err(|err| {
-            let hash = tx.tx().trie_hash();
-            BlockExecutionError::evm(err, hash)
-        })?;
+        #[cfg(feature = "parallel")]
+        let precomputed = {
+            if !is_deposit
+                && self.parallel_results.is_none()
+                && let Some(payload) = self.ctx.parallel.take()
+                && let Some(env) = crate::ParallelPayload::environment(&self.evm)
+            {
+                match payload.execute(self.evm.db_mut(), env, self.receipts.len()) {
+                    Ok(results) => self.parallel_results = Some(results.into()),
+                    Err(error) => {
+                        tracing::debug!(%error, "parallel execution fell back to sequential")
+                    }
+                }
+            }
+            let candidate = self.parallel_results.as_mut().and_then(|results| results.pop_front());
+            match candidate {
+                Some(candidate)
+                    if candidate.hash == tx.tx().trie_hash()
+                        && candidate.signer == *tx.signer() =>
+                {
+                    self.parallel_returned = true;
+                    Some(candidate.into_output::<E::HaltReason>().ok_or_else(|| {
+                        BlockExecutionError::msg("unsupported parallel result type")
+                    })?)
+                }
+                Some(_) => {
+                    self.parallel_results = None;
+                    if self.parallel_returned {
+                        return Err(BlockExecutionError::msg(
+                            "parallel transaction identity mismatch",
+                        ));
+                    }
+                    None
+                }
+                None if self.parallel_returned => {
+                    return Err(BlockExecutionError::msg("parallel transaction list exhausted"));
+                }
+                None => None,
+            }
+        };
+        #[cfg(not(feature = "parallel"))]
+        let precomputed = None;
+        let result = match precomputed {
+            Some(result) => result,
+            None => self.evm.transact(tx_env).map_err(|err| {
+                let hash = tx.tx().trie_hash();
+                BlockExecutionError::evm(err, hash)
+            })?,
+        };
 
         // Fetch the depositor account from the database for the deposit nonce.
         // This *only* needs to be done post-Regolith for deposit transactions.
@@ -767,6 +821,83 @@ mod tests {
         )) = executor.execute_transaction(&tx)
         {
             panic!("self-pay transaction must not be rejected by the block gas pre-check");
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_results_use_normal_commits_and_fail_closed_on_late_mismatch() {
+        use std::sync::Arc;
+
+        use alloy_consensus::transaction::SignerRecoverable;
+
+        let transactions: Vec<_> = (1..=2)
+            .map(|signature| {
+                let tx = BaseTxEnvelope::Legacy(
+                    TxLegacy {
+                        gas_limit: 21_000,
+                        to: alloy_primitives::TxKind::Call(Address::repeat_byte(5)),
+                        value: U256::from(1),
+                        ..Default::default()
+                    }
+                    .into_signed(Signature::new(
+                        U256::from(signature),
+                        U256::from(2),
+                        false,
+                    )),
+                );
+                let signer = tx.recover_signer().unwrap();
+                Recovered::new_unchecked(tx, signer)
+            })
+            .collect();
+        for (malformed, mismatch) in [(false, false), (true, false), (false, true)] {
+            let mut db = revm::database::State::builder()
+                .with_database(InMemoryDB::default())
+                .with_bundle_update()
+                .build();
+            for tx in &transactions {
+                db.insert_account(
+                    tx.signer(),
+                    AccountInfo { balance: U256::from(1_000_000), ..Default::default() },
+                );
+            }
+            let factory = BaseBlockExecutorFactory::new(
+                AlloyReceiptBuilder::default(),
+                ChainUpgrades::mainnet(),
+                BaseEvmFactory::default(),
+            );
+            let evm = factory.evm_factory().create_evm(
+                &mut db,
+                EvmEnv::new(
+                    revm::context::CfgEnv::new_with_spec(BaseSpecId::new(BaseUpgrade::Bedrock)),
+                    BlockEnv { gas_limit: 100_000, ..Default::default() },
+                ),
+            );
+            let ctx = BaseBlockExecutionCtx {
+                parallel: Some(crate::ParallelPayload {
+                    transactions: if malformed {
+                        vec![Bytes::from_static(&[0xff])]
+                    } else if mismatch {
+                        transactions.iter().rev().map(|tx| tx.encoded_2718().into()).collect()
+                    } else {
+                        transactions.iter().map(|tx| tx.encoded_2718().into()).collect()
+                    }
+                    .into(),
+                    workers: Arc::new(crate::Workers::new(3).unwrap()),
+                    factory: BaseEvmFactory::default(),
+                }),
+                ..Default::default()
+            };
+            let mut executor = factory.create_executor(evm, ctx);
+            executor.execute_transaction(&transactions[0]).unwrap();
+            assert_eq!(executor.parallel_returned, !malformed && !mismatch);
+            assert_eq!(executor.receipts.len(), 1);
+            if malformed || mismatch {
+                executor.execute_transaction(&transactions[1]).unwrap();
+                assert_eq!(executor.receipts.len(), 2);
+            } else {
+                assert!(executor.execute_transaction_without_commit(&transactions[0]).is_err());
+            }
         }
     }
 }

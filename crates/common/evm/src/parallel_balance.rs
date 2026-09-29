@@ -1,7 +1,6 @@
 //! Opcodes that observe account balances, wrapped to record the observation.
 
 use alloy_primitives::{Address, B256, U256};
-use base_common_evm::BaseContext;
 use revm::{
     bytecode::opcode::{BALANCE, CALL, CALLCODE, CREATE, CREATE2, SELFBALANCE, SELFDESTRUCT},
     handler::instructions::{EthInstructions, InstructionProvider},
@@ -12,7 +11,7 @@ use revm::{
     },
 };
 
-use crate::RecordingDb;
+use crate::{BaseContext, RecordingDb};
 
 type Context<'a, 'db> = InstructionContext<'a, BaseContext<RecordingDb<'db>>, EthInterpreter>;
 type Opcode<'db> = fn(Context<'_, 'db>) -> InstructionExecResult;

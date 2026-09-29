@@ -194,11 +194,11 @@ where
         &self,
         block: &'_ SealedBlock<N::Block>,
     ) -> Result<BaseBlockExecutionCtx, Self::Error> {
-        Ok(BaseBlockExecutionCtx {
-            parent_hash: block.header().parent_hash(),
-            parent_beacon_block_root: block.header().parent_beacon_block_root(),
-            extra_data: block.header().extra_data().clone(),
-        })
+        Ok(BaseBlockExecutionCtx::new(
+            block.header().parent_hash(),
+            block.header().parent_beacon_block_root(),
+            block.header().extra_data().clone(),
+        ))
     }
 
     fn context_for_next_block(
@@ -206,11 +206,11 @@ where
         parent: &SealedHeader<N::BlockHeader>,
         attributes: Self::NextBlockEnvCtx,
     ) -> Result<BaseBlockExecutionCtx, Self::Error> {
-        Ok(BaseBlockExecutionCtx {
-            parent_hash: parent.hash(),
-            parent_beacon_block_root: attributes.parent_beacon_block_root,
-            extra_data: attributes.extra_data,
-        })
+        Ok(BaseBlockExecutionCtx::new(
+            parent.hash(),
+            attributes.parent_beacon_block_root,
+            attributes.extra_data,
+        ))
     }
 }
 
@@ -237,11 +237,23 @@ where
         &self,
         payload: &'a ExecutionData,
     ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
-        Ok(BaseBlockExecutionCtx {
-            parent_hash: payload.parent_hash(),
-            parent_beacon_block_root: payload.sidecar.parent_beacon_block_root(),
-            extra_data: payload.payload.as_v1().extra_data.clone(),
-        })
+        let context = BaseBlockExecutionCtx::new(
+            payload.parent_hash(),
+            payload.sidecar.parent_beacon_block_root(),
+            payload.payload.as_v1().extra_data.clone(),
+        );
+        #[cfg(feature = "parallel")]
+        let context = BaseBlockExecutionCtx {
+            parallel: base_common_evm::ParallelPayload::configured_workers()
+                .filter(|_| payload.block_access_list.is_none())
+                .map(|workers| base_common_evm::ParallelPayload {
+                    transactions: payload.payload.transactions().clone().into(),
+                    workers,
+                    factory: *self.executor_factory.evm_factory(),
+                }),
+            ..context
+        };
+        Ok(context)
     }
 
     fn tx_iterator_for_payload(
@@ -294,6 +306,47 @@ mod tests {
     };
 
     use super::BaseEvmConfig;
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn payload_context_obeys_runtime_gate_only() {
+        use base_common_rpc_types_engine::ExecutionData;
+        use reth_evm::ConfigureEngineEvm;
+        use reth_primitives_traits::{SealedBlock, SealedHeader};
+
+        let config = test_evm_config();
+        let block = BaseBlock::default();
+        let mut payload = ExecutionData::from_block_slow(&block);
+        let enabled = std::env::var("BASE_PARALLEL_EXECUTION_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|threads| threads > 0);
+        let context = config.context_for_payload(&payload).unwrap();
+        assert_eq!(context.parallel.is_some(), enabled);
+        if let Some(parallel) = context.parallel {
+            assert_eq!(parallel.transactions.as_ref(), payload.payload.transactions().as_slice());
+        }
+        assert!(
+            config.context_for_block(&SealedBlock::seal_slow(block)).unwrap().parallel.is_none()
+        );
+        payload.block_access_list = Some(Default::default());
+        assert!(config.context_for_payload(&payload).unwrap().parallel.is_none());
+        let attributes = super::BaseNextBlockEnvAttributes {
+            timestamp: 1,
+            suggested_fee_recipient: Address::ZERO,
+            prev_randao: B256::ZERO,
+            gas_limit: 30_000_000,
+            parent_beacon_block_root: None,
+            extra_data: Default::default(),
+        };
+        assert!(
+            config
+                .context_for_next_block(&SealedHeader::seal_slow(Header::default()), attributes)
+                .unwrap()
+                .parallel
+                .is_none()
+        );
+    }
 
     fn test_evm_config() -> BaseEvmConfig {
         BaseEvmConfig::base(Arc::new(BaseChainSpec::mainnet()))

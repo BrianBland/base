@@ -14,8 +14,6 @@ workspace = true
 
 [dependencies]
 eyre.workspace = true
-rayon.workspace = true
-dashmap.workspace = true
 reth-evm.workspace = true
 reth-revm.workspace = true
 alloy-evm.workspace = true
@@ -26,9 +24,8 @@ alloy-provider = { workspace = true, features = ["reqwest"] }
 reth-primitives-traits.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
-base-common-evm.workspace = true
-base-execution-evm.workspace = true
-base-common-genesis.workspace = true
+base-common-evm = { workspace = true, features = ["parallel"] }
+base-execution-evm = { workspace = true, features = ["parallel"] }
 base-common-network.workspace = true
 base-common-consensus.workspace = true
 base-execution-chainspec.workspace = true
@@ -37,4 +34,4 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 revm = { workspace = true, features = ["std", "blst", "c-kzg", "p256-aws-lc-rs", "secp256k1"] }
 
 [features]
-scheduler-watchdog = []
+scheduler-watchdog = ["base-common-evm/scheduler-watchdog"]
