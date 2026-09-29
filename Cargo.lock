@@ -5230,6 +5230,7 @@ dependencies = [
  "alloy-provider",
  "base-common-consensus",
  "base-common-evm",
+ "base-common-flz",
  "base-common-network",
  "base-execution-chainspec",
  "base-execution-evm",

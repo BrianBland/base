@@ -1,5 +1,8 @@
 #![doc = include_str!("../README.md")]
 
+mod builder_sim;
+pub use builder_sim::{BuilderObservation, BuilderSim};
+
 mod data;
 pub use data::{BlockFixture, FetchError, PreAccount, PreDb, Prestate, RpcRecorder};
 

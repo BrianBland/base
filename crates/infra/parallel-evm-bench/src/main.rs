@@ -30,6 +30,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Offline basic-builder loop with ahead-of-choice speculative execution.
+    BuilderSim {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long, value_delimiter = ',', default_value = "4,8")]
+        threads: Vec<usize>,
+        #[arg(long, value_delimiter = ',', default_value = "32,128")]
+        k: Vec<usize>,
+        #[arg(long, default_value_t = 3)]
+        iters: usize,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        forwarding: bool,
+        #[arg(long, default_value_t = 0)]
+        idle_prewarm_ms: u64,
+        #[arg(long, default_value_t = 0.0)]
+        inject_invalid: f64,
+        #[arg(long)]
+        tx_da_limit: Option<u64>,
+        #[arg(long)]
+        block_da_limit: Option<u64>,
+    },
     /// Fetch block fixtures (block + touched parent state) from an archive RPC.
     Fetch {
         #[arg(long)]
@@ -320,6 +341,26 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
+        Cmd::BuilderSim {
+            data,
+            threads,
+            k,
+            iters,
+            forwarding,
+            idle_prewarm_ms,
+            inject_invalid,
+            tx_da_limit,
+            block_da_limit,
+        } => base_parallel_evm_bench::BuilderSim {
+            window: 1,
+            threads: 1,
+            forwarding,
+            idle_prewarm_ms,
+            inject_invalid,
+            tx_da_limit,
+            block_da_limit,
+        }
+        .bench(&config(), &data, &threads, &k, iters),
         Cmd::Fetch { rpc, hint_rpc, from, count, step, jobs, out } => {
             std::fs::create_dir_all(&out)?;
             let blocks: Vec<u64> = (0..count).map(|i| from + i * step).collect();

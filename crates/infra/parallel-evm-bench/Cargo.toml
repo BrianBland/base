@@ -26,6 +26,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
 base-common-evm = { workspace = true, features = ["parallel"] }
 base-execution-evm = { workspace = true, features = ["parallel"] }
+base-common-flz.workspace = true
 base-common-network.workspace = true
 base-common-consensus.workspace = true
 base-execution-chainspec.workspace = true
