@@ -277,6 +277,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
     let blocks = execs_per_tx.first().map_or(0, Vec::len).max(1) as u64;
     for (k, t) in threads.iter().enumerate() {
         let s = &stats_total[k];
+        println!("# {t} threads blocking idle waits: {}", s.idle_waits);
         let per_tx = |count: usize| count as f64 / scheduled_txs.max(1) as f64;
         execs_per_tx[k].sort_by(f64::total_cmp);
         println!(

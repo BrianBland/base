@@ -16,7 +16,7 @@ use std::{
     collections::BTreeMap,
     convert::Infallible,
     sync::{
-        Mutex, OnceLock,
+        Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence},
     },
     time::Instant,
@@ -851,8 +851,10 @@ pub struct Stats {
     /// Time spent holding the commit role: executing, validating, and applying frontier
     /// transactions.
     pub commit_nanos: u64,
-    /// Thread time spent yielding with nothing to execute or commit, summed over threads.
+    /// Thread time spent spinning or sleeping with nothing to execute or commit.
     pub idle_nanos: u64,
+    /// Number of blocking waits after bounded idle polling.
+    pub idle_waits: usize,
     /// Time spent in all executions, including wasted ones.
     pub execution_nanos: u64,
     /// Time spent in executions that aborted as blocked.
@@ -890,6 +892,7 @@ impl Stats {
         self.rebased += other.rebased;
         self.commit_nanos += other.commit_nanos;
         self.idle_nanos += other.idle_nanos;
+        self.idle_waits += other.idle_waits;
         self.execution_nanos += other.execution_nanos;
         self.blocked_nanos += other.blocked_nanos;
         self.committed_execution_nanos += other.committed_execution_nanos;
@@ -951,14 +954,47 @@ struct Committed {
     apply_nanos: u64,
 }
 
+/// Generation-based notification; sampling before searching prevents lost wakeups.
+#[derive(Debug, Default)]
+pub struct WorkSignal {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl WorkSignal {
+    /// Captures the generation before looking for runnable work.
+    pub fn generation(&self) -> u64 {
+        *self.generation.lock().unwrap()
+    }
+
+    /// Notifies waiters after publishing work or stopping the scheduler.
+    pub fn notify(&self) {
+        *self.generation.lock().unwrap() += 1;
+        self.changed.notify_all();
+    }
+
+    /// Sleeps unless a publisher has already advanced the generation.
+    pub fn wait(&self, observed: u64, stop: &AtomicBool) {
+        let _guard = self.changed.wait_while(self.generation.lock().unwrap(), |generation| {
+            *generation == observed && !stop.load(Ordering::Relaxed)
+        }).unwrap();
+    }
+}
+
 /// Stops sibling workers before Rayon waits for them during panic propagation.
 #[derive(Debug)]
-pub struct StopOnUnwind<'a>(pub &'a AtomicBool);
+pub struct StopOnUnwind<'a> {
+    /// Shared cancellation flag.
+    pub stop: &'a AtomicBool,
+    /// Wakes sleeping siblings during unwinding.
+    pub signal: &'a WorkSignal,
+}
 
 impl Drop for StopOnUnwind<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.0.store(true, Ordering::Relaxed);
+            self.stop.store(true, Ordering::Relaxed);
+            self.signal.notify();
         }
     }
 }
@@ -986,6 +1022,8 @@ struct Scheduler<'a> {
     /// Lowest uncommitted transaction.
     frontier: AtomicUsize,
     stop: AtomicBool,
+    signal: WorkSignal,
+    idle_waits: AtomicUsize,
     /// Speculate only on transactions at most this far above the frontier (`None` = unbounded).
     window: Option<usize>,
     trace: bool,
@@ -1145,6 +1183,7 @@ impl Scheduler<'_> {
                 self.blocked.fetch_add(1, Ordering::Relaxed);
                 self.waiting[tx].store(writer, Ordering::SeqCst);
                 self.status[tx].store(PENDING, Ordering::SeqCst);
+                self.signal.notify();
                 return;
             }
         };
@@ -1164,6 +1203,7 @@ impl Scheduler<'_> {
             EXECUTED
         };
         self.status[tx].store(status, Ordering::SeqCst);
+        self.signal.notify();
         #[cfg(test)]
         if let Some(after_execution) = self.after_execution {
             after_execution(self);
@@ -1259,6 +1299,7 @@ impl Scheduler<'_> {
             }
             let result = self.commit_ready(evm);
             self.committing.store(false, Ordering::SeqCst);
+            self.signal.notify();
             if let Err(error) = result {
                 *self.error.lock().unwrap() = Some(error);
                 self.stop.store(true, Ordering::Relaxed);
@@ -1305,6 +1346,7 @@ impl Scheduler<'_> {
             self.apply(&mut committed, i, spec, previous)?;
             i += 1;
             self.frontier.store(i, Ordering::SeqCst);
+            self.signal.notify();
         }
         committed.nanos += started.elapsed().as_nanos() as u64;
         Ok(())
@@ -1384,18 +1426,30 @@ impl Scheduler<'_> {
     }
 
     fn work(&self) {
-        let _stop_on_unwind = StopOnUnwind(&self.stop);
+        let _stop_on_unwind = StopOnUnwind { stop: &self.stop, signal: &self.signal };
+        let mut idle_scans = 0;
         let since_start = || self.started.elapsed().as_nanos() as u64;
         let mut evm = self.evm();
         self.all_entered.fetch_max(since_start(), Ordering::Relaxed);
         while !self.stop.load(Ordering::Relaxed) {
+            let generation = self.signal.generation();
             self.commit(&mut evm);
             if !self.stop.load(Ordering::Relaxed) && !self.step(&mut evm) {
                 let idle = Instant::now();
-                std::thread::yield_now();
+                if idle_scans < 8 {
+                    idle_scans += 1;
+                    std::hint::spin_loop();
+                } else {
+                    self.idle_waits.fetch_add(1, Ordering::Relaxed);
+                    self.signal.wait(generation, &self.stop);
+                    idle_scans = 0;
+                }
                 self.idle_nanos.fetch_add(idle.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            } else {
+                idle_scans = 0;
             }
         }
+        self.signal.notify();
         self.first_left.fetch_min(since_start(), Ordering::Relaxed);
     }
 }
@@ -1509,6 +1563,8 @@ impl ParallelOutcome {
             slots: (0..n).map(|_| Mutex::new(None)).collect(),
             frontier: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
+            signal: WorkSignal::default(),
+            idle_waits: AtomicUsize::new(0),
             window: schedule.window,
             trace,
             committing: AtomicBool::new(false),
@@ -1549,6 +1605,7 @@ impl ParallelOutcome {
             rebased: committed.rebased,
             commit_nanos: committed.nanos,
             idle_nanos: scheduler.idle_nanos.load(Ordering::Relaxed),
+            idle_waits: scheduler.idle_waits.load(Ordering::Relaxed),
             execution_nanos: scheduler.execution_nanos.load(Ordering::Relaxed),
             blocked_nanos: scheduler.blocked_nanos.load(Ordering::Relaxed),
             committed_execution_nanos: committed.execution_nanos,
@@ -1717,6 +1774,8 @@ mod tests {
             slots: (0..3).map(|_| Mutex::new(None)).collect(),
             frontier: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
+            signal: WorkSignal::default(),
+            idle_waits: AtomicUsize::new(0),
             window: None,
             trace: false,
             committing: AtomicBool::new(false),
