@@ -225,7 +225,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
             }
         }
         seq_total += seq;
-        let scheduled = block.body().transactions.len() - 1;
+        let scheduled = traced.traces.len();
         scheduled_txs += scheduled;
         for (total, bound) in path_total.iter_mut().zip(bounds) {
             *total += bound;
