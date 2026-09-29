@@ -105,3 +105,44 @@ Deploy by building `cargo build --release -p base-reth-node` and starting the no
 `BASE_PARALLEL_EXECUTION_THREADS=8` (or the desired count). Fallback reasons are debug-level
 structured events from `base_common_evm::executor::block_executor`. Database-service overhead
 and suffix-result retention need live measurement; fixture timings are not node speedup claims.
+
+## Basic-builder simulation (Phase 1 only)
+
+`builder-sim` chooses fixture transactions in canonical order, rather than taking an unordered
+parallel block suffix. Deposits/system calls are an untimed sequential prefix. Each subsequent
+choice goes through the production `BaseBlockExecutor` without-commit/commit pair; the production
+builder and flashblocks are not wired. This models fair ordering, not live pool selection.
+
+```sh
+export CARGO_TARGET_DIR=/Users/brianbland/code/scratch/target-spec
+cargo build --release -p base-parallel-evm-bench
+timeout 900 "$CARGO_TARGET_DIR/release/base-parallel-evm-bench" builder-sim --data /Users/brianbland/code/scratch/fixtures-dev --threads 4,8 --k 32,128 --iters 3 --forwarding false --idle-prewarm-ms 0 --inject-invalid 0
+```
+
+Repeat with `--forwarding true`, `--idle-prewarm-ms 20`, and `--inject-invalid 0.1`. The fault
+fraction is in [0,1], seeded from transaction hash/block/index; selected envelopes are replaced
+with synthetic high-nonce transactions using the fixture signer. Signatures are deliberately not
+recovered for those invalid candidates. Rejected nonce lanes are skipped, and a skip clears the
+prediction window before refilling it. Faulted paths can touch fixture-missing state, which `PreDb`
+treats as empty in both arms; these gates are loop-parity tests, not claims about canonical roots.
+
+Gas reservation and cumulative Jovian DA-footprint checks are enforced by the executor.
+`--tx-da-limit` and `--block-da-limit` add optional Fjord-estimated byte limits matching the basic
+builder's accounting. Predicate evaluation, pool priorities, sender-tip prechecks, elapsed-time
+cutoffs and resource-metering policies are not simulated. The choice stream substitutes for them;
+the real builder's existing checks and commit-condition callback remain authoritative in Phase 2.
+
+Worker pools persist across blocks/iterations. Each iteration interleaves a sequential reference
+and rotating K/thread arms, retaining each arm's minimum loop time and its counters. Every timed
+arm must match included hashes/order, full receipts and full `BundleState` including reverts.
+Prewarm is excluded from loop time; it represents otherwise idle downtime, not free end-to-end
+speedup. Output reports per-block timings, hits/considered choices, validation failures, waste
+(started executions minus consumed results, after bounded worker settling), and nearest-rank
+p50/p99 of per-block minima. Admission counts are deterministic; worker counts vary with scheduling.
+
+Forwarding is advisory and batch-local: overlapping submissions retain matching jobs, and newly
+queued jobs share the new batch's `MvMemory`. A rolling extension does not replay all retained
+predictions into its new batch. Candidate execution reconstructs an EVM per job. Both limitations
+are deliberate Phase 1 measurement baselines, not production scheduling recommendations.
+
+See [measurements](BUILDER_SIM_RESULTS.md) and the library's [contract](../../common/evm/SPECULATOR.md).
