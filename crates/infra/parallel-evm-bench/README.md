@@ -59,3 +59,49 @@ can be committed; with no post-publication mutation, committed statuses remain `
 CARGO_TARGET_DIR=/Users/brianbland/code/scratch/target-live cargo build --release -p base-parallel-evm-bench --features scheduler-watchdog
 bash crates/infra/parallel-evm-bench/stress.sh /Users/brianbland/code/scratch/target-live/release/base-parallel-evm-bench /Users/brianbland/code/scratch/fixtures-dev 20 /tmp/pevm-stress
 ```
+
+## Payload validation integration
+
+The scheduler, balance observations, multi-version state, and persistent workers live in
+`base-common-evm` behind its std-only `parallel` feature. The node enables
+`base-execution-evm/parallel`; proof and zkVM builds do not enable it by default.
+
+Set `BASE_PARALLEL_EXECUTION_THREADS=N` before starting the node. The value is read once;
+unset, zero, malformed values, or pool construction failure disable parallel execution.
+Only Engine API payload contexts carry the transaction list. Block execution, building, RPC,
+and flashblocks remain sequential. Restart the node to change the worker count.
+
+Leading deposits and system calls execute normally. At the first non-deposit, workers execute
+the remaining suffix against an overlay. A read-through cache requests misses from the calling
+thread, which owns the actual State database; no Send/Sync assumption or unsafe access is made
+about that database. Speculative reads only warm its cache. On failure, the complete overlay
+is discarded before returning any result and ordinary sequential execution resumes. EIP-8130
+payloads currently take this fallback; Amsterdam/BAL execution also stays sequential because
+speculative reads do not preserve BAL transaction indices. A transaction hash/signer mismatch can fall back before
+the first result, but becomes an error after any parallel result has been returned.
+
+Every accepted result commits through the existing executor. Account balances are rebased to
+the committed prefix, deferred fees (including zero-fee touched recipients) are included, and
+storage original values are taken from that prefix. Creation/destruction clears storage in
+the overlay. The ordinary commit path retains receipts, hooks, bundles, and reverts.
+
+Validate fixtures through the real executor (the wrapper injects a payload context for fixtures
+only; its explicit worker counts do not mutate the process-wide environment gate):
+
+```sh
+export CARGO_TARGET_DIR=/Users/brianbland/code/scratch/target-live2
+cargo build --release -p base-parallel-evm-bench
+timeout 600 "$CARGO_TARGET_DIR/release/base-parallel-evm-bench" bench --via-executor --data /Users/brianbland/code/scratch/fixtures-dev --threads 1,4,8 --iters 1
+timeout 600 "$CARGO_TARGET_DIR/release/base-parallel-evm-bench" bench --via-executor --data /Users/brianbland/code/scratch/fixtures-final --threads 1,4,8 --iters 1
+```
+
+Executor mode requires a successful parallel run, compares full receipts and `BundleState`
+(including storage and reverts), and replays every recorded state-hook commit against the
+same pre-state to compare the committed values after each transaction. Hooks are installed
+with `execute_one_with_state_hook` on the executor's outer State, not its nested input DB.
+The legacy benchmark still compares receipts and post-state at every timed iteration.
+
+Deploy by building `cargo build --release -p base-reth-node` and starting the node with
+`BASE_PARALLEL_EXECUTION_THREADS=8` (or the desired count). Fallback reasons are debug-level
+structured events from `base_common_evm::executor::block_executor`. Database-service overhead
+and suffix-result retention need live measurement; fixture timings are not node speedup claims.
