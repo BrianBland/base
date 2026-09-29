@@ -59,6 +59,12 @@ pub struct BaseBlockExecutor<Evm, R: BaseReceiptBuilder, Spec> {
     /// Whether any precomputed output has escaped to the caller.
     #[cfg(feature = "parallel")]
     pub parallel_returned: bool,
+    /// Latest executed identity, used only to prune advisory work after a commit.
+    #[cfg(feature = "parallel")]
+    pub speculative_transaction_hash: alloy_primitives::B256,
+    /// A normal non-deposit execution has initialized the EVM's per-block L1 fee cache.
+    #[cfg(feature = "parallel")]
+    pub speculative_fee_cache_ready: bool,
 }
 
 impl<E, R, Spec> BaseBlockExecutor<E, R, Spec>
@@ -84,6 +90,10 @@ where
             parallel_results: None,
             #[cfg(feature = "parallel")]
             parallel_returned: false,
+            #[cfg(feature = "parallel")]
+            speculative_transaction_hash: alloy_primitives::B256::ZERO,
+            #[cfg(feature = "parallel")]
+            speculative_fee_cache_ready: false,
         }
     }
 }
@@ -301,6 +311,33 @@ where
                 None => None,
             }
         };
+        #[cfg(feature = "parallel")]
+        let precomputed = if precomputed.is_none()
+            && !is_deposit
+            && self.speculative_fee_cache_ready
+            && tx_env.eip8130_signed().is_none()
+            && let Some(speculator) = &self.ctx.speculator
+            && let Some(env) = crate::ParallelPayload::environment(&self.evm)
+            && let Some(mut candidate) = speculator.take(tx.tx().trie_hash(), *tx.signer())
+        {
+            let valid = candidate.parent_hash == self.ctx.parent_hash
+                && candidate.environment == env
+                && tx_env.speculative_transaction().is_some_and(|tx| *tx == candidate.transaction)
+                && candidate.validate_and_rebase(self.evm.db_mut()).unwrap_or(false);
+            speculator.record_validation(valid);
+            if valid {
+                crate::ParallelTransaction {
+                    hash: tx.tx().trie_hash(),
+                    signer: *tx.signer(),
+                    output: candidate.output,
+                }
+                .into_output::<E::HaltReason>()
+            } else {
+                None
+            }
+        } else {
+            precomputed
+        };
         #[cfg(not(feature = "parallel"))]
         let precomputed = None;
         let result = match precomputed {
@@ -318,6 +355,11 @@ where
             .transpose()
             .map_err(BlockExecutionError::other)?;
 
+        #[cfg(feature = "parallel")]
+        {
+            self.speculative_transaction_hash = tx.tx().trie_hash();
+            self.speculative_fee_cache_ready |= !is_deposit;
+        }
         Ok(BaseTxResult {
             inner: EthTxResult {
                 result,
@@ -378,6 +420,21 @@ where
             },
         );
 
+        #[cfg(feature = "parallel")]
+        if self.speculative_fee_cache_ready
+            && state.get(&Predeploys::L1_BLOCK_INFO).is_some_and(|account| {
+                account.is_selfdestructed()
+                    || account.is_created()
+                    || account.changed_storage_slots().next().is_some()
+            })
+            && let Some(speculator) = self.ctx.speculator.take()
+        {
+            speculator.cancel();
+        }
+        #[cfg(feature = "parallel")]
+        if let Some(speculator) = &self.ctx.speculator {
+            speculator.on_commit(self.speculative_transaction_hash, &state);
+        }
         self.evm.db_mut().commit(state);
 
         GasOutput::with_state_gas(tx_gas_used, state_gas_used)

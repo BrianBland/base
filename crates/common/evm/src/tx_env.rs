@@ -6,6 +6,13 @@ use crate::BaseTransaction;
 /// Trait for Base transaction environments. Allows to recover the transaction encoded bytes if
 /// they're available.
 pub trait BaseTxEnv {
+    /// Exact production transaction environment for speculative identity checking.
+    /// Custom transaction environments default to inline execution.
+    #[cfg(feature = "parallel")]
+    fn speculative_transaction(&self) -> Option<&BaseTransaction<revm::context::TxEnv>> {
+        None
+    }
+
     /// Returns the encoded bytes of the transaction.
     fn encoded_bytes(&self) -> Option<&Bytes>;
 
@@ -22,7 +29,12 @@ pub trait BaseTxEnv {
     fn eip8130_signed(&self) -> Option<&Eip8130Signed>;
 }
 
-impl<T: revm::context::Transaction> BaseTxEnv for BaseTransaction<T> {
+impl<T: revm::context::Transaction + 'static> BaseTxEnv for BaseTransaction<T> {
+    #[cfg(feature = "parallel")]
+    fn speculative_transaction(&self) -> Option<&BaseTransaction<revm::context::TxEnv>> {
+        (self as &dyn core::any::Any).downcast_ref()
+    }
+
     fn encoded_bytes(&self) -> Option<&Bytes> {
         self.enveloped_tx.as_ref()
     }

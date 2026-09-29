@@ -8,6 +8,14 @@ extern crate alloc;
 pub use base_common_genesis::BaseUpgrade;
 
 #[cfg(feature = "parallel")]
+mod speculator;
+#[cfg(feature = "parallel")]
+pub use speculator::{
+    Prediction, SpeculationJob, SpeculationParent, SpeculationSlot, SpeculativeResult, Speculator,
+    SpeculatorQueue, SpeculatorStats,
+};
+
+#[cfg(feature = "parallel")]
 mod parallel_balance;
 #[cfg(feature = "parallel")]
 pub use parallel_balance::BalanceOpcodes;

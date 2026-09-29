@@ -16,7 +16,7 @@ use std::{
     collections::BTreeMap,
     convert::Infallible,
     sync::{
-        Condvar, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence},
     },
     time::Instant,
@@ -192,10 +192,10 @@ fn may_be_empty(info: &Option<AccountInfo>) -> bool {
 #[derive(Debug)]
 pub struct Store<'a> {
     pre: &'a dyn ParallelDatabase,
-    accounts: DashMap<Address, Option<AccountInfo>, DefaultHashBuilder>,
-    storage: DashMap<(Address, U256), U256, DefaultHashBuilder>,
-    cleared_storage: DashSet<Address, DefaultHashBuilder>,
-    codes: DashMap<B256, Bytecode, DefaultHashBuilder>,
+    accounts: Arc<DashMap<Address, Option<AccountInfo>, DefaultHashBuilder>>,
+    storage: Arc<DashMap<(Address, U256), U256, DefaultHashBuilder>>,
+    cleared_storage: Arc<DashSet<Address, DefaultHashBuilder>>,
+    codes: Arc<DashMap<B256, Bytecode, DefaultHashBuilder>>,
 }
 
 impl<'a> Store<'a> {
@@ -203,10 +203,21 @@ impl<'a> Store<'a> {
     pub fn new(pre: &'a dyn ParallelDatabase) -> Self {
         Self {
             pre,
-            accounts: DashMap::default(),
-            storage: DashMap::default(),
-            cleared_storage: DashSet::default(),
-            codes: DashMap::default(),
+            accounts: Arc::default(),
+            storage: Arc::default(),
+            cleared_storage: Arc::default(),
+            codes: Arc::default(),
+        }
+    }
+
+    /// Shares committed writes while reading untouched locations through a worker-owned parent.
+    pub fn fork<'b>(&self, pre: &'b dyn ParallelDatabase) -> Store<'b> {
+        Store {
+            pre,
+            accounts: Arc::clone(&self.accounts),
+            storage: Arc::clone(&self.storage),
+            cleared_storage: Arc::clone(&self.cleared_storage),
+            codes: Arc::clone(&self.codes),
         }
     }
 
@@ -249,7 +260,7 @@ impl<'a> Store<'a> {
 
     /// Applies a validated execution, rebasing each balance it read by the committed drift.
     /// Returns whether any read balance had drifted.
-    fn apply_state(&self, state: &EvmState, reads: &[Read]) -> bool {
+    pub fn apply_state(&self, state: &EvmState, reads: &[Read]) -> bool {
         let rebased: Vec<(Address, U256, U256)> = reads
             .iter()
             .filter_map(|read| {
@@ -314,36 +325,8 @@ impl<'a> Store<'a> {
         reads: &[Read],
         fees: &[(Address, U256)],
     ) -> bool {
-        let mut rebased = false;
-        for read in reads {
-            if let Read::Account(address, Some(_), balance) = read {
-                let now = self.account(*address).map_or(U256::ZERO, |info| info.balance);
-                if now != balance.seen {
-                    rebased = true;
-                    if let Some(account) = state.get_mut(address) {
-                        account.info.balance =
-                            account.info.balance.wrapping_add(now).wrapping_sub(balance.seen);
-                    }
-                }
-            }
-        }
-        for (address, account) in state.iter_mut() {
-            let created = account.is_created();
-            for (slot, value) in &mut account.storage {
-                value.original_value =
-                    if created { U256::ZERO } else { self.slot(*address, *slot) };
-            }
-        }
-        for (recipient, amount) in fees {
-            let account = state.entry(*recipient).or_insert_with(|| {
-                self.account(*recipient).map(revm::state::Account::from).unwrap_or_else(|| {
-                    revm::state::Account::new_not_existing(revm::state::TransactionId::ZERO)
-                })
-            });
-            account.mark_touch();
-            account.info.balance += *amount;
-        }
-        rebased
+        crate::SpeculativeResult::rebase(state, reads, fees, &mut WrapDatabaseRef(self))
+            .unwrap_or_else(|never| match never {})
     }
 }
 
@@ -473,6 +456,24 @@ impl MvMemory {
         Self { writes: DashMap::default(), readers: DashMap::default(), txs }
     }
 
+    /// Forwards a candidate's writes as an advisory prediction, never as committed state.
+    pub fn publish_candidate(&self, store: &Store<'_>, tx: usize, state: &EvmState) {
+        let writes: Vec<_> = state
+            .iter()
+            .filter(|(_, account)| account.is_touched())
+            .flat_map(|(address, account)| {
+                let info = (!account.is_selfdestructed() && !account.is_empty())
+                    .then(|| account.info.clone());
+                std::iter::once((Loc::Account(*address), Value::Account(info))).chain(
+                    account.changed_storage_slots().map(|(slot, value)| {
+                        (Loc::Slot(*address, *slot), Value::Slot(value.present_value))
+                    }),
+                )
+            })
+            .collect();
+        self.publish(store, tx, &writes, &[]);
+    }
+
     fn register(&self, loc: Loc, tx: usize) {
         match self.readers.get(&loc) {
             Some(readers) => readers.insert(tx),
@@ -575,9 +576,59 @@ pub struct RecordingDb<'a> {
     accounts: FastMap<Address, usize>,
     /// Caller and nonce of a speculated non-deposit transaction (see [`Self::assume_nonce`]).
     sender: Option<(Address, u64)>,
+    verify_code: bool,
 }
 
 impl RecordingDb<'_> {
+    /// Executes one candidate with recorded fee-parameter and EVM reads.
+    /// Failure (including an unsupported transaction) is only a speculation miss.
+    pub fn execute_candidate(
+        factory: &BaseEvmFactory,
+        env: EvmEnv<BaseSpecId>,
+        store: &Store<'_>,
+        tx: BaseTransaction<TxEnv>,
+        forwarding: Option<(&MvMemory, &[AtomicU8], usize)>,
+    ) -> Option<crate::SpeculativeResult> {
+        if tx.tx_type() == DEPOSIT_TRANSACTION_TYPE
+            || tx.tx_type() == crate::EIP8130_TRANSACTION_TYPE
+            || env
+                .cfg_env
+                .spec
+                .into_eth_spec()
+                .is_enabled_in(revm::primitives::hardfork::SpecId::AMSTERDAM)
+        {
+            return None;
+        }
+        let mut db = RecordingDb {
+            store,
+            speculation: forwarding.map(|(mv, status, _)| (mv, status)),
+            tx: forwarding.map_or(0, |(_, _, index)| index),
+            reads: Vec::new(),
+            accounts: FastMap::default(),
+            sender: Some((tx.caller(), tx.nonce())),
+            verify_code: true,
+        };
+        let l1_info =
+            L1BlockInfo::try_fetch(&mut db, env.block_env.number, env.cfg_env.spec).ok()?;
+        let mut evm = factory.create_evm(db, env.clone());
+        BalanceOpcodes::install(evm.all_mut().1);
+        evm.ctx_mut().set_tx(tx.clone());
+        *evm.ctx_mut().chain_mut() = l1_info;
+        let mut handler: LazyFeeHandler<_, EVMError<Blocked, BaseTransactionError>, _> =
+            LazyFeeHandler::default();
+        let result = handler.run(&mut evm).ok()?;
+        let state = evm.ctx_mut().journal_mut().finalize();
+        let reads = std::mem::take(&mut evm.ctx_mut().db_mut().reads);
+        Some(crate::SpeculativeResult {
+            transaction: tx,
+            environment: env,
+            parent_hash: B256::ZERO,
+            output: ResultAndState { result, state },
+            reads,
+            fees: handler.fees.take(),
+        })
+    }
+
     fn register(&self, loc: Loc) {
         if let Some((mv, _)) = self.speculation {
             mv.register(loc, self.tx);
@@ -674,7 +725,11 @@ impl Database for RecordingDb<'_> {
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        Ok(self.store.code_by_hash_ref(code_hash).unwrap())
+        let code = self.store.code_by_hash_ref(code_hash).unwrap();
+        if self.verify_code && code.hash_slow() != code_hash {
+            return Err(Blocked(0));
+        }
+        Ok(code)
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
@@ -1141,6 +1196,7 @@ impl Scheduler<'_> {
             reads: Vec::new(),
             accounts: FastMap::default(),
             sender: None,
+            verify_code: false,
         };
         let mut evm = self.config.create_evm(db, self.env.clone());
         BalanceOpcodes::install(evm.all_mut().1);

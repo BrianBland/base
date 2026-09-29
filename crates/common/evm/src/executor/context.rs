@@ -5,6 +5,9 @@ use alloy_primitives::{B256, Bytes};
 /// Context for base block execution.
 #[derive(Debug, Default, Clone)]
 pub struct BaseBlockExecutionCtx {
+    /// Optional ahead-of-builder workers; never installed by production builders in Phase 1.
+    #[cfg(feature = "parallel")]
+    pub speculator: Option<std::sync::Arc<crate::Speculator>>,
     /// Full payload transactions, present only for explicitly gated payload validation.
     #[cfg(feature = "parallel")]
     pub parallel: Option<crate::ParallelPayload>,
@@ -29,6 +32,8 @@ impl BaseBlockExecutionCtx {
             extra_data,
             #[cfg(feature = "parallel")]
             parallel: None,
+            #[cfg(feature = "parallel")]
+            speculator: None,
         }
     }
 }
