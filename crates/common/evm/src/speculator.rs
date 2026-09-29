@@ -517,6 +517,22 @@ mod tests {
             let declined = executor.execute_transaction_without_commit(&first).unwrap();
             drop(declined);
             assert!(executor.receipts.is_empty());
+            assert!(
+                executor
+                    .execute_transaction_with_commit_condition(&first, |_| {
+                        alloy_evm::block::CommitChanges::No
+                    })
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(workers.stats().consumed, 1);
+            assert!(executor.receipts.is_empty());
+            assert_eq!(
+                executor.evm.db_mut().basic(first.signer()).unwrap().unwrap().balance,
+                U256::from(1_000_000)
+            );
+            workers.submit(&[first.clone(), second.clone()]);
+            assert!(workers.wait_idle(Duration::from_secs(5)));
             let mut altered = BaseTransaction::from_recovered_tx(first.inner(), first.signer());
             altered.base.gas_limit = 1;
             assert!(executor.execute_transaction_without_commit((altered, &first)).is_err());
@@ -538,7 +554,7 @@ mod tests {
             assert!(workers.wait_idle(Duration::from_secs(5)));
             executor.execute_transaction(&second).unwrap();
             assert_eq!(executor.receipts.len(), 1);
-            assert_eq!(workers.stats().consumed, 1);
+            assert_eq!(workers.stats().consumed, 2);
             assert_eq!(
                 executor.evm.db_mut().basic(first.signer()).unwrap().unwrap().balance,
                 U256::from(999_980)
