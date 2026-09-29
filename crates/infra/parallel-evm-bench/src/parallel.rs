@@ -928,6 +928,18 @@ struct Committed {
     apply_nanos: u64,
 }
 
+/// Stops sibling workers before Rayon waits for them during panic propagation.
+#[derive(Debug)]
+pub struct StopOnUnwind<'a>(pub &'a AtomicBool);
+
+impl Drop for StopOnUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Shared scheduler state for one block.
 struct Scheduler<'a> {
     config: &'a Config,
@@ -965,6 +977,8 @@ struct Scheduler<'a> {
     execution_nanos: AtomicU64,
     blocked_nanos: AtomicU64,
     reads: AtomicUsize,
+    #[cfg(test)]
+    before_execution: Option<fn()>,
     #[cfg(test)]
     after_execution: Option<fn(&Scheduler<'_>)>,
     started: Instant,
@@ -1041,6 +1055,10 @@ impl Scheduler<'_> {
         speculative: bool,
     ) -> Result<Speculation, usize> {
         let start = Instant::now();
+        #[cfg(test)]
+        if let Some(before_execution) = self.before_execution {
+            before_execution();
+        }
         let db = evm.ctx_mut().db_mut();
         db.speculation = speculative.then_some((self.mv, self.status.as_slice()));
         db.tx = tx;
@@ -1200,7 +1218,7 @@ impl Scheduler<'_> {
     /// executions, so whichever thread makes the frontier transaction committable commits it
     /// instead of waiting on a dedicated committer.
     fn commit<'s>(&'s self, evm: &mut WorkerEvm<'s>) {
-        loop {
+        while !self.stop.load(Ordering::Relaxed) {
             let i = self.frontier.load(Ordering::SeqCst);
             if i == self.txs.len() {
                 self.stop.store(true, Ordering::Relaxed);
@@ -1231,7 +1249,7 @@ impl Scheduler<'_> {
         let started = Instant::now();
         let mut committed = self.committed.lock().unwrap();
         let mut i = self.frontier.load(Ordering::SeqCst);
-        while i < self.txs.len() {
+        while i < self.txs.len() && !self.stop.load(Ordering::Relaxed) {
             // Every lower transaction is committed, so an execution here reads the exact prefix
             // state, needs no validation, and is committed without being published.
             const AT_FRONTIER: &str =
@@ -1343,12 +1361,13 @@ impl Scheduler<'_> {
     }
 
     fn work(&self) {
+        let _stop_on_unwind = StopOnUnwind(&self.stop);
         let since_start = || self.started.elapsed().as_nanos() as u64;
         let mut evm = self.evm();
         self.all_entered.fetch_max(since_start(), Ordering::Relaxed);
         while !self.stop.load(Ordering::Relaxed) {
             self.commit(&mut evm);
-            if !self.step(&mut evm) && !self.stop.load(Ordering::Relaxed) {
+            if !self.stop.load(Ordering::Relaxed) && !self.step(&mut evm) {
                 let idle = Instant::now();
                 std::thread::yield_now();
                 self.idle_nanos.fetch_add(idle.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1479,6 +1498,8 @@ impl ParallelOutcome {
             execution_nanos: AtomicU64::new(0),
             blocked_nanos: AtomicU64::new(0),
             reads: AtomicUsize::new(0),
+            #[cfg(test)]
+            before_execution: None,
             #[cfg(test)]
             after_execution: None,
             started,
@@ -1626,7 +1647,7 @@ mod tests {
         assert_eq!(scheduler.committed.lock().unwrap().txs.len(), 2);
     }
 
-    fn late_execution_tail(sender_gate: bool) {
+    fn late_execution_tail(sender_gate: bool, panic: bool) {
         let config = Config::base(Arc::new(BaseChainSpecBuilder::base_mainnet().build()));
         let sender = Address::repeat_byte(1);
         let recipient = Address::repeat_byte(2);
@@ -1685,11 +1706,16 @@ mod tests {
             execution_nanos: AtomicU64::new(0),
             blocked_nanos: AtomicU64::new(0),
             reads: AtomicUsize::new(0),
+            before_execution: panic.then_some(|| panic!("injected execution panic")),
             after_execution: Some(finish_predecessor_and_commit),
             started: Instant::now(),
             all_entered: AtomicU64::new(0),
             first_left: AtomicU64::new(u64::MAX),
         };
+        if panic {
+            Workers::new(4).unwrap().run(|| scheduler.work());
+            return;
+        }
         let mut evm = scheduler.evm();
         assert!(scheduler.claim(1));
         scheduler.run(&mut evm, 1);
@@ -1703,13 +1729,23 @@ mod tests {
     }
 
     #[test]
+    fn panicking_execution_releases_all_workers() {
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| late_execution_tail(false, true));
+            sent.send(result.is_err()).unwrap();
+        });
+        assert!(received.recv_timeout(std::time::Duration::from_secs(5)).expect("workers hung"));
+    }
+
+    #[test]
     fn late_execution_tail_does_not_strand_blocked_reader() {
-        late_execution_tail(false);
+        late_execution_tail(false, false);
     }
 
     #[test]
     fn late_execution_tail_does_not_strand_sender_gate() {
-        late_execution_tail(true);
+        late_execution_tail(true, false);
     }
 
     #[test]
