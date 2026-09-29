@@ -36,7 +36,7 @@ use base_common_evm::{
 };
 use base_common_genesis::BaseUpgrade;
 use base_execution_evm::BaseEvmConfig;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use eyre::{Result, eyre};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use reth_evm::{ConfigureEvm, EvmFor, execute::BlockExecutor};
@@ -192,6 +192,7 @@ pub struct Store<'a> {
     pre: &'a PreDb,
     accounts: DashMap<Address, Option<AccountInfo>, DefaultHashBuilder>,
     storage: DashMap<(Address, U256), U256, DefaultHashBuilder>,
+    cleared_storage: DashSet<Address, DefaultHashBuilder>,
     codes: DashMap<B256, Bytecode, DefaultHashBuilder>,
 }
 
@@ -202,6 +203,7 @@ impl<'a> Store<'a> {
             pre,
             accounts: DashMap::default(),
             storage: DashMap::default(),
+            cleared_storage: DashSet::default(),
             codes: DashMap::default(),
         }
     }
@@ -219,6 +221,9 @@ impl<'a> Store<'a> {
         if let Some(value) = self.storage.get(&(address, slot)) {
             return *value;
         }
+        if self.cleared_storage.contains(&address) {
+            return U256::ZERO;
+        }
         self.pre.storage_ref(address, slot).unwrap()
     }
 
@@ -234,9 +239,12 @@ impl<'a> Store<'a> {
         }
     }
 
-    // ponytail: destroyed accounts do not wipe their pre-existing storage; post-Cancun
-    // SELFDESTRUCT only destroys same-transaction contracts, which have none. The final state
-    // comparison against the sequential executor catches any violation.
+    /// Prevents reads from reaching storage belonging to an earlier account incarnation.
+    pub fn clear_storage(&self, address: Address) {
+        self.storage.retain(|(owner, _), _| *owner != address);
+        self.cleared_storage.insert(address);
+    }
+
     /// Applies a validated execution, rebasing each balance it read by the committed drift.
     /// Returns whether any read balance had drifted.
     fn apply_state(&self, state: &EvmState, reads: &[Read]) -> bool {
@@ -251,6 +259,9 @@ impl<'a> Store<'a> {
         for (address, account) in state {
             if !account.is_touched() {
                 continue;
+            }
+            if account.is_selfdestructed() || account.is_created() {
+                self.clear_storage(*address);
             }
             if account.is_selfdestructed() || account.is_empty() {
                 self.accounts.insert(*address, None);
@@ -273,6 +284,9 @@ impl<'a> Store<'a> {
 
     fn apply_bundle(&self, bundle: &BundleState) {
         for (address, account) in &bundle.state {
+            if account.status.is_storage_known() {
+                self.clear_storage(*address);
+            }
             let info = account.info.clone().map(|mut info| {
                 if info.code.is_none() {
                     info.code = bundle
@@ -315,7 +329,16 @@ impl Store<'_> {
                 .state
                 .get(address)
                 .and_then(|a| a.storage.get(slot))
-                .map_or_else(|| self.pre.storage_ref(*address, *slot).unwrap(), |s| s.present_value)
+                .map_or_else(
+                    || {
+                        if bundle.state.get(address).is_some_and(|a| a.status.is_storage_known()) {
+                            U256::ZERO
+                        } else {
+                            self.pre.storage_ref(*address, *slot).unwrap()
+                        }
+                    },
+                    |s| s.present_value,
+                )
         };
         let addresses = bundle.state.keys().copied().chain(self.accounts.iter().map(|e| *e.key()));
         for address in addresses {
@@ -1726,6 +1749,25 @@ mod tests {
         assert_eq!(store.account(recipient).unwrap().balance, U256::from(3));
         assert_eq!(scheduler.executions.load(Ordering::Relaxed), 4);
         assert_eq!(scheduler.invalidated.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn recreation_clears_parent_and_overlay_storage() {
+        let address = Address::repeat_byte(3);
+        let mut prestate = Prestate::default();
+        prestate.storage.entry(address).or_default().insert(U256::ZERO, U256::from(7));
+        let pre = PreDb::new(&prestate);
+        let store = Store::new(&pre);
+        store.storage.insert((address, U256::from(1)), U256::from(8));
+        let mut account = revm::state::Account::from(AccountInfo { nonce: 1, ..Default::default() });
+        account.mark_touch();
+        account.mark_selfdestruct();
+        store.apply_state(&[(address, account.clone())].into_iter().collect(), &[]);
+        account.unmark_selfdestruct();
+        account.mark_created();
+        store.apply_state(&[(address, account)].into_iter().collect(), &[]);
+        assert_eq!(store.slot(address, U256::ZERO), U256::ZERO);
+        assert_eq!(store.slot(address, U256::from(1)), U256::ZERO);
     }
 
     #[test]

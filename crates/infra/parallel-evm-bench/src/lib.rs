@@ -9,5 +9,5 @@ pub use data::{BlockFixture, FetchError, PreAccount, PreDb, Prestate, RpcRecorde
 mod parallel;
 pub use parallel::{
     BalanceRead, Blocked, CriticalPath, LazyFeeHandler, Loc, MvMemory, ParallelOutcome, Read,
-    Readers, RecordingDb, Schedule, Stats, Store, TxOutcome, TxTrace, Value, Workers,
+    Readers, RecordingDb, Schedule, Stats, StopOnUnwind, Store, TxOutcome, TxTrace, Value, Workers,
 };
