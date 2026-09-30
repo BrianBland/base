@@ -73,19 +73,22 @@ impl SpeculativeResult {
     /// Call at most once: successful validation consumes the recorded balance/fee deltas.
     pub fn validate_and_rebase<DB: Database>(&mut self, db: &mut DB) -> Result<bool, DB::Error> {
         let started = Instant::now();
+        let mut last_loaded_account = None;
         for read in &self.reads {
-            self.validation_lookups += match read {
-                Read::Account(..) => 1,
-                Read::Slot(..) => 2,
-            };
+            self.validation_lookups += 1;
             let valid = match read {
                 Read::Account(address, seen, balance) => {
                     let now = db.basic(*address)?;
+                    last_loaded_account = Some(*address);
                     *seen == now.as_ref().map(|info| (info.nonce, info.code_hash))
                         && balance.admits(now.as_ref().map_or(U256::ZERO, |info| info.balance))
                 }
                 Read::Slot(address, slot, seen) => {
-                    db.basic(*address)?;
+                    if last_loaded_account != Some(*address) {
+                        db.basic(*address)?;
+                        self.validation_lookups += 1;
+                        last_loaded_account = Some(*address);
+                    }
                     db.storage(*address, *slot)? == *seen
                 }
             };
@@ -128,7 +131,9 @@ impl SpeculativeResult {
         }
         for (address, account) in state.iter_mut() {
             let created = account.is_created();
-            db.basic(*address)?;
+            if !created && !account.storage.is_empty() {
+                db.basic(*address)?;
+            }
             for (slot, value) in &mut account.storage {
                 value.original_value =
                     if created { U256::ZERO } else { db.storage(*address, *slot)? };
@@ -225,7 +230,7 @@ pub struct SpeculatorStats {
     pub generations: usize,
     /// Plans replaced because retained candidates were no longer an ordered prefix.
     pub replans: usize,
-    /// Total frontier polling time, excluding Store validation and repair.
+    /// Take setup and frontier polling time, excluding Store validation and repair.
     pub frontier_wait_nanos: u64,
     /// Owner validation plus rebasing time in nanoseconds.
     pub validation_nanos: u64,
@@ -391,7 +396,11 @@ impl SpeculatorQueue {
         if let Some(index) = self.slots.remove(&hash) {
             self.prediction.as_ref().unwrap().retire(index);
         }
-        self.order.retain(|item| *item != hash);
+        if self.order.front() == Some(&hash) {
+            self.order.pop_front();
+        } else {
+            self.order.retain(|&item| item != hash);
+        }
         if self.requested == Some(hash) {
             self.requested = None;
         }
@@ -581,7 +590,11 @@ impl Speculator {
             drop(slot);
             prediction.advance();
             queue.slots.remove(&hash);
-            queue.order.retain(|item| *item != hash);
+            if queue.order.front() == Some(&hash) {
+                queue.order.pop_front();
+            } else {
+                queue.order.retain(|&item| item != hash);
+            }
         } else {
             let changed = MvMemory::committed_locations(
                 &parent.overlay,

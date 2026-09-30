@@ -228,10 +228,10 @@ impl<'a> Store<'a> {
     pub fn is_cached_current(&self, read: &Read) -> bool {
         match read {
             Read::Account(address, seen, funds) => {
-                let now = self.accounts.get(address).map(|v| v.clone()).or_else(|| {
-                    self.parent_cache.as_ref()?.accounts.get(address).map(|v| v.clone())
-                });
-                now.is_some_and(|now| *seen == info_key(&now) && funds.admits(balance(&now)))
+                self.accounts
+                    .get(address)
+                    .or_else(|| self.parent_cache.as_ref()?.accounts.get(address))
+                    .is_some_and(|now| *seen == info_key(&now) && funds.admits(balance(&now)))
             }
             Read::Slot(address, key, seen) => {
                 let now = self.storage.get(&(*address, *key)).map(|v| *v).or_else(|| {
@@ -781,7 +781,7 @@ pub struct RecordingDb<'a> {
 
 impl RecordingDb<'_> {
     /// Executes one candidate with recorded fee-parameter and EVM reads.
-    /// Failure (including an unsupported transaction) is only a speculation miss.
+    /// Transaction errors retain observations; unsupported/provider failures are misses.
     pub fn execute_candidate(
         factory: &BaseEvmFactory,
         env: EvmEnv<BaseSpecId>,
@@ -862,7 +862,8 @@ impl RecordingDb<'_> {
             Ok(result) => Ok(ResultAndState { result, state }),
             Err(EVMError::Transaction(error)) => {
                 for read in &mut reads {
-                    if let Read::Account(_, _, balance) = read {
+                    if let Read::Account(address, _, balance) = read {
+                        evm.ctx_mut().db_mut().register(Loc::Balance(*address));
                         *balance = BalanceRead::exact(balance.seen);
                     }
                 }

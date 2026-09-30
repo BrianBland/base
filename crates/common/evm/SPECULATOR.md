@@ -67,6 +67,12 @@ Duplicate hashes in a submitted snapshot share one advisory slot at their first 
 resubmitting the same ordered unique candidates must retain completed work. Admission of repeated
 choices still belongs to the owner, and a delivered/retired result cannot be consumed twice.
 
+Owner validation still checks every observation: Store equivalence is not assumed. Cached Store
+account checks borrow metadata under shard guards instead of cloning AccountInfo/bytecode.
+Adjacent owner storage checks reuse the already-loaded account but still read every slot; the
+lookup counter counts actual basic/storage calls. Rebasing loads account metadata only when it
+will fetch non-created storage originals. Front-of-plan retirement pops instead of scanning K.
+
 Tests must exercise stale nonce/storage rejection, admitted balance drift and fee rebasing,
 identity mismatch, discarded work/reset, and a declined commit followed by another choice.
 The offline gate compares the same deterministic fault stream's included hashes, full
