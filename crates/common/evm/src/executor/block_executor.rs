@@ -318,23 +318,36 @@ where
             && tx_env.eip8130_signed().is_none()
             && let Some(speculator) = &self.ctx.speculator
             && let Some(env) = crate::ParallelPayload::environment(&self.evm)
-            && let Some(mut candidate) = speculator.take(tx.tx().trie_hash(), *tx.signer())
         {
-            let valid = candidate.parent_hash == self.ctx.parent_hash
-                && candidate.environment == env
-                && tx_env.speculative_transaction().is_some_and(|tx| *tx == candidate.transaction)
-                && candidate.validate_and_rebase(self.evm.db_mut()).unwrap_or(false);
-            speculator.record_validation(valid);
-            if valid {
-                crate::ParallelTransaction {
-                    hash: tx.tx().trie_hash(),
-                    signer: *tx.signer(),
-                    output: candidate.output,
+            let mut output = None;
+            for attempt in 0..2 {
+                let Some(mut candidate) = speculator.take(tx.tx().trie_hash(), *tx.signer()) else {
+                    break;
+                };
+                let validation_started = std::time::Instant::now();
+                let identity_matches = candidate.parent_hash == self.ctx.parent_hash
+                    && candidate.environment == env
+                    && tx_env
+                        .speculative_transaction()
+                        .is_some_and(|tx| *tx == candidate.transaction);
+                let valid = identity_matches
+                    && candidate.validate_and_rebase(self.evm.db_mut()).unwrap_or(false);
+                speculator.record_validation(valid, validation_started.elapsed());
+                if valid {
+                    output = crate::ParallelTransaction {
+                        hash: tx.tx().trie_hash(),
+                        signer: *tx.signer(),
+                        output: candidate.output,
+                    }
+                    .into_output::<E::HaltReason>();
+                    break;
                 }
-                .into_output::<E::HaltReason>()
-            } else {
-                None
+                if !identity_matches || attempt != 0 {
+                    break;
+                }
+                speculator.retry(tx.tx().trie_hash());
             }
+            output
         } else {
             precomputed
         };
@@ -342,10 +355,19 @@ where
         let precomputed = None;
         let result = match precomputed {
             Some(result) => result,
-            None => self.evm.transact(tx_env).map_err(|err| {
-                let hash = tx.tx().trie_hash();
-                BlockExecutionError::evm(err, hash)
-            })?,
+            None => {
+                #[cfg(feature = "parallel")]
+                let started = self.ctx.speculator.as_ref().map(|_| std::time::Instant::now());
+                let result = self.evm.transact(tx_env);
+                #[cfg(feature = "parallel")]
+                if let Some(speculator) = &self.ctx.speculator {
+                    speculator.record_owner_work(
+                        started.map(|start| start.elapsed()),
+                        std::time::Duration::ZERO,
+                    );
+                }
+                result.map_err(|err| BlockExecutionError::evm(err, tx.tx().trie_hash()))?
+            }
         };
 
         // Fetch the depositor account from the database for the deposit nonce.
@@ -373,6 +395,8 @@ where
     }
 
     fn commit_transaction(&mut self, output: Self::Result) -> GasOutput {
+        #[cfg(feature = "parallel")]
+        let started = self.ctx.speculator.as_ref().map(|_| std::time::Instant::now());
         let BaseTxResult {
             inner: EthTxResult { result: ResultAndState { result, state }, blob_gas_used, tx_type },
             is_deposit,
@@ -436,6 +460,13 @@ where
             speculator.on_commit(self.speculative_transaction_hash, &state);
         }
         self.evm.db_mut().commit(state);
+        #[cfg(feature = "parallel")]
+        if let Some(speculator) = &self.ctx.speculator {
+            speculator.record_owner_work(
+                None,
+                started.map_or(std::time::Duration::ZERO, |start| start.elapsed()),
+            );
+        }
 
         GasOutput::with_state_gas(tx_gas_used, state_gas_used)
     }

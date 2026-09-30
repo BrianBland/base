@@ -456,22 +456,145 @@ impl MvMemory {
         Self { writes: DashMap::default(), readers: DashMap::default(), txs }
     }
 
-    /// Forwards a candidate's writes as an advisory prediction, never as committed state.
-    pub fn publish_candidate(&self, store: &Store<'_>, tx: usize, state: &EvmState) {
-        let writes: Vec<_> = state
+    /// Publishes without provider I/O while the builder scheduler holds its queue lock.
+    /// Recorded observations supply the baseline for first writes; missing observations cause
+    /// conservative invalidation instead of inventing committed state.
+    pub fn publish_observed(
+        &self,
+        tx: usize,
+        writes: &[(Loc, Value)],
+        previous: &[(Loc, Value)],
+        reads: &[Read],
+    ) -> Vec<Loc> {
+        let mut changed = Vec::new();
+        for (loc, value) in writes {
+            let below = self.latest(loc, tx).map(|(_, value)| value).or_else(|| {
+                reads.iter().find_map(|read| match (loc, read) {
+                    (Loc::Account(address), Read::Account(a, info, funds)) if address == a => {
+                        Some(Value::Account(info.map(|(nonce, code_hash)| AccountInfo {
+                            nonce,
+                            code_hash,
+                            balance: funds.seen,
+                            code: None,
+                            ..Default::default()
+                        })))
+                    }
+                    (Loc::Slot(address, slot), Read::Slot(a, key, seen))
+                        if address == a && slot == key =>
+                    {
+                        Some(Value::Slot(*seen))
+                    }
+                    _ => None,
+                })
+            });
+            let old = self.writes.entry(*loc).or_default().insert(tx, value.clone());
+            if let Some(old) = old.or(below) {
+                changed.extend(loc.changes(&old, value));
+            } else {
+                changed.extend(Self::removed_locations(&[(*loc, value.clone())]));
+            }
+        }
+        for (loc, value) in previous {
+            if !writes.iter().any(|(key, _)| key == loc) {
+                self.remove(tx, &[(*loc, value.clone())]);
+                changed.extend(Self::removed_locations(&[(*loc, value.clone())]));
+            }
+        }
+        changed
+    }
+
+    /// Actual writes, excluding call targets whose account was merely touched.
+    pub fn candidate_writes(state: &EvmState, reads: &[Read]) -> Vec<(Loc, Value)> {
+        state
             .iter()
-            .filter(|(_, account)| account.is_touched())
+            .filter(|(_, a)| a.is_touched())
             .flat_map(|(address, account)| {
                 let info = (!account.is_selfdestructed() && !account.is_empty())
                     .then(|| account.info.clone());
-                std::iter::once((Loc::Account(*address), Value::Account(info))).chain(
-                    account.changed_storage_slots().map(|(slot, value)| {
+                let unchanged = reads.iter().any(|read| {
+                    matches!(read,
+                Read::Account(a, seen, funds) if a == address
+                    && *seen == info_key(&info) && funds.seen == balance(&info))
+                });
+                (!unchanged)
+                    .then(|| (Loc::Account(*address), Value::Account(info)))
+                    .into_iter()
+                    .chain(account.changed_storage_slots().map(|(slot, value)| {
                         (Loc::Slot(*address, *slot), Value::Slot(value.present_value))
-                    }),
-                )
+                    }))
             })
-            .collect();
-        self.publish(store, tx, &writes, &[]);
+            .collect()
+    }
+
+    /// Readers invalidated by a lower writer. Duplicate indices are allowed.
+    pub fn affected_readers(&self, tx: usize, changed: &[Loc]) -> Vec<usize> {
+        changed
+            .iter()
+            .flat_map(|loc| {
+                self.readers.get(loc).map(|r| r.above(tx).collect::<Vec<_>>()).unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Read locations affected when a prediction is removed without committing.
+    pub fn removed_locations(writes: &[(Loc, Value)]) -> Vec<Loc> {
+        writes
+            .iter()
+            .flat_map(|(loc, _)| match loc {
+                Loc::Account(address) => vec![*loc, Loc::Balance(*address)],
+                _ => vec![*loc],
+            })
+            .collect()
+    }
+
+    /// Changes between the prediction and the owner's actual commit, including fees.
+    pub fn committed_locations(
+        store: &Store<'_>,
+        writes: &[(Loc, Value)],
+        previous: &[(Loc, Value)],
+    ) -> Vec<Loc> {
+        let mut changed = Vec::new();
+        for (loc, value) in writes {
+            let old = previous
+                .iter()
+                .find(|(key, _)| key == loc)
+                .map(|(_, value)| value.clone())
+                .or_else(|| match loc {
+                    Loc::Account(address) | Loc::Balance(address) => {
+                        store.accounts.get(address).map(|info| Value::Account(info.clone()))
+                    }
+                    Loc::Slot(address, slot) => {
+                        store.storage.get(&(*address, *slot)).map(|value| Value::Slot(*value))
+                    }
+                });
+            if let Some(old) = old {
+                changed.extend(loc.changes(&old, value));
+            } else {
+                changed.extend(Self::removed_locations(&[(*loc, value.clone())]));
+            }
+        }
+        for (loc, value) in previous {
+            if !writes.iter().any(|(key, _)| key == loc) {
+                changed.extend(Self::removed_locations(&[(*loc, value.clone())]));
+            }
+        }
+        changed
+    }
+
+    /// Whether a result still admits its currently visible speculative prefix.
+    pub fn reads_visible(&self, store: &Store<'_>, tx: usize, reads: &[Read]) -> bool {
+        reads.iter().all(|read| match read {
+            Read::Slot(address, slot, seen) => matches!(
+                self.visible(store, &Loc::Slot(*address, *slot), tx),
+                Value::Slot(now) if now == *seen
+            ),
+            Read::Account(address, info, funds) => {
+                let Value::Account(now) = self.visible(store, &Loc::Account(*address), tx) else {
+                    return false;
+                };
+                *info == info_key(&now) && funds.admits(balance(&now))
+            }
+        })
     }
 
     fn register(&self, loc: Loc, tx: usize) {
@@ -541,7 +664,8 @@ impl MvMemory {
         written.chain(unwritten).collect()
     }
 
-    fn remove(&self, tx: usize, writes: &[(Loc, Value)]) {
+    /// Removes every published write of a retired prediction.
+    pub fn remove(&self, tx: usize, writes: &[(Loc, Value)]) {
         for (loc, _) in writes {
             if let Some(mut entry) = self.writes.get_mut(loc) {
                 entry.remove(&tx);
@@ -554,6 +678,11 @@ impl MvMemory {
 /// ESTIMATE): abort and retry once that transaction finishes.
 #[derive(Debug)]
 pub struct Blocked(pub usize);
+
+impl Blocked {
+    /// A provider returned code that does not match its requested hash; not a dependency.
+    pub const INVALID_CODE: usize = usize::MAX;
+}
 
 impl std::fmt::Display for Blocked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -589,6 +718,50 @@ impl RecordingDb<'_> {
         tx: BaseTransaction<TxEnv>,
         forwarding: Option<(&MvMemory, &[AtomicU8], usize)>,
     ) -> Option<crate::SpeculativeResult> {
+        Self::execute_recorded(factory, env, store, tx, forwarding, true).ok().flatten()
+    }
+
+    /// Constructs a reusable worker EVM with all balance-observing opcodes installed.
+    pub fn candidate_evm<'a>(
+        factory: &BaseEvmFactory,
+        env: EvmEnv<BaseSpecId>,
+        store: &'a Store<'a>,
+    ) -> BaseEvm<RecordingDb<'a>, NoOpInspector> {
+        let db = RecordingDb {
+            store,
+            speculation: None,
+            tx: 0,
+            reads: Vec::new(),
+            accounts: FastMap::default(),
+            sender: None,
+            verify_code: true,
+        };
+        let mut evm = factory.create_evm(db, env);
+        BalanceOpcodes::install(evm.all_mut().1);
+        evm
+    }
+
+    /// Executes a prediction, retaining ESTIMATE dependencies for ordered rescheduling.
+    pub fn execute_recorded(
+        factory: &BaseEvmFactory,
+        env: EvmEnv<BaseSpecId>,
+        store: &Store<'_>,
+        tx: BaseTransaction<TxEnv>,
+        forwarding: Option<(&MvMemory, &[AtomicU8], usize)>,
+        speculative: bool,
+    ) -> Result<Option<crate::SpeculativeResult>, Blocked> {
+        let mut evm = Self::candidate_evm(factory, env.clone(), store);
+        Self::execute_reusing(&mut evm, env, tx, forwarding, speculative)
+    }
+
+    /// Runs a candidate on a worker-local EVM, resetting journal and error state after any result.
+    pub fn execute_reusing<'a>(
+        evm: &mut BaseEvm<RecordingDb<'a>, NoOpInspector>,
+        env: EvmEnv<BaseSpecId>,
+        tx: BaseTransaction<TxEnv>,
+        forwarding: Option<(&'a MvMemory, &'a [AtomicU8], usize)>,
+        speculative: bool,
+    ) -> Result<Option<crate::SpeculativeResult>, Blocked> {
         if tx.tx_type() == DEPOSIT_TRANSACTION_TYPE
             || tx.tx_type() == crate::EIP8130_TRANSACTION_TYPE
             || env
@@ -597,36 +770,39 @@ impl RecordingDb<'_> {
                 .into_eth_spec()
                 .is_enabled_in(revm::primitives::hardfork::SpecId::AMSTERDAM)
         {
-            return None;
+            return Ok(None);
         }
-        let mut db = RecordingDb {
-            store,
-            speculation: forwarding.map(|(mv, status, _)| (mv, status)),
-            tx: forwarding.map_or(0, |(_, _, index)| index),
-            reads: Vec::new(),
-            accounts: FastMap::default(),
-            sender: Some((tx.caller(), tx.nonce())),
-            verify_code: true,
-        };
-        let l1_info =
-            L1BlockInfo::try_fetch(&mut db, env.block_env.number, env.cfg_env.spec).ok()?;
-        let mut evm = factory.create_evm(db, env.clone());
-        BalanceOpcodes::install(evm.all_mut().1);
+        let db = evm.ctx_mut().db_mut();
+        db.speculation = forwarding.map(|(mv, status, _)| (mv, status));
+        db.tx = forwarding.map_or(0, |(_, _, index)| index);
+        db.reads.clear();
+        db.accounts.clear();
+        db.sender = speculative.then_some((tx.caller(), tx.nonce()));
+        let l1_info = L1BlockInfo::try_fetch(db, env.block_env.number, env.cfg_env.spec)?;
         evm.ctx_mut().set_tx(tx.clone());
         *evm.ctx_mut().chain_mut() = l1_info;
         let mut handler: LazyFeeHandler<_, EVMError<Blocked, BaseTransactionError>, _> =
             LazyFeeHandler::default();
-        let result = handler.run(&mut evm).ok()?;
+        let result = handler.run(evm);
+        *evm.ctx_mut().error() = Ok(());
         let state = evm.ctx_mut().journal_mut().finalize();
         let reads = std::mem::take(&mut evm.ctx_mut().db_mut().reads);
-        Some(crate::SpeculativeResult {
+        let result = match result {
+            Ok(result) => result,
+            Err(EVMError::Database(blocked)) if blocked.0 == Blocked::INVALID_CODE => {
+                return Ok(None);
+            }
+            Err(EVMError::Database(blocked)) => return Err(blocked),
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(crate::SpeculativeResult {
             transaction: tx,
             environment: env,
             parent_hash: B256::ZERO,
             output: ResultAndState { result, state },
             reads,
             fees: handler.fees.take(),
-        })
+        }))
     }
 
     fn register(&self, loc: Loc) {
@@ -727,7 +903,7 @@ impl Database for RecordingDb<'_> {
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         let code = self.store.code_by_hash_ref(code_hash).unwrap();
         if self.verify_code && code.hash_slow() != code_hash {
-            return Err(Blocked(0));
+            return Err(Blocked(Blocked::INVALID_CODE));
         }
         Ok(code)
     }
@@ -1019,11 +1195,24 @@ pub struct Schedule {
     pub window: Option<usize>,
 }
 
+/// Atomic execution phases shared by validator and builder scheduling.
+#[derive(Debug)]
+pub struct ExecutionStatus;
+
+impl ExecutionStatus {
+    /// Ready to execute, or an ESTIMATE of an invalidated incarnation.
+    pub const PENDING: u8 = 0;
+    /// Exclusively owned by one worker until final publication.
+    pub const EXECUTING: u8 = 1;
+    /// Published incarnation, including retired positions that no longer have writes.
+    pub const EXECUTED: u8 = 2;
+}
+
 type Config = BaseEvmFactory;
 
-const PENDING: u8 = 0;
-const EXECUTING: u8 = 1;
-const EXECUTED: u8 = 2;
+const PENDING: u8 = ExecutionStatus::PENDING;
+const EXECUTING: u8 = ExecutionStatus::EXECUTING;
+const EXECUTED: u8 = ExecutionStatus::EXECUTED;
 
 /// Commit-side state, only touched by the thread holding the commit role.
 #[derive(Debug, Default)]
@@ -1244,26 +1433,7 @@ impl Scheduler<'_> {
         self.reads.fetch_add(reads.len(), Ordering::Relaxed);
         // Merely touched accounts (every call target) keep the value the transaction read, so
         // publishing them would only make higher readers block on this transaction.
-        let unchanged = |address: &Address, info: &Option<AccountInfo>| {
-            reads.iter().any(|read| {
-                matches!(read, Read::Account(a, seen, read_balance)
-                    if a == address && *seen == info_key(info) && read_balance.seen == balance(info))
-            })
-        };
-        let writes =
-            state
-                .iter()
-                .filter(|(_, a)| a.is_touched())
-                .flat_map(|(address, account)| {
-                    let info = (!account.is_selfdestructed() && !account.is_empty())
-                        .then(|| account.info.clone());
-                    let account_write = (!unchanged(address, &info))
-                        .then(|| (Loc::Account(*address), Value::Account(info)));
-                    account_write.into_iter().chain(account.changed_storage_slots().map(
-                        |(slot, v)| (Loc::Slot(*address, *slot), Value::Slot(v.present_value)),
-                    ))
-                })
-                .collect();
+        let writes = MvMemory::candidate_writes(&state, &reads);
         Ok(Speculation { result, state, reads, writes, fees: handler.fees.take(), nanos })
     }
 

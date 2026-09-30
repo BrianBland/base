@@ -9,6 +9,8 @@ pub use base_common_genesis::BaseUpgrade;
 
 #[cfg(feature = "parallel")]
 mod speculator;
+#[cfg(all(test, feature = "parallel"))]
+pub use speculator::GatedDb;
 #[cfg(feature = "parallel")]
 pub use speculator::{
     Prediction, SpeculationJob, SpeculationParent, SpeculationSlot, SpeculativeResult, Speculator,
@@ -24,9 +26,9 @@ pub use parallel_balance::BalanceOpcodes;
 mod parallel;
 #[cfg(feature = "parallel")]
 pub use parallel::{
-    BalanceRead, Blocked, CriticalPath, LazyFeeHandler, Loc, MvMemory, ParallelDatabase,
-    ParallelOutcome, Read, Readers, RecordingDb, Schedule, Stats, StopOnUnwind, Store, TxOutcome,
-    TxTrace, Value, WorkSignal, Workers,
+    BalanceRead, Blocked, CriticalPath, ExecutionStatus, LazyFeeHandler, Loc, MvMemory,
+    ParallelDatabase, ParallelOutcome, Read, Readers, RecordingDb, Schedule, Stats, StopOnUnwind,
+    Store, TxOutcome, TxTrace, Value, WorkSignal, Workers,
 };
 
 #[cfg(feature = "parallel")]
