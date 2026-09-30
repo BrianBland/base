@@ -1,0 +1,81 @@
+Phase 1d evidence manifest
+
+Archives contain raw text logs, not fixture contents or executables. Extract each with tar -xzf.
+main/: full fixed-window performance matrix plus legacy and via-executor correctness gates.
+owner/: alternating before/after owner-cost ablation, five invocations per version.
+validation/: unit/build/lint/format checks, three expected red-first regressions, diagnostic
+  intermediate measurements, final-source forwarding-OFF/nonblocking correctness runs,
+  driver/load logs and final binary hash. Diagnostic and nonblocking timings are NOT the main matrix.
+
+Source boundaries:
+  Base: 311544766 (Phase 1c report/code).
+  Fault outcomes, duplicate snapshot reconciliation and counters: 2b9251c52.
+  Borrowed Store metadata, adjacent owner account reuse, cheap retirement: 5cde1c2f0.
+  Main measured source and AFTER owner-ablation binary: 5b9049f91.
+  BEFORE owner-ablation binary: release build preceding owner optimizations, equivalent to
+    2b9251c52 production code (tests/formatting do not affect that executable).
+  Final-source correctness checks also include 46a1afe3e's equivalent error conversion/formatting.
+  714589695 adds measurement documentation and the paired ablation script.
+  Archive environment.txt files record binary SHA256, immutable fixture SHA256, revision and load.
+  The main measured binary and later final-source validation binary hashes differ; do not conflate them.
+
+Main invocation (passed):
+  CARGO_TARGET_DIR=/Users/brianbland/code/scratch/target-spec4 cargo build --release -p base-parallel-evm-bench
+  MODE=full WAIT_SECS=300 ITERS=5 bash crates/infra/parallel-evm-bench/measure-builder-sim.sh \
+    /Users/brianbland/code/scratch/target-spec4/release/base-parallel-evm-bench \
+    /Users/brianbland/code/scratch /tmp/spec1d-measured
+  Every timed CLI invocation uses timeout 900. Six cohort invocations, each interleaving all
+  K32/128 x threads4/8/10 and ordered references for five iterations. No builds from this worktree
+  ran during measurement; unrelated shared-host activity was not controlled.
+  The supervisor approved one load gate per cohort invocation, rather than the requested internal
+  per-timed-arm gates. Threshold6, polling30s, capped300s. All main gates reached the threshold.
+  Fixtures were frozen before measuring. The original7 requested bursts and the additional
+  51961418 present at snapshot time are separately identified in BUILDER_SIM_RESULTS.md.
+
+Owner ablation (passed):
+  bash crates/infra/parallel-evm-bench/measure-owner-cost.sh /tmp/spec1d-owner-before \
+    /Users/brianbland/code/scratch/target-spec4/release/base-parallel-evm-bench \
+    /tmp/spec1d-measured/fixtures/dev /tmp/spec1d-owner
+  Alternates before/after order, five invocations of iters1, K128, threads4/8/10, clean.
+  Select the minimum sim_ms row per block/thread/version across the five files; retain that row's
+  counters. Load remained high (21.14-23.69 during samples); the gate cap was observed at302s.
+  The committed script clips the last poll sleep to remaining budget; recorded logs retain the
+  original full-poll behavior and its two-second overrun. Do not interpret small timings causally.
+
+Final validation commands (passed unless noted):
+  export CARGO_TARGET_DIR=/Users/brianbland/code/scratch/target-spec4
+  cargo test -p base-common-evm --features parallel
+    148 tests passed; one pre-existing doctest ignored.
+  cargo test -p base-common-evm --features parallel speculator::tests --lib
+    Repeated20 times: all16 tests passed each time, including cancellation and declined proposals.
+  cargo test -p base-parallel-evm-bench
+    Passed, zero tests in library/binary/doc targets.
+  cargo check -p base-common-evm --no-default-features
+  cargo check -p base-common-evm --features scheduler-watchdog
+  cargo clippy -p base-common-evm -p base-parallel-evm-bench --all-targets --features base-common-evm/parallel
+    Only pre-existing parallel_payload.rs:180 manual_is_multiple_of warning remains.
+  rustfmt --edition 2024 --check crates/common/evm/src/speculator.rs crates/common/evm/src/parallel.rs \
+    crates/common/evm/src/executor/block_executor.rs crates/infra/parallel-evm-bench/src/builder_sim.rs
+    Stable rustfmt warns about existing nightly-only configuration keys; final formatting passes.
+  bash -n crates/infra/parallel-evm-bench/measure-builder-sim.sh crates/infra/parallel-evm-bench/measure-owner-cost.sh
+  git diff --check
+  For each frozen dev/final/burst cohort, both faults0/.1:
+    timeout 900 $CARGO_TARGET_DIR/release/base-parallel-evm-bench builder-sim --data COHORT \
+      --threads 4,8 --k 32,128 --iters 1 --forwarding false --frontier-wait-ms 0 --inject-invalid FAULT
+    768 builder block-iterations, all included order, receipts and bundle/reverts equal.
+  The main script also passed bench --threads 1,2,4,8,10 --iters1 and
+    bench --via-executor --threads 1,4,8 --iters1 for all96 frozen blocks.
+
+Expected failures / corrected intermediate checks:
+  red-tests.log: retained-invalid-nonce and no-invalid-writes regressions failed before implementation.
+  red-duplicate.log: duplicate snapshot reuse failed before reconciliation fix (executions4 vs2).
+  Initial test invocation omitted --features parallel and selected zero speculator tests; rerun correctly.
+  Intermediate compilation exposed HashSet type inference and Database-vs-DatabaseRef wrapper mistakes;
+    both corrected before final validation. Initial fmt-check failed and was corrected.
+  No ignored doctest was enabled, no full internal per-arm/20-minute load gate was run, and no adaptive
+    K policy was implemented. The universal <=5% per-block fault slowdown goal remains unmet.
+
+Local immutable inputs/log originals:
+  /tmp/spec1d-measured/fixtures/{dev,final,burst}
+  /tmp/spec1d-measured, /tmp/spec1d-owner, /tmp/spec1d-logs
+  Fixture contents are roughly697MB and intentionally not committed. Hashes are in main/environment.txt.
