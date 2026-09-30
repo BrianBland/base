@@ -2,6 +2,7 @@
 
 use std::time::Instant;
 
+use alloy_consensus::TxReceipt;
 use alloy_eips::Typed2718;
 use base_common_consensus::BaseBlock;
 use base_common_evm::{
@@ -9,15 +10,43 @@ use base_common_evm::{
 };
 use base_execution_evm::BaseEvmConfig;
 use eyre::Result;
-use reth_evm::{ConfigureEvm, execute::BlockExecutor};
+use reth_evm::{
+    ConfigureEvm,
+    execute::{BlockExecutor, Executor},
+};
 use reth_primitives_traits::RecoveredBlock;
 use reth_revm::{State, db::states::bundle_state::BundleRetention};
+use revm::{DatabaseRef, database::BundleState};
 
 /// Executes a fixture's system calls and leading deposits before scheduling its suffix.
 #[derive(Debug)]
 pub struct BenchExecution;
 
 impl BenchExecution {
+    /// Canonical sequential reference, with exactly the legacy bench timing boundary.
+    pub fn sequential<DB: DatabaseRef<Error: Send + Sync + 'static> + std::fmt::Debug>(
+        config: &BaseEvmConfig,
+        db: DB,
+        block: &RecoveredBlock<BaseBlock>,
+    ) -> Result<(Vec<TxOutcome>, BundleState, u64)> {
+        let start = Instant::now();
+        let mut executor =
+            config.executor(State::builder().with_database_ref(db).with_bundle_update().build());
+        let result = executor.execute_one(block)?;
+        let nanos = start.elapsed().as_nanos() as u64;
+        let bundle = executor.into_state().take_bundle();
+        let txs = result
+            .receipts
+            .iter()
+            .map(|r| TxOutcome {
+                success: r.status(),
+                cumulative_gas: r.cumulative_gas_used(),
+                logs: r.logs().to_vec(),
+            })
+            .collect();
+        Ok((txs, bundle, nanos))
+    }
+
     /// Runs the shared engine over the non-deposit suffix of a block.
     pub fn execute(
         config: &BaseEvmConfig,

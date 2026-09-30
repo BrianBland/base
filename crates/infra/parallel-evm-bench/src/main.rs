@@ -6,21 +6,15 @@ use std::{
     time::Instant,
 };
 
-use alloy_consensus::{BlockHeader, TxReceipt};
+use alloy_consensus::BlockHeader;
 use alloy_primitives::logs_bloom;
-use base_common_consensus::BaseBlock;
 use base_execution_chainspec::BaseChainSpecBuilder;
 use base_execution_evm::BaseEvmConfig;
 use base_parallel_evm_bench::{
-    BenchExecution, BlockFixture, CriticalPath, PreDb, RpcRecorder, Schedule, Stats, Store,
-    TxOutcome, Workers,
+    BenchExecution, BlockFixture, CriticalPath, PreDb, RpcRecorder, Schedule, Stats, Store, Workers,
 };
 use clap::{Parser, Subcommand};
 use eyre::{Result, ensure};
-use reth_evm::{ConfigureEvm, execute::Executor};
-use reth_primitives_traits::RecoveredBlock;
-use reth_revm::{State, db::BundleState};
-use revm::DatabaseRef;
 
 #[derive(Parser)]
 struct Cli {
@@ -101,29 +95,6 @@ fn config() -> BaseEvmConfig {
     BaseEvmConfig::base(Arc::new(BaseChainSpecBuilder::base_mainnet().build()))
 }
 
-fn sequential<DB: DatabaseRef<Error: Send + Sync + 'static> + std::fmt::Debug>(
-    config: &BaseEvmConfig,
-    db: DB,
-    block: &RecoveredBlock<BaseBlock>,
-) -> Result<(Vec<TxOutcome>, BundleState, u64)> {
-    let start = Instant::now();
-    let mut executor =
-        config.executor(State::builder().with_database_ref(db).with_bundle_update().build());
-    let result = executor.execute_one(block)?;
-    let nanos = start.elapsed().as_nanos() as u64;
-    let bundle = executor.into_state().take_bundle();
-    let txs = result
-        .receipts
-        .iter()
-        .map(|r| TxOutcome {
-            success: r.status(),
-            cumulative_gas: r.cumulative_gas_used(),
-            logs: r.logs().to_vec(),
-        })
-        .collect();
-    Ok((txs, bundle, nanos))
-}
-
 fn fetch(rpc: &str, hint_rpc: Option<&str>, number: u64, out: &Path) -> Result<()> {
     let path = out.join(format!("{number}.json"));
     if path.exists() {
@@ -136,7 +107,7 @@ fn fetch(rpc: &str, hint_rpc: Option<&str>, number: u64, out: &Path) -> Result<(
     if let Some(hint_rpc) = hint_rpc {
         let hint = RpcRecorder::new(hint_rpc, number - 1)?;
         // Divergent values may fail execution; the keys touched so far are still useful.
-        let _ = sequential(&config(), &hint, &block);
+        let _ = BenchExecution::sequential(&config(), &hint, &block);
         let hint = hint.pre.into_inner().unwrap();
         let started = Instant::now();
         eprintln!(
@@ -147,7 +118,7 @@ fn fetch(rpc: &str, hint_rpc: Option<&str>, number: u64, out: &Path) -> Result<(
         recorder.prefetch(&hint)?;
         eprintln!("block {number}: prefetched in {:?}", started.elapsed());
     }
-    let (outcomes, _, _) = sequential(&config(), &recorder, &block)?;
+    let (outcomes, _, _) = BenchExecution::sequential(&config(), &recorder, &block)?;
     let gas = outcomes.last().map(|o| o.cumulative_gas).unwrap_or_default();
     let bloom = logs_bloom(outcomes.iter().flat_map(|o| o.logs.iter()));
     fixture.prestate = recorder.pre.into_inner().unwrap();
@@ -194,7 +165,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
         let fixture: BlockFixture = serde_json::from_slice(&std::fs::read(&file)?)?;
         let block = fixture.block()?;
         let pre = PreDb::new(&fixture.prestate);
-        let (expected, bundle, _) = sequential(&config, &pre, &block)?;
+        let (expected, bundle, _) = BenchExecution::sequential(&config, &pre, &block)?;
 
         // Correctness and dependency trace at every thread count before timing.
         let store = Store::new(&pre);
@@ -224,7 +195,7 @@ fn bench(data: &Path, threads: &[usize], iters: usize, schedule: Schedule) -> Re
         let mut par = vec![u64::MAX; threads.len()];
         let mut stats = vec![Stats::default(); threads.len()];
         for _ in 0..iters {
-            seq = seq.min(sequential(&config, &pre, &block)?.2);
+            seq = seq.min(BenchExecution::sequential(&config, &pre, &block)?.2);
             for (k, workers) in workers.iter().enumerate() {
                 let t = threads[k];
                 let store = Store::new(&pre);
@@ -385,7 +356,7 @@ fn main() -> Result<()> {
         Cmd::Receipts { file } => {
             let fixture: BlockFixture = serde_json::from_slice(&std::fs::read(&file)?)?;
             let pre = PreDb::new(&fixture.prestate);
-            let (txs, _, _) = sequential(&config(), &pre, &fixture.block()?)?;
+            let (txs, _, _) = BenchExecution::sequential(&config(), &pre, &fixture.block()?)?;
             for (i, tx) in txs.iter().enumerate() {
                 println!("{i} {} {}", tx.cumulative_gas, u8::from(tx.success));
             }

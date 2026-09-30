@@ -29,7 +29,7 @@ use revm::{
     state::EvmState,
 };
 
-use crate::{BlockFixture, PreDb};
+use crate::{BenchExecution, BlockFixture, PreDb, Schedule, Store, Workers};
 
 /// One simulation arm; workers are additional to the builder's owner thread.
 #[derive(Debug, Clone)]
@@ -264,21 +264,57 @@ impl BuilderSim {
                 arms.push((arm, Arc::new(workers)));
             }
         }
+        let reference_workers =
+            threads.iter().map(|&t| Workers::new(t)).collect::<Result<Vec<_>>>()?;
+        let mut reference_totals = vec![0u64; threads.len()];
+        let mut reference_seq_total = 0u64;
         let mut sequential = Vec::new();
         let mut timings = vec![Vec::new(); arms.len()];
         let mut totals = vec![(0usize, 0usize, 0usize, 0usize); arms.len()];
         println!(
-            "block,k,threads,forwarding,prewarm_ms,invalid,seq_ms,sim_ms,consumed,total,validation_failures,waste,included,not_ready,absent,invalidations,blocked,frontier_retries,timeouts,validation_ns,wait_ms,take_ns,submit_ns,inline_ns,inline_executions,commit_ns,owner_queue_wait_ns,worker_queue_wait_ns,worker_busy_ns,worker_idle_ns"
+            "block,k,threads,forwarding,prewarm_ms,invalid,seq_ms,sim_ms,consumed,total,validation_failures,waste,included,not_ready,absent,invalidations,blocked,frontier_retries,timeouts,validation_ns,wait_ms,take_ns,submit_ns,inline_ns,inline_executions,commit_ns,owner_queue_wait_ns,worker_queue_wait_ns,worker_busy_ns,worker_idle_ns,read_validation_ns,rebase_ns,validation_lookups,store_validation_ns,store_validation_reads,repair_ns,submit_clone_ns"
         );
         for file in files {
             let fixture: BlockFixture = serde_json::from_slice(&std::fs::read(file)?)?;
+            let block = fixture.block()?;
+            let pre = PreDb::new(&fixture.prestate);
+            let mut reference_seq = u64::MAX;
+            let mut reference_best = vec![u64::MAX; threads.len()];
             let mut seq = u64::MAX;
             let mut best: Vec<Option<BuilderObservation>> = (0..arms.len()).map(|_| None).collect();
             for iteration in 0..iters {
+                let load = std::process::Command::new("uptime").output()?;
+                println!(
+                    "# load block={} iteration={} {}",
+                    fixture.header.number,
+                    iteration,
+                    String::from_utf8_lossy(&load.stdout).trim()
+                );
+                let (expected, bundle, canonical_nanos) =
+                    BenchExecution::sequential(config, &pre, &block)?;
+                reference_seq = reference_seq.min(canonical_nanos);
                 let baseline = self.run(config, &fixture, None)?;
                 seq = seq.min(baseline.nanos);
-                for offset in 0..arms.len() {
-                    let index = (offset + iteration) % arms.len();
+                for offset in 0..arms.len() + threads.len() {
+                    let index = (offset + iteration) % (arms.len() + threads.len());
+                    if index >= arms.len() {
+                        let reference = index - arms.len();
+                        let store = Store::new(&pre);
+                        let started = Instant::now();
+                        let outcome = BenchExecution::execute(
+                            config,
+                            &block,
+                            &store,
+                            &reference_workers[reference],
+                            Schedule::default(),
+                            false,
+                        )?;
+                        let nanos = started.elapsed().as_nanos() as u64;
+                        ensure!(outcome.txs == expected, "ordered reference receipts differ");
+                        ensure!(store.diff(&bundle).is_empty(), "ordered reference state differs");
+                        reference_best[reference] = reference_best[reference].min(nanos);
+                        continue;
+                    }
                     let (arm, workers) = &arms[index];
                     let actual = arm.run(config, &fixture, Some(workers))?;
                     ensure!(
@@ -304,6 +340,18 @@ impl BuilderSim {
                     }
                 }
             }
+            reference_seq_total += reference_seq;
+            for (index, &nanos) in reference_best.iter().enumerate() {
+                reference_totals[index] += nanos;
+                println!(
+                    "# reference block={} threads={} seq_ms={:.3} ordered_ms={:.3} speedup={:.3}",
+                    fixture.header.number,
+                    threads[index],
+                    reference_seq as f64 / 1e6,
+                    nanos as f64 / 1e6,
+                    reference_seq as f64 / nanos as f64
+                );
+            }
             sequential.push(seq);
             for (index, best) in best.into_iter().enumerate() {
                 let best = best.unwrap();
@@ -316,7 +364,7 @@ impl BuilderSim {
                 totals[index].2 += stats.validation_failures;
                 totals[index].3 += waste;
                 println!(
-                    "{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                     fixture.header.number,
                     arm.window,
                     arm.threads,
@@ -346,9 +394,25 @@ impl BuilderSim {
                     stats.owner_queue_wait_nanos,
                     stats.worker_queue_wait_nanos,
                     stats.worker_busy_nanos,
-                    stats.worker_idle_nanos
+                    stats.worker_idle_nanos,
+                    stats.read_validation_nanos,
+                    stats.rebase_nanos,
+                    stats.validation_lookups,
+                    stats.store_validation_nanos,
+                    stats.store_validation_reads,
+                    stats.repair_nanos,
+                    stats.submit_clone_nanos
                 );
             }
+        }
+        for (index, &nanos) in reference_totals.iter().enumerate() {
+            println!(
+                "# reference-total threads={} seq_ms={:.3} ordered_ms={:.3} speedup={:.3}",
+                threads[index],
+                reference_seq_total as f64 / 1e6,
+                nanos as f64 / 1e6,
+                reference_seq_total as f64 / nanos as f64
+            );
         }
         for (index, (arm, _)) in arms.iter().enumerate() {
             let (hits, considered, failures, waste) = totals[index];
