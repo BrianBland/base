@@ -19,7 +19,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicU8, Ordering, fence},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -40,8 +40,8 @@ use revm::{
 };
 
 use crate::{
-    BaseEvmFactory, BaseHaltReason, BaseSpecId, BaseTransaction, ExecutionStatus, Loc, MvMemory,
-    ParallelDatabase, Read, RecordingDb, Store, Value,
+    AtomicSchedule, BaseEvmFactory, BaseHaltReason, BaseSpecId, BaseTransaction, ExecutionStatus,
+    Loc, MvMemory, ParallelDatabase, Read, RecordingDb, Store, Value, WorkSignal,
 };
 
 /// Recorded execution before committed-state validation and fee rebasing.
@@ -59,13 +59,24 @@ pub struct SpeculativeResult {
     pub reads: Vec<Read>,
     /// Deferred fee credits, including zero-valued touches.
     pub fees: Vec<(Address, U256)>,
+    /// Owner validation-only time, excluding rebase.
+    pub read_validation_nanos: u64,
+    /// Owner balance/storage/fee rebase time.
+    pub rebase_nanos: u64,
+    /// Owner database lookups made by validation.
+    pub validation_lookups: usize,
 }
 
 impl SpeculativeResult {
     /// Validates on the database's owner thread. A false result must be discarded.
     /// Call at most once: successful validation consumes the recorded balance/fee deltas.
     pub fn validate_and_rebase<DB: Database>(&mut self, db: &mut DB) -> Result<bool, DB::Error> {
+        let started = Instant::now();
         for read in &self.reads {
+            self.validation_lookups += match read {
+                Read::Account(..) => 1,
+                Read::Slot(..) => 2,
+            };
             let valid = match read {
                 Read::Account(address, seen, balance) => {
                     let now = db.basic(*address)?;
@@ -78,10 +89,14 @@ impl SpeculativeResult {
                 }
             };
             if !valid {
+                self.read_validation_nanos = started.elapsed().as_nanos() as u64;
                 return Ok(false);
             }
         }
+        self.read_validation_nanos = started.elapsed().as_nanos() as u64;
+        let started = Instant::now();
         Self::rebase(&mut self.output.state, &self.reads, &self.fees, db)?;
+        self.rebase_nanos = started.elapsed().as_nanos() as u64;
         Ok(true)
     }
 
@@ -132,7 +147,7 @@ impl SpeculativeResult {
     }
 }
 
-/// Immutable execution epoch. The provider factory runs on each worker, once per epoch.
+/// Immutable execution epoch. Workers reuse their own provider throughout the epoch.
 pub struct SpeculationParent {
     /// Parent identity, checked by the owning executor.
     pub hash: B256,
@@ -140,7 +155,8 @@ pub struct SpeculationParent {
     pub env: EvmEnv<BaseSpecId>,
     /// Production EVM configuration.
     pub factory: BaseEvmFactory,
-    /// Worker-local provider constructor; providers need not be Send.
+    /// Thread-local provider constructor; providers need not be Send.
+    /// Workers reuse one per epoch. A rare owner repair constructs its own reader.
     pub database: Arc<dyn Fn() -> Box<dyn ParallelDatabase> + Send + Sync>,
     overlay: Store<'static>,
 }
@@ -163,13 +179,9 @@ impl SpeculationParent {
         database: Arc<dyn Fn() -> Box<dyn ParallelDatabase> + Send + Sync>,
     ) -> Self {
         static EMPTY: OnceLock<EmptyDB> = OnceLock::new();
-        Self {
-            hash,
-            env,
-            factory,
-            database,
-            overlay: Store::new(EMPTY.get_or_init(EmptyDB::default)),
-        }
+        let mut overlay = Store::new(EMPTY.get_or_init(EmptyDB::default));
+        overlay.cache_parent_reads();
+        Self { hash, env, factory, database, overlay }
     }
 }
 
@@ -196,6 +208,20 @@ pub struct SpeculatorStats {
     pub timeouts: usize,
     /// Owner validation plus rebasing time in nanoseconds.
     pub validation_nanos: u64,
+    /// Owner-State validation-only nanoseconds.
+    pub read_validation_nanos: u64,
+    /// Owner-State rebase nanoseconds.
+    pub rebase_nanos: u64,
+    /// Owner-State validation database lookups.
+    pub validation_lookups: usize,
+    /// Store validation nanoseconds within take.
+    pub store_validation_nanos: u64,
+    /// Store validation observations checked.
+    pub store_validation_reads: usize,
+    /// Owner repair nanoseconds within take, including provider construction.
+    pub repair_nanos: u64,
+    /// Feeder transaction clone nanoseconds; results themselves are moved, not cloned.
+    pub submit_clone_nanos: u64,
     /// Owner time in take, including queue contention and bounded frontier waits.
     pub take_nanos: u64,
     /// Owner time feeding or replanning the prediction.
@@ -216,103 +242,122 @@ pub struct SpeculatorStats {
     pub worker_idle_nanos: u64,
 }
 
-/// One bounded, append-only generation of predicted positions.
+/// Worker counters do not contend with the builder's metadata lock.
+#[derive(Debug, Default)]
+pub struct SpeculationCounters {
+    executions: AtomicUsize,
+    blocked: AtomicUsize,
+    invalidations: AtomicUsize,
+    busy: AtomicU64,
+    idle: AtomicU64,
+}
+
+/// Fixed-capacity external-commit plan using the ordered engine's atomic claim protocol.
 #[derive(Debug)]
 pub struct Prediction {
     parent: Arc<SpeculationParent>,
     mv: MvMemory,
-    status: Vec<AtomicU8>,
+    core: AtomicSchedule,
+    slots: Vec<OnceLock<SpeculationJob>>,
+    tail: AtomicUsize,
+    requested: AtomicUsize,
+    stop: AtomicBool,
+    signal: WorkSignal,
+    counters: Arc<SpeculationCounters>,
 }
 
 impl Prediction {
     /// Minimum generation size, amortizing rollovers without unbounded reader bitsets.
     pub const MIN_CAPACITY: usize = 1024;
-    /// Number of initially submitted windows that fit before a larger generation rolls over.
+    /// Headroom for incremental submissions.
     pub const GENERATION_WINDOWS: usize = 4;
+
+    /// Invalidates readers after publication, removal or inline commit.
+    pub fn invalidate(&self, index: Option<usize>, changed: &[Loc]) {
+        fence(Ordering::SeqCst);
+        let first = self.core.frontier.load(Ordering::SeqCst);
+        let readers = index.map_or_else(
+            || self.mv.readers_from(first, changed),
+            |index| self.mv.affected_readers(index, changed),
+        );
+        for reader in readers {
+            if reader < first {
+                continue;
+            }
+            let job = self.slots[reader].get().unwrap();
+            if job.retired.load(Ordering::SeqCst) {
+                continue;
+            }
+            self.core.invalidate(reader);
+            if job.retired.load(Ordering::SeqCst) {
+                self.core.status[reader].store(ExecutionStatus::EXECUTED, Ordering::SeqCst);
+            }
+            self.counters.invalidations.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Removes speculative writes without applying a declined proposal.
+    pub fn retire(&self, index: usize) {
+        let job = self.slots[index].get().unwrap();
+        let mut slot = job.slot.lock().unwrap();
+        job.retired.store(true, Ordering::SeqCst);
+        self.mv.remove(index, &slot.writes);
+        self.invalidate(Some(index), &MvMemory::removed_locations(&slot.writes));
+        slot.result = None;
+        slot.writes.clear();
+        self.core.status[index].store(ExecutionStatus::EXECUTED, Ordering::SeqCst);
+        drop(slot);
+        self.advance();
+    }
+
+    /// Moves past retired positions; only the builder calls this.
+    pub fn advance(&self) {
+        let mut first = self.core.frontier.load(Ordering::SeqCst);
+        let tail = self.tail.load(Ordering::Acquire);
+        while first < tail && self.slots[first].get().unwrap().retired.load(Ordering::SeqCst) {
+            first += 1;
+        }
+        self.core.frontier.store(first, Ordering::SeqCst);
+        self.signal.notify_one();
+    }
 }
 
-/// Candidate identity and its stable predicted position.
+/// Immutable candidate identity and per-position publication ownership.
 #[derive(Debug)]
 pub struct SpeculationJob {
-    prediction: Arc<Prediction>,
     transaction: Recovered<BaseTxEnvelope>,
-    index: usize,
+    retired: AtomicBool,
+    delivered: AtomicBool,
+    slot: Mutex<SpeculationSlot>,
 }
 
-/// One prediction and its latest incarnation.
-#[derive(Debug)]
+/// Latest incarnation. Provider I/O never holds this publication lock.
+#[derive(Debug, Default)]
 pub struct SpeculationSlot {
-    job: Arc<SpeculationJob>,
     result: Option<SpeculativeResult>,
     writes: Vec<(Loc, Value)>,
     reads: Vec<Read>,
-    invalidations: usize,
-    waiting: Option<usize>,
-    delivered: bool,
 }
 
-/// Builder-controlled ordered scheduler. All publication and retirement holds this lock;
-/// EVM execution and provider reads never hold it.
+/// Builder metadata. Workers access it only when entering/leaving a generation.
 #[derive(Debug, Default)]
 pub struct SpeculatorQueue {
     parent: Option<Arc<SpeculationParent>>,
-    stats_parent: Option<Arc<SpeculationParent>>,
     prediction: Option<Arc<Prediction>>,
     order: VecDeque<B256>,
-    slots: HashMap<B256, SpeculationSlot>,
-    positions: Vec<Option<B256>>,
-    next: usize,
+    slots: HashMap<B256, usize>,
     requested: Option<B256>,
     stats: SpeculatorStats,
+    counters: Arc<SpeculationCounters>,
     active: usize,
     stopped: bool,
 }
 
 impl SpeculatorQueue {
-    /// Acquires the scheduler lock and measures contention separately from execution.
-    pub fn lock(
-        shared: &(Mutex<Self>, Condvar, Condvar),
-        worker: bool,
-    ) -> std::sync::MutexGuard<'_, Self> {
-        let started = Instant::now();
-        let mut queue = shared.0.lock().unwrap();
-        let elapsed = started.elapsed().as_nanos() as u64;
-        if worker {
-            queue.stats.worker_queue_wait_nanos += elapsed;
-        } else {
-            queue.stats.owner_queue_wait_nanos += elapsed;
-        }
-        queue
-    }
-
-    /// Marks registered higher readers pending, including incarnations currently executing.
-    pub fn invalidate(&mut self, prediction: &Prediction, index: usize, changed: &[Loc]) {
-        fence(Ordering::SeqCst);
-        for reader in prediction.mv.affected_readers(index, changed) {
-            if let Some(hash) = self.positions.get(reader).copied().flatten()
-                && let Some(slot) = self.slots.get_mut(&hash)
-            {
-                slot.invalidations += 1;
-                self.stats.invalidations += 1;
-                let _ = prediction.status[reader].compare_exchange(
-                    ExecutionStatus::EXECUTED,
-                    ExecutionStatus::PENDING,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                );
-                slot.waiting = None;
-            }
-        }
-    }
-
-    /// Retires a prediction without applying any of its state.
+    /// Retires a prediction without applying its state.
     pub fn remove(&mut self, hash: B256) {
-        if let Some(slot) = self.slots.remove(&hash) {
-            self.positions[slot.job.index] = None;
-            let prediction = &slot.job.prediction;
-            prediction.mv.remove(slot.job.index, &slot.writes);
-            prediction.status[slot.job.index].store(ExecutionStatus::EXECUTED, Ordering::SeqCst);
-            self.invalidate(prediction, slot.job.index, &MvMemory::removed_locations(&slot.writes));
+        if let Some(index) = self.slots.remove(&hash) {
+            self.prediction.as_ref().unwrap().retire(index);
         }
         self.order.retain(|item| *item != hash);
         if self.requested == Some(hash) {
@@ -320,18 +365,19 @@ impl SpeculatorQueue {
         }
     }
 
-    /// Discards a generation; late workers cannot publish into its replacement.
+    /// Cancels a generation; late workers cannot publish into its replacement.
     pub fn clear(&mut self) {
+        if let Some(prediction) = self.prediction.take() {
+            prediction.stop.store(true, Ordering::SeqCst);
+            prediction.signal.notify();
+        }
         self.slots.clear();
         self.order.clear();
-        self.positions.clear();
-        self.prediction = None;
         self.requested = None;
-        self.next = 0;
     }
 }
 
-/// Persistent ordered workers. The owner remains the only authority for admission and commit.
+/// Persistent ordered workers. Admission and Store commits belong exclusively to the builder.
 #[derive(Debug)]
 pub struct Speculator {
     shared: Arc<(Mutex<SpeculatorQueue>, Condvar, Condvar)>,
@@ -341,8 +387,10 @@ pub struct Speculator {
 }
 
 impl Speculator {
-    /// Maximum time one take waits for workers; a timeout permits ordinary inline execution.
+    /// Maximum worker wait; provider calls themselves must be bounded by the caller.
     pub const FRONTIER_WAIT: Duration = Duration::from_millis(10);
+    /// Cancellation polling interval after bounded owner spinning.
+    pub const FRONTIER_POLL: Duration = Duration::from_micros(20);
 
     /// Starts persistent workers. Zero threads is rejected.
     pub fn new(threads: usize, forwarding: bool) -> std::io::Result<Self> {
@@ -367,17 +415,16 @@ impl Speculator {
 
     /// Cancels outstanding predictions and installs a fresh immutable parent epoch.
     pub fn reset(&self, parent: SpeculationParent) {
-        let mut queue = SpeculatorQueue::lock(&self.shared, false);
+        let mut queue = self.shared.0.lock().unwrap();
         queue.clear();
         queue.stats = SpeculatorStats::default();
-        let parent = Arc::new(parent);
-        queue.stats_parent = Some(Arc::clone(&parent));
-        queue.parent = Some(parent);
+        queue.counters = Arc::default();
+        queue.parent = Some(Arc::new(parent));
         self.shared.1.notify_all();
         self.shared.2.notify_all();
     }
 
-    /// Starts the measured builder choice loop after its untimed prefix/prewarm.
+    /// Starts measurement after the untimed prefix/prewarm.
     pub fn reset_owner_timing(&self) {
         let mut queue = self.shared.0.lock().unwrap();
         queue.stats.take_nanos = 0;
@@ -385,10 +432,9 @@ impl Speculator {
         queue.stats.inline_nanos = 0;
         queue.stats.inline_executions = 0;
         queue.stats.commit_nanos = 0;
-        queue.stats.owner_queue_wait_nanos = 0;
     }
 
-    /// Records ordinary owner execution or commit time without changing engine state.
+    /// Records ordinary owner execution or commit time.
     pub fn record_owner_work(&self, inline: Option<Duration>, commit: Duration) {
         let mut queue = self.shared.0.lock().unwrap();
         if let Some(inline) = inline {
@@ -398,34 +444,41 @@ impl Speculator {
         queue.stats.commit_nanos += commit.as_nanos() as u64;
     }
 
-    /// Retains a matching suffix, removes skipped choices and appends newly visible candidates.
-    /// Reordering or exhausting the bounded generation starts a new advisory plan.
+    /// Retains the matching suffix, retires skipped choices and appends into free tail slots.
     pub fn submit(&self, candidates: &[Recovered<BaseTxEnvelope>]) {
         let started = Instant::now();
-        let mut queue = SpeculatorQueue::lock(&self.shared, false);
+        let mut queue = self.shared.0.lock().unwrap();
         let Some(parent) = queue.parent.clone() else { return };
-        let wanted: HashSet<_> = candidates.iter().map(|tx| tx.inner().tx_hash()).collect();
-        let removed: Vec<_> = queue.order.iter().copied().filter(|h| !wanted.contains(h)).collect();
-        for hash in removed {
-            queue.remove(hash);
+        let matching_suffix = queue.order.len() <= candidates.len()
+            && queue
+                .order
+                .iter()
+                .copied()
+                .eq(candidates.iter().take(queue.order.len()).map(|tx| tx.inner().tx_hash()));
+        if !matching_suffix {
+            let wanted: HashSet<_> = candidates.iter().map(|tx| tx.inner().tx_hash()).collect();
+            let removed: Vec<_> =
+                queue.order.iter().copied().filter(|h| !wanted.contains(h)).collect();
+            for hash in removed {
+                queue.remove(hash);
+            }
+            let retained: Vec<_> = candidates
+                .iter()
+                .map(|tx| tx.inner().tx_hash())
+                .filter(|hash| queue.slots.contains_key(hash))
+                .collect();
+            let append_only = candidates
+                .iter()
+                .take(retained.len())
+                .map(|tx| tx.inner().tx_hash())
+                .eq(retained.iter().copied());
+            if !append_only || !retained.iter().eq(queue.order.iter()) {
+                queue.clear();
+            }
         }
-        let retained: Vec<_> = candidates
-            .iter()
-            .map(|tx| tx.inner().tx_hash())
-            .filter(|hash| queue.slots.contains_key(hash))
-            .collect();
-        let append_only = candidates
-            .iter()
-            .take(retained.len())
-            .map(|tx| tx.inner().tx_hash())
-            .eq(retained.iter().copied());
-        if !append_only
-            || !retained.iter().eq(queue.order.iter())
-            || queue
-                .prediction
-                .as_ref()
-                .is_some_and(|p| queue.next + candidates.len() - retained.len() > p.status.len())
-        {
+        if queue.prediction.as_ref().is_some_and(|p| {
+            p.tail.load(Ordering::Relaxed) + candidates.len() - queue.order.len() > p.slots.len()
+        }) {
             queue.clear();
         }
         if queue.prediction.is_none() {
@@ -436,146 +489,218 @@ impl Speculator {
             queue.prediction = Some(Arc::new(Prediction {
                 parent,
                 mv: MvMemory::new(capacity),
-                status: (0..capacity).map(|_| AtomicU8::new(ExecutionStatus::PENDING)).collect(),
+                core: AtomicSchedule::new(capacity),
+                slots: (0..capacity).map(|_| OnceLock::new()).collect(),
+                tail: AtomicUsize::new(0),
+                requested: AtomicUsize::new(usize::MAX),
+                stop: AtomicBool::new(false),
+                signal: WorkSignal::default(),
+                counters: Arc::clone(&queue.counters),
             }));
+            self.shared.1.notify_all();
         }
         let prediction = Arc::clone(queue.prediction.as_ref().unwrap());
-        for transaction in candidates {
+        let retained = queue.order.len();
+        for transaction in &candidates[retained..] {
             let hash = transaction.inner().tx_hash();
             if queue.slots.contains_key(&hash) {
                 continue;
             }
-            let index = queue.next;
-            queue.next += 1;
-            let job = Arc::new(SpeculationJob {
-                prediction: Arc::clone(&prediction),
-                transaction: transaction.clone(),
-                index,
-            });
+            let index = prediction.tail.load(Ordering::Relaxed);
+            let clone_started = Instant::now();
+            let transaction = transaction.clone();
+            queue.stats.submit_clone_nanos += clone_started.elapsed().as_nanos() as u64;
+            prediction.slots[index]
+                .set(SpeculationJob {
+                    transaction,
+                    retired: AtomicBool::new(false),
+                    delivered: AtomicBool::new(false),
+                    slot: Mutex::default(),
+                })
+                .unwrap();
             queue.order.push_back(hash);
-            queue.positions.push(Some(hash));
-            queue.slots.insert(
-                hash,
-                SpeculationSlot {
-                    job,
-                    result: None,
-                    writes: Vec::new(),
-                    reads: Vec::new(),
-                    invalidations: 0,
-                    waiting: None,
-                    delivered: false,
-                },
-            );
+            queue.slots.insert(hash, index);
+            prediction.tail.store(index + 1, Ordering::Release);
+        }
+        if candidates.len() > retained {
+            prediction.signal.notify_one();
         }
         queue.stats.submit_nanos += started.elapsed().as_nanos() as u64;
-        drop(queue);
-        self.shared.1.notify_one();
-        self.shared.2.notify_all();
     }
 
-    /// Publishes the owner's actual commit, including fees, inline execution and system changes.
-    pub fn on_commit(&self, tx_hash: B256, state: &EvmState) {
-        let mut queue = SpeculatorQueue::lock(&self.shared, false);
-        if let Some(slot) = queue.slots.remove(&tx_hash) {
-            let prediction = &slot.job.prediction;
+    /// Applies only admitted owner state, including fees, inline and system changes.
+    pub fn on_commit(&self, hash: B256, state: &EvmState) {
+        let mut queue = self.shared.0.lock().unwrap();
+        let Some(parent) = &queue.parent else { return };
+        if let Some(&index) = queue.slots.get(&hash) {
+            let prediction = queue.prediction.as_ref().unwrap();
+            let job = prediction.slots[index].get().unwrap();
+            let mut slot = job.slot.lock().unwrap();
             let writes = MvMemory::candidate_writes(state, &slot.reads);
-            queue.positions[slot.job.index] = None;
-            let changed =
-                MvMemory::committed_locations(&prediction.parent.overlay, &writes, &slot.writes);
-            prediction.parent.overlay.apply_state(state, &[]);
-            prediction.mv.remove(slot.job.index, &slot.writes);
-            prediction.status[slot.job.index].store(ExecutionStatus::EXECUTED, Ordering::SeqCst);
-            queue.invalidate(prediction, slot.job.index, &changed);
-            queue.order.retain(|hash| *hash != tx_hash);
+            let changed = MvMemory::committed_locations(&parent.overlay, &writes, &slot.writes);
+            parent.overlay.apply_state(state, &[]);
+            job.retired.store(true, Ordering::SeqCst);
+            prediction.mv.remove(index, &slot.writes);
+            prediction.invalidate(Some(index), &changed);
+            slot.result = None;
+            slot.writes.clear();
+            prediction.core.status[index].store(ExecutionStatus::EXECUTED, Ordering::SeqCst);
+            drop(slot);
+            prediction.advance();
+            queue.slots.remove(&hash);
+            queue.order.retain(|item| *item != hash);
         } else {
-            if let Some(parent) = &queue.parent {
-                parent.overlay.apply_state(state, &[]);
-            }
-            for slot in queue.slots.values_mut() {
-                slot.invalidations += 1;
-                slot.waiting = None;
-                let _ = slot.job.prediction.status[slot.job.index].compare_exchange(
-                    ExecutionStatus::EXECUTED,
-                    ExecutionStatus::PENDING,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                );
+            let changed = MvMemory::committed_locations(
+                &parent.overlay,
+                &MvMemory::candidate_writes(state, &[]),
+                &[],
+            );
+            parent.overlay.apply_state(state, &[]);
+            if let Some(prediction) = &queue.prediction {
+                prediction.invalidate(None, &changed);
+                prediction.signal.notify_one();
             }
         }
         queue.requested = None;
-        drop(queue);
-        self.shared.1.notify_one();
-        self.shared.2.notify_all();
     }
 
-    /// Bounded, cancellation-aware extraction of the builder's chosen frontier.
-    /// Results must still pass owner-state validation; timeout and identity mismatch miss inline.
+    /// Waits for the frontier, checks Store and repairs invalid work locally.
+    /// Store is unchanged until on_commit; independent owner-State validation remains mandatory.
     pub fn take(&self, hash: B256, signer: Address) -> Option<SpeculativeResult> {
         let started = Instant::now();
-        let until = started + self.frontier_wait;
-        let mut queue = SpeculatorQueue::lock(&self.shared, false);
-        if queue.slots.get(&hash).is_none_or(|slot| slot.job.transaction.signer() != signer) {
-            queue.stats.take_nanos += started.elapsed().as_nanos() as u64;
-            queue.stats.absent += 1;
-            if let Some(previous) = queue.requested {
-                queue.remove(previous);
+        let (prediction, index) = {
+            let mut queue = self.shared.0.lock().unwrap();
+            let position = queue.slots.get(&hash).copied();
+            let matching = position.is_some_and(|index| {
+                queue.prediction.as_ref().unwrap().slots[index].get().unwrap().transaction.signer()
+                    == signer
+            });
+            if !matching {
+                queue.stats.absent += 1;
+                if let Some(previous) = queue.requested {
+                    queue.remove(previous);
+                }
+                return None;
             }
-            return None;
+            while queue.order.front().is_some_and(|front| *front != hash) {
+                let skipped = *queue.order.front().unwrap();
+                queue.remove(skipped);
+            }
+            queue.requested = Some(hash);
+            (Arc::clone(queue.prediction.as_ref().unwrap()), position.unwrap())
+        };
+        let job = prediction.slots[index].get().unwrap();
+        prediction.requested.store(index, Ordering::SeqCst);
+        prediction.core.waiting[index].store(usize::MAX, Ordering::SeqCst);
+        if job.delivered.swap(false, Ordering::SeqCst) {
+            prediction.core.status[index].store(ExecutionStatus::PENDING, Ordering::SeqCst);
         }
-        while queue.order.front().is_some_and(|front| *front != hash) {
-            let skipped = *queue.order.front().unwrap();
-            queue.remove(skipped);
+        if prediction.core.status[index].load(Ordering::SeqCst) != ExecutionStatus::EXECUTED {
+            prediction.signal.notify_one();
         }
-        let job = Arc::clone(&queue.slots[&hash].job);
-        if queue.slots[&hash].delivered {
-            queue.slots.get_mut(&hash).unwrap().delivered = false;
-            job.prediction.status[job.index].store(ExecutionStatus::PENDING, Ordering::SeqCst);
-        }
-        queue.requested = Some(hash);
-        queue.slots.get_mut(&hash).unwrap().waiting = None;
         let mut waited = false;
-        loop {
-            let slot = queue.slots.get_mut(&hash)?;
-            if !Arc::ptr_eq(&job, &slot.job) {
-                return None;
+        let mut spins = 0;
+        let mut result = None;
+        while !prediction.stop.load(Ordering::SeqCst) {
+            if prediction.core.status[index].load(Ordering::SeqCst) == ExecutionStatus::EXECUTED {
+                let mut slot = job.slot.lock().unwrap();
+                if prediction.core.status[index]
+                    .compare_exchange(
+                        ExecutionStatus::EXECUTED,
+                        ExecutionStatus::TAKEN,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                job.delivered.store(true, Ordering::SeqCst);
+                result = slot.result.take();
+                break;
             }
-            if job.prediction.status[job.index].load(Ordering::SeqCst) == ExecutionStatus::EXECUTED
-            {
-                slot.delivered = true;
-                let result = slot.result.take();
-                queue.stats.take_nanos += started.elapsed().as_nanos() as u64;
-                return result;
+            waited = true;
+            if started.elapsed() >= self.frontier_wait {
+                break;
             }
-            if !waited {
-                queue.stats.not_ready += 1;
-                waited = true;
-                self.shared.1.notify_one();
+            if spins < 16 {
+                spins += 1;
+                std::hint::spin_loop();
+            } else {
+                std::thread::park_timeout(Self::FRONTIER_POLL);
             }
-            let Some(remaining) = until.checked_duration_since(Instant::now()) else {
-                queue.stats.take_nanos += started.elapsed().as_nanos() as u64;
-                queue.stats.timeouts += 1;
-                return None;
-            };
-            queue = self.shared.2.wait_timeout(queue, remaining).unwrap().0;
         }
+        let validation_started = Instant::now();
+        let mut checked = 0;
+        let valid = result.as_ref().is_none_or(|result| {
+            result.reads.iter().all(|read| {
+                checked += 1;
+                prediction.parent.overlay.is_cached_current(read)
+            })
+        });
+        let validation_nanos = validation_started.elapsed().as_nanos() as u64;
+        let mut repair_nanos = 0;
+        if !valid && !prediction.stop.load(Ordering::SeqCst) {
+            let repair_started = Instant::now();
+            prediction.counters.executions.fetch_add(1, Ordering::Relaxed);
+            let pre = catch_unwind(AssertUnwindSafe(|| (prediction.parent.database)()));
+            result = pre.ok().and_then(|pre| {
+                let store = prediction.parent.overlay.fork(pre.as_ref());
+                self.shared.0.lock().unwrap().stats.frontier_retries += 1;
+                catch_unwind(AssertUnwindSafe(|| {
+                    let mut evm = RecordingDb::candidate_evm(
+                        &prediction.parent.factory,
+                        prediction.parent.env.clone(),
+                        &store,
+                    );
+                    RecordingDb::execute_reusing(
+                        &mut evm,
+                        prediction.parent.env.clone(),
+                        BaseTransaction::from_recovered_tx(job.transaction.inner(), signer),
+                        None,
+                        false,
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|mut result| {
+                        result.parent_hash = prediction.parent.hash;
+                        result
+                    })
+                }))
+                .ok()
+                .flatten()
+            });
+            repair_nanos = repair_started.elapsed().as_nanos() as u64;
+        }
+        let mut queue = self.shared.0.lock().unwrap();
+        queue.stats.store_validation_nanos += validation_nanos;
+        queue.stats.store_validation_reads += checked;
+        queue.stats.repair_nanos += repair_nanos;
+        queue.stats.not_ready += usize::from(waited);
+        queue.stats.timeouts +=
+            usize::from(waited && result.is_none() && started.elapsed() >= self.frontier_wait);
+        queue.stats.take_nanos += started.elapsed().as_nanos() as u64;
+        if prediction.stop.load(Ordering::SeqCst) { None } else { result }
     }
 
-    /// Schedules a failed owner validation for exact-prefix execution on the next idle worker.
+    /// Retries after independent owner-State validation rejects a proposal.
     pub fn retry(&self, hash: B256) {
-        let mut queue = SpeculatorQueue::lock(&self.shared, false);
-        if let Some(slot) = queue.slots.get_mut(&hash) {
+        let mut queue = self.shared.0.lock().unwrap();
+        if let Some(&index) = queue.slots.get(&hash) {
+            let prediction = queue.prediction.as_ref().unwrap();
+            let job = prediction.slots[index].get().unwrap();
+            let mut slot = job.slot.lock().unwrap();
             slot.result = None;
-            slot.delivered = false;
-            slot.waiting = None;
-            slot.job.prediction.status[slot.job.index]
-                .store(ExecutionStatus::PENDING, Ordering::SeqCst);
+            job.delivered.store(false, Ordering::SeqCst);
+            prediction.core.waiting[index].store(usize::MAX, Ordering::SeqCst);
+            prediction.core.status[index].store(ExecutionStatus::PENDING, Ordering::SeqCst);
+            prediction.signal.notify_one();
+            drop(slot);
             queue.stats.frontier_retries += 1;
-            drop(queue);
-            self.shared.1.notify_one();
         }
     }
 
-    /// Epoch identity and execution environment are part of every result's validity.
+    /// Epoch identity and environment are part of every result's validity.
     pub fn matches(&self, hash: B256, env: &EvmEnv<BaseSpecId>) -> bool {
         self.shared
             .0
@@ -586,222 +711,219 @@ impl Speculator {
             .is_some_and(|parent| parent.hash == hash && parent.env == *env)
     }
 
-    /// Records the consume-time validation decision.
-    pub fn record_validation(&self, valid: bool, elapsed: Duration) {
-        let mut queue = SpeculatorQueue::lock(&self.shared, false);
+    /// Records mandatory consume-time validation.
+    pub fn record_validation(&self, valid: bool, elapsed: Duration, result: &SpeculativeResult) {
+        let mut queue = self.shared.0.lock().unwrap();
         if valid {
             queue.stats.consumed += 1;
         } else {
             queue.stats.validation_failures += 1;
         }
         queue.stats.validation_nanos += elapsed.as_nanos() as u64;
+        queue.stats.read_validation_nanos += result.read_validation_nanos;
+        queue.stats.rebase_nanos += result.rebase_nanos;
+        queue.stats.validation_lookups += result.validation_lookups;
     }
 
-    /// Cancels without waiting for provider I/O; waiting owners wake immediately.
+    /// Cancels without waiting for provider I/O.
     pub fn cancel(&self) {
-        let mut queue = SpeculatorQueue::lock(&self.shared, false);
+        let mut queue = self.shared.0.lock().unwrap();
         queue.parent = None;
         queue.clear();
         self.shared.1.notify_all();
         self.shared.2.notify_all();
     }
 
-    /// Current epoch counters; execution counts become stable once idle.
+    /// Current epoch counters; worker counts settle after cancellation and wait_idle.
     pub fn stats(&self) -> SpeculatorStats {
-        self.shared.0.lock().unwrap().stats
-    }
-
-    /// Bounded diagnostic wait for scheduled executions to settle.
-    pub fn wait_idle(&self, timeout: Duration) -> bool {
-        let until = Instant::now() + timeout;
-        let mut queue = SpeculatorQueue::lock(&self.shared, false);
-        while queue.active != 0
-            || queue.slots.values().any(|slot| {
-                !slot.delivered
-                    && slot.job.prediction.status[slot.job.index].load(Ordering::SeqCst)
-                        != ExecutionStatus::EXECUTED
-            })
-        {
-            let Some(remaining) = until.checked_duration_since(Instant::now()) else {
-                return false;
-            };
-            queue = self.shared.2.wait_timeout(queue, remaining).unwrap().0;
+        let queue = self.shared.0.lock().unwrap();
+        SpeculatorStats {
+            executions: queue.counters.executions.load(Ordering::Relaxed),
+            blocked: queue.counters.blocked.load(Ordering::Relaxed),
+            invalidations: queue.counters.invalidations.load(Ordering::Relaxed),
+            worker_busy_nanos: queue.counters.busy.load(Ordering::Relaxed),
+            worker_idle_nanos: queue.counters.idle.load(Ordering::Relaxed),
+            ..queue.stats
         }
-        true
     }
 
-    /// Worker-side execution, forwarding, ESTIMATE blocking and incarnation invalidation.
+    /// Bounded diagnostic wait; never required for builder progress.
+    pub fn wait_idle(&self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        loop {
+            let queue = self.shared.0.lock().unwrap();
+            let idle = queue.prediction.as_ref().map_or(queue.active == 0, |p| {
+                p.stop.load(Ordering::SeqCst)
+                    || (0..p.tail.load(Ordering::Acquire)).all(|index| {
+                        let job = p.slots[index].get().unwrap();
+                        job.retired.load(Ordering::SeqCst)
+                            || job.delivered.load(Ordering::SeqCst)
+                            || p.core.status[index].load(Ordering::SeqCst)
+                                == ExecutionStatus::EXECUTED
+                    })
+            });
+            if idle {
+                return true;
+            }
+            drop(queue);
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    }
+
+    /// Persistent generation loop; factories and execution are panic-contained.
     pub fn work(shared: Arc<(Mutex<SpeculatorQueue>, Condvar, Condvar)>, forwarding: bool) {
         let mut provider: Option<(Arc<SpeculationParent>, Box<dyn ParallelDatabase>)> = None;
         loop {
             let prediction = {
-                let mut queue = SpeculatorQueue::lock(&shared, true);
-                while queue.prediction.is_none() && !queue.stopped {
+                let mut queue = shared.0.lock().unwrap();
+                while queue.prediction.as_ref().is_none_or(|p| p.stop.load(Ordering::SeqCst))
+                    && !queue.stopped
+                {
                     queue = shared.1.wait(queue).unwrap();
                 }
                 if queue.stopped {
                     return;
                 }
+                queue.active += 1;
                 Arc::clone(queue.prediction.as_ref().unwrap())
             };
-            let parent = &prediction.parent;
-            if provider.as_ref().is_none_or(|(epoch, _)| !Arc::ptr_eq(epoch, parent)) {
-                let created = catch_unwind(AssertUnwindSafe(|| (parent.database)()));
-                let Ok(database) = created else {
-                    let mut queue = SpeculatorQueue::lock(&shared, true);
-                    if queue.prediction.as_ref().is_some_and(|p| Arc::ptr_eq(p, &prediction)) {
-                        queue.clear();
-                    }
-                    shared.1.notify_all();
-                    shared.2.notify_all();
-                    continue;
-                };
-                provider = Some((Arc::clone(parent), database));
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                if provider
+                    .as_ref()
+                    .is_none_or(|(epoch, _)| !Arc::ptr_eq(epoch, &prediction.parent))
+                {
+                    provider =
+                        Some((Arc::clone(&prediction.parent), (prediction.parent.database)()));
+                }
+                Self::work_prediction(
+                    &prediction,
+                    provider.as_ref().unwrap().1.as_ref(),
+                    forwarding,
+                );
+            }));
+            if outcome.is_err() {
+                prediction.stop.store(true, Ordering::SeqCst);
+                prediction.signal.notify();
+                provider = None;
             }
-            Self::work_prediction(
-                &shared,
-                &prediction,
-                provider.as_ref().unwrap().1.as_ref(),
-                forwarding,
-            );
+            let mut queue = shared.0.lock().unwrap();
+            queue.active -= 1;
+            shared.2.notify_all();
         }
     }
 
-    /// Reuses one EVM and worker-local database across a bounded prediction generation.
-    pub fn work_prediction(
-        shared: &Arc<(Mutex<SpeculatorQueue>, Condvar, Condvar)>,
-        prediction: &Arc<Prediction>,
-        pre: &dyn ParallelDatabase,
-        forwarding: bool,
-    ) {
+    /// Lowest-PENDING CAS scan and per-slot publication, with reusable worker EVMs.
+    pub fn work_prediction(prediction: &Prediction, pre: &dyn ParallelDatabase, forwarding: bool) {
         let parent = &prediction.parent;
         let store = parent.overlay.fork(pre);
-        let mut evm = None;
-        loop {
-            let (job, seen, frontier, previous_result) = {
-                let mut queue = SpeculatorQueue::lock(shared, true);
-                loop {
-                    if queue.stopped
-                        || queue.prediction.as_ref().is_none_or(|p| !Arc::ptr_eq(p, prediction))
-                    {
-                        return;
-                    }
-                    let choice = queue.order.iter().find_map(|hash| {
-                        let slot = &queue.slots[hash];
-                        let status = &slot.job.prediction.status;
-                        (!slot.delivered
-                            && status[slot.job.index].load(Ordering::SeqCst)
-                                == ExecutionStatus::PENDING
-                            && slot.waiting.is_none_or(|dep| {
-                                status[dep].load(Ordering::SeqCst) == ExecutionStatus::EXECUTED
-                            }))
-                        .then_some(*hash)
-                    });
-                    if let Some(hash) = choice {
-                        let frontier = queue.requested == Some(hash);
-                        let slot = queue.slots.get_mut(&hash).unwrap();
-                        let job = Arc::clone(&slot.job);
-                        job.prediction.status[job.index]
-                            .store(ExecutionStatus::EXECUTING, Ordering::SeqCst);
-                        let seen = slot.invalidations;
-                        let result = slot.result.take();
-                        queue.active += 1;
-                        shared.1.notify_one();
-                        break (job, seen, frontier, result);
-                    }
-                    let idle_started = Instant::now();
-                    queue = shared.1.wait(queue).unwrap();
-                    if queue.prediction.as_ref().is_some_and(|p| Arc::ptr_eq(p, prediction)) {
-                        queue.stats.worker_idle_nanos += idle_started.elapsed().as_nanos() as u64;
-                    }
+        let mut evm = RecordingDb::candidate_evm(&parent.factory, parent.env.clone(), &store);
+        let mut scans = 0;
+        while !prediction.stop.load(Ordering::SeqCst) {
+            let generation = prediction.signal.generation();
+            let from = prediction.core.frontier.load(Ordering::SeqCst);
+            let to = prediction.tail.load(Ordering::Acquire);
+            let choice = (from..to).find(|&index| {
+                let job = prediction.slots[index].get().unwrap();
+                !job.retired.load(Ordering::SeqCst)
+                    && !job.delivered.load(Ordering::SeqCst)
+                    && prediction.core.claim(index)
+            });
+            let Some(index) = choice else {
+                let idle = Instant::now();
+                if scans < 8 {
+                    scans += 1;
+                    std::hint::spin_loop();
+                } else {
+                    prediction.signal.wait(generation, &prediction.stop);
+                    scans = 0;
                 }
+                prediction
+                    .counters
+                    .idle
+                    .fetch_add(idle.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                continue;
             };
-            let busy_started = Instant::now();
-            let mut executed = false;
-            let outcome = catch_unwind(AssertUnwindSafe(|| {
-                if let Some(result) = previous_result
-                    && job.prediction.mv.reads_visible(&store, job.index, &result.reads)
-                {
-                    return Ok(Some(result));
-                }
-                let forwarding = (forwarding && !frontier).then_some((
+            scans = 0;
+            prediction.signal.notify_one();
+            let job = prediction.slots[index].get().unwrap();
+            let seen = prediction.core.invalidations[index].load(Ordering::SeqCst);
+            let frontier = prediction.requested.load(Ordering::SeqCst) == index;
+            let previous = job.slot.lock().unwrap().result.take();
+            let busy = Instant::now();
+            let outcome = if let Some(result) =
+                previous.filter(|result| prediction.mv.reads_visible(&store, index, &result.reads))
+            {
+                Ok(Some(result))
+            } else {
+                prediction.counters.executions.fetch_add(1, Ordering::Relaxed);
+                let speculative = (forwarding && !frontier).then_some((
                     &prediction.mv,
-                    prediction.status.as_slice(),
-                    job.index,
+                    prediction.core.status.as_slice(),
+                    index,
                 ));
-                executed = true;
-                let evm = evm.get_or_insert_with(|| {
-                    RecordingDb::candidate_evm(&parent.factory, parent.env.clone(), &store)
-                });
-                let mut result = RecordingDb::execute_reusing(
-                    evm,
+                RecordingDb::execute_reusing(
+                    &mut evm,
                     parent.env.clone(),
                     BaseTransaction::from_recovered_tx(
                         job.transaction.inner(),
                         job.transaction.signer(),
                     ),
-                    forwarding,
+                    speculative,
                     !frontier,
-                )?;
-                if let Some(result) = &mut result {
-                    result.parent_hash = parent.hash;
-                }
-                Ok(result)
-            }))
-            .unwrap_or_else(|_| {
-                evm = None;
-                Ok(None)
-            });
-            let busy_nanos = busy_started.elapsed().as_nanos() as u64;
-            let mut queue = SpeculatorQueue::lock(shared, true);
-            queue.active -= 1;
-            if queue.stats_parent.as_ref().is_some_and(|p| Arc::ptr_eq(p, &job.prediction.parent)) {
-                queue.stats.executions += usize::from(executed);
-                queue.stats.worker_busy_nanos += busy_nanos;
-            }
-            let hash = job.transaction.inner().tx_hash();
-            if queue.slots.get(&hash).is_none_or(|slot| !Arc::ptr_eq(&slot.job, &job)) {
-                shared.2.notify_all();
+                )
+                .map(|result| {
+                    result.map(|mut result| {
+                        result.parent_hash = parent.hash;
+                        result
+                    })
+                })
+            };
+            prediction.counters.busy.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let affected = prediction.core.invalidations[index].load(Ordering::SeqCst) != seen
+                && outcome
+                    .as_ref()
+                    .ok()
+                    .and_then(|result| result.as_ref())
+                    .is_some_and(|r| !prediction.mv.reads_visible(&store, index, &r.reads));
+            let mut slot = job.slot.lock().unwrap();
+            if job.retired.load(Ordering::SeqCst) || prediction.stop.load(Ordering::SeqCst) {
                 continue;
             }
             match outcome {
                 Err(crate::Blocked(writer)) => {
-                    queue.stats.blocked += 1;
-                    queue.slots.get_mut(&hash).unwrap().waiting = Some(writer);
-                    job.prediction.status[job.index]
-                        .store(ExecutionStatus::PENDING, Ordering::SeqCst);
+                    prediction.counters.blocked.fetch_add(1, Ordering::Relaxed);
+                    prediction.core.waiting[index].store(writer, Ordering::SeqCst);
+                    prediction.core.status[index].store(ExecutionStatus::PENDING, Ordering::SeqCst);
                 }
                 Ok(result) => {
                     let writes = result
                         .as_ref()
                         .map(|r| MvMemory::candidate_writes(&r.output.state, &r.reads))
                         .unwrap_or_default();
-                    let slot = &queue.slots[&hash];
-                    let changed = if forwarding {
-                        job.prediction.mv.publish_observed(
-                            job.index,
+                    if forwarding {
+                        let changed = prediction.mv.publish_observed(
+                            index,
                             &writes,
                             &slot.writes,
                             result.as_ref().map_or(&[], |r| r.reads.as_slice()),
-                        )
-                    } else {
-                        Vec::new()
-                    };
-                    let affected = slot.invalidations != seen && result.is_some();
-                    queue.invalidate(&job.prediction, job.index, &changed);
-                    let slot = queue.slots.get_mut(&hash).unwrap();
+                        );
+                        prediction.invalidate(Some(index), &changed);
+                    }
                     slot.reads = result.as_ref().map(|r| r.reads.clone()).unwrap_or_default();
                     slot.result = result;
                     slot.writes = writes;
-                    slot.waiting = None;
-                    job.prediction.status[job.index].store(
+                    prediction.core.waiting[index].store(usize::MAX, Ordering::SeqCst);
+                    prediction.core.status[index].store(
                         if affected { ExecutionStatus::PENDING } else { ExecutionStatus::EXECUTED },
                         Ordering::SeqCst,
                     );
                 }
             }
-            drop(queue);
-            shared.2.notify_all();
+            drop(slot);
+            prediction.signal.notify_one();
         }
     }
 }
@@ -941,6 +1063,48 @@ mod tests {
                 Box::new(db)
             }),
         )
+    }
+
+    #[test]
+    fn take_rejects_a_nonce_invalid_at_the_committed_frontier() {
+        let workers = Speculator::new(2, true).unwrap();
+        workers.reset(parent());
+        let tx = transaction(10);
+        let mut sender = Account::from(AccountInfo {
+            balance: U256::from(1_000_000),
+            nonce: 1,
+            ..Default::default()
+        });
+        sender.mark_touch();
+        workers.on_commit(B256::ZERO, &EvmState::from_iter([(tx.signer(), sender)]));
+        workers.submit(std::slice::from_ref(&tx));
+        assert!(workers.wait_idle(Duration::from_secs(5)));
+        assert!(workers.take(tx.inner().tx_hash(), tx.signer()).is_none());
+    }
+
+    #[test]
+    fn declined_or_cancelled_proposals_never_enter_the_committed_store() {
+        for cancel in [false, true] {
+            let workers = Speculator::new(2, true).unwrap();
+            let epoch = parent();
+            let mut owner = CacheDB::new((epoch.database)());
+            workers.reset(epoch);
+            let first = transaction(10);
+            let second = transaction(20);
+            workers.submit(&[first.clone(), second.clone()]);
+            assert!(workers.wait_idle(Duration::from_secs(5)));
+            let proposal = workers.take(first.inner().tx_hash(), first.signer()).unwrap();
+            drop(proposal);
+            if cancel {
+                workers.cancel();
+                assert!(workers.take(second.inner().tx_hash(), second.signer()).is_none());
+                workers.reset(parent());
+            }
+            workers.submit(std::slice::from_ref(&second));
+            let mut proposal = workers.take(second.inner().tx_hash(), second.signer()).unwrap();
+            assert!(proposal.validate_and_rebase(&mut owner).unwrap());
+            assert_eq!(proposal.output.state[&second.signer()].info.balance, U256::from(999_980));
+        }
     }
 
     #[test]

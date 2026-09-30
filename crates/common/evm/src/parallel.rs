@@ -188,10 +188,18 @@ fn may_be_empty(info: &Option<AccountInfo>) -> bool {
     })
 }
 
+/// Immutable parent observations shared by worker-local readers and the external commit owner.
+#[derive(Debug, Default)]
+pub struct ParentReadCache {
+    accounts: DashMap<Address, Option<AccountInfo>, DefaultHashBuilder>,
+    storage: DashMap<(Address, U256), U256, DefaultHashBuilder>,
+}
+
 /// Committed state: the read-only pre-state plus an overlay of committed writes.
 #[derive(Debug)]
 pub struct Store<'a> {
     pre: &'a dyn ParallelDatabase,
+    parent_cache: Option<Arc<ParentReadCache>>,
     accounts: Arc<DashMap<Address, Option<AccountInfo>, DefaultHashBuilder>>,
     storage: Arc<DashMap<(Address, U256), U256, DefaultHashBuilder>>,
     cleared_storage: Arc<DashSet<Address, DefaultHashBuilder>>,
@@ -204,9 +212,36 @@ impl<'a> Store<'a> {
         Self {
             pre,
             accounts: Arc::default(),
+            parent_cache: None,
             storage: Arc::default(),
             cleared_storage: Arc::default(),
             codes: Arc::default(),
+        }
+    }
+
+    /// Retains immutable worker reads for owner-side validation without constructing a provider.
+    pub fn cache_parent_reads(&mut self) {
+        self.parent_cache = Some(Arc::default());
+    }
+
+    /// Checks only authentic cached/committed values. Missing parent observations fail closed.
+    pub fn is_cached_current(&self, read: &Read) -> bool {
+        match read {
+            Read::Account(address, seen, funds) => {
+                let now = self.accounts.get(address).map(|v| v.clone()).or_else(|| {
+                    self.parent_cache.as_ref()?.accounts.get(address).map(|v| v.clone())
+                });
+                now.is_some_and(|now| *seen == info_key(&now) && funds.admits(balance(&now)))
+            }
+            Read::Slot(address, key, seen) => {
+                let now = self.storage.get(&(*address, *key)).map(|v| *v).or_else(|| {
+                    if self.cleared_storage.contains(address) {
+                        return Some(U256::ZERO);
+                    }
+                    self.parent_cache.as_ref()?.storage.get(&(*address, *key)).map(|v| *v)
+                });
+                now == Some(*seen)
+            }
         }
     }
 
@@ -215,6 +250,7 @@ impl<'a> Store<'a> {
         Store {
             pre,
             accounts: Arc::clone(&self.accounts),
+            parent_cache: self.parent_cache.clone(),
             storage: Arc::clone(&self.storage),
             cleared_storage: Arc::clone(&self.cleared_storage),
             codes: Arc::clone(&self.codes),
@@ -225,6 +261,14 @@ impl<'a> Store<'a> {
     pub fn account(&self, address: Address) -> Option<AccountInfo> {
         if let Some(account) = self.accounts.get(&address) {
             return account.clone();
+        }
+        if let Some(cache) = &self.parent_cache {
+            if let Some(value) = cache.accounts.get(&address) {
+                return value.clone();
+            }
+            let value = self.pre.basic_ref(address).unwrap();
+            cache.accounts.insert(address, value.clone());
+            return value;
         }
         self.pre.basic_ref(address).unwrap()
     }
@@ -237,10 +281,19 @@ impl<'a> Store<'a> {
         if self.cleared_storage.contains(&address) {
             return U256::ZERO;
         }
+        if let Some(cache) = &self.parent_cache {
+            if let Some(value) = cache.storage.get(&(address, slot)) {
+                return *value;
+            }
+            let value = self.pre.storage_ref(address, slot).unwrap();
+            cache.storage.insert((address, slot), value);
+            return value;
+        }
         self.pre.storage_ref(address, slot).unwrap()
     }
 
-    fn is_current(&self, read: &Read) -> bool {
+    /// Whether a recorded observation admits the committed value.
+    pub fn is_current(&self, read: &Read) -> bool {
         match read {
             Read::Account(address, seen, balance) => match self.account(*address) {
                 Some(now) => {
@@ -434,10 +487,15 @@ impl Readers {
 
     /// Readers with an index above `tx`.
     pub fn above(&self, tx: usize) -> impl Iterator<Item = usize> + '_ {
-        self.0.iter().enumerate().skip(tx / 64).flat_map(move |(word, bits)| {
+        self.at_or_above(tx + 1)
+    }
+
+    /// Readers at or above an external commit frontier.
+    pub fn at_or_above(&self, first: usize) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().enumerate().skip(first / 64).flat_map(move |(word, bits)| {
             let mut bits = bits.load(Ordering::SeqCst);
-            if word == tx / 64 {
-                bits &= !0 << (tx % 64) << 1;
+            if word == first / 64 {
+                bits &= !0 << (first % 64);
             }
             std::iter::from_fn(move || {
                 (bits != 0).then(|| {
@@ -456,7 +514,7 @@ impl MvMemory {
         Self { writes: DashMap::default(), readers: DashMap::default(), txs }
     }
 
-    /// Publishes without provider I/O while the builder scheduler holds its queue lock.
+    /// Publishes without provider I/O while the builder holds this position's publication lock.
     /// Recorded observations supply the baseline for first writes; missing observations cause
     /// conservative invalidation instead of inventing committed state.
     pub fn publish_observed(
@@ -532,6 +590,19 @@ impl MvMemory {
             .iter()
             .flat_map(|loc| {
                 self.readers.get(loc).map(|r| r.above(tx).collect::<Vec<_>>()).unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Registered readers affected by an unpredicted commit before the frontier.
+    pub fn readers_from(&self, first: usize, changed: &[Loc]) -> Vec<usize> {
+        changed
+            .iter()
+            .flat_map(|loc| {
+                self.readers
+                    .get(loc)
+                    .map(|r| r.at_or_above(first).collect::<Vec<_>>())
+                    .unwrap_or_default()
             })
             .collect()
     }
@@ -796,6 +867,9 @@ impl RecordingDb<'_> {
             Err(_) => return Ok(None),
         };
         Ok(Some(crate::SpeculativeResult {
+            read_validation_nanos: 0,
+            rebase_nanos: 0,
+            validation_lookups: 0,
             transaction: tx,
             environment: env,
             parent_hash: B256::ZERO,
@@ -1206,6 +1280,52 @@ impl ExecutionStatus {
     pub const EXECUTING: u8 = 1;
     /// Published incarnation, including retired positions that no longer have writes.
     pub const EXECUTED: u8 = 2;
+    /// External owner holds a proposal pending its admission decision.
+    pub const TAKEN: u8 = 3;
+}
+
+/// Shared lock-free claim and invalidation state for ordered and external-commit execution.
+#[derive(Debug)]
+pub struct AtomicSchedule {
+    /// Per-position execution phase.
+    pub status: Vec<AtomicU8>,
+    /// Lower publications observed while an incarnation executes.
+    pub invalidations: Vec<AtomicU64>,
+    /// ESTIMATE dependency, or usize::MAX when runnable.
+    pub waiting: Vec<AtomicUsize>,
+    /// First uncommitted position.
+    pub frontier: AtomicUsize,
+}
+
+impl AtomicSchedule {
+    /// Allocates a fixed-capacity plan. Uninitialized tail positions must not be scanned.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            status: (0..capacity).map(|_| AtomicU8::new(PENDING)).collect(),
+            invalidations: (0..capacity).map(|_| AtomicU64::new(0)).collect(),
+            waiting: (0..capacity).map(|_| AtomicUsize::new(usize::MAX)).collect(),
+            frontier: AtomicUsize::new(0),
+        }
+    }
+
+    /// Exclusively claims a pending position whose ESTIMATE dependency has completed.
+    pub fn claim(&self, tx: usize) -> bool {
+        let waiting = self.waiting[tx].load(Ordering::SeqCst);
+        if waiting != usize::MAX && self.status[waiting].load(Ordering::SeqCst) != EXECUTED {
+            return false;
+        }
+        self.status[tx]
+            .compare_exchange(PENDING, EXECUTING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Marks an incarnation stale; final committed-value validation remains mandatory.
+    pub fn invalidate(&self, tx: usize) -> bool {
+        self.invalidations[tx].fetch_add(1, Ordering::SeqCst);
+        self.status[tx]
+            .compare_exchange(EXECUTED, PENDING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
 }
 
 type Config = BaseEvmFactory;
@@ -1235,30 +1355,47 @@ struct Committed {
 /// Generation-based notification; sampling before searching prevents lost wakeups.
 #[derive(Debug, Default)]
 pub struct WorkSignal {
-    generation: Mutex<u64>,
+    generation: AtomicU64,
+    sleepers: AtomicUsize,
+    sleep_lock: Mutex<()>,
     changed: Condvar,
 }
 
 impl WorkSignal {
     /// Captures the generation before looking for runnable work.
     pub fn generation(&self) -> u64 {
-        *self.generation.lock().unwrap()
+        self.generation.load(Ordering::SeqCst)
     }
 
     /// Notifies waiters after publishing work or stopping the scheduler.
     pub fn notify(&self) {
-        *self.generation.lock().unwrap() += 1;
-        self.changed.notify_all();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if self.sleepers.load(Ordering::SeqCst) != 0 {
+            let _guard = self.sleep_lock.lock().unwrap();
+            self.changed.notify_all();
+        }
+    }
+
+    /// Wakes one worker; a successful claim can chain the wake to another sleeper.
+    pub fn notify_one(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if self.sleepers.load(Ordering::SeqCst) != 0 {
+            let _guard = self.sleep_lock.lock().unwrap();
+            self.changed.notify_one();
+        }
     }
 
     /// Sleeps unless a publisher has already advanced the generation.
     pub fn wait(&self, observed: u64, stop: &AtomicBool) {
+        let guard = self.sleep_lock.lock().unwrap();
+        self.sleepers.fetch_add(1, Ordering::SeqCst);
         let _guard = self
             .changed
-            .wait_while(self.generation.lock().unwrap(), |generation| {
-                *generation == observed && !stop.load(Ordering::Relaxed)
+            .wait_while(guard, |_| {
+                self.generation.load(Ordering::SeqCst) == observed && !stop.load(Ordering::Relaxed)
             })
             .unwrap();
+        self.sleepers.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1292,16 +1429,11 @@ struct Scheduler<'a> {
     /// Transaction environments, built by the first execution of each transaction so workers
     /// build them in parallel instead of serially before execution starts.
     txs: Vec<OnceLock<BaseTransaction<TxEnv>>>,
-    status: Vec<AtomicU8>,
-    invalidations: Vec<AtomicU64>,
-    /// Transaction each one last blocked on (`usize::MAX` = none).
-    waiting: Vec<AtomicUsize>,
+    core: AtomicSchedule,
     /// Previous transaction from the same sender when [`Schedule::sender_gate`] is set: its nonce
     /// and balance changes are known dependencies, so speculating before it executes is wasted.
     sender_prev: Vec<Option<usize>>,
     slots: Vec<Mutex<Option<Speculation>>>,
-    /// Lowest uncommitted transaction.
-    frontier: AtomicUsize,
     stop: AtomicBool,
     signal: WorkSignal,
     idle_waits: AtomicUsize,
@@ -1333,6 +1465,14 @@ struct Scheduler<'a> {
 /// An EVM owned by one thread and reused for every execution it runs, as the sequential executor
 /// reuses one EVM for a whole block. The balance-recording opcodes are installed once.
 type WorkerEvm<'a> = BaseEvm<RecordingDb<'a>, NoOpInspector>;
+
+impl std::ops::Deref for Scheduler<'_> {
+    type Target = AtomicSchedule;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
 
 impl Scheduler<'_> {
     #[cfg(feature = "scheduler-watchdog")]
@@ -1504,33 +1644,21 @@ impl Scheduler<'_> {
         for loc in changed {
             if let Some(readers) = self.mv.readers.get(&loc) {
                 for reader in readers.above(tx) {
-                    self.invalidations[reader].fetch_add(1, Ordering::SeqCst);
-                    self.invalidate(reader);
+                    if self.core.invalidate(reader) {
+                        self.invalidated.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
     }
 
-    fn invalidate(&self, tx: usize) {
-        if self.status[tx]
-            .compare_exchange(EXECUTED, PENDING, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            self.invalidated.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     fn claim(&self, tx: usize) -> bool {
-        let executed = |dep: usize| self.status[dep].load(Ordering::SeqCst) == EXECUTED;
-        let waiting = self.waiting[tx].load(Ordering::SeqCst);
-        if (waiting != usize::MAX && !executed(waiting))
-            || self.sender_prev[tx].is_some_and(|dep| !executed(dep))
+        if self.sender_prev[tx]
+            .is_some_and(|dep| self.status[dep].load(Ordering::SeqCst) != EXECUTED)
         {
             return false;
         }
-        self.status[tx]
-            .compare_exchange(PENDING, EXECUTING, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+        self.core.claim(tx)
     }
 
     /// Executes the lowest pending transaction within the window above the commit frontier, if
@@ -1810,12 +1938,9 @@ impl ParallelOutcome {
             mv: &mv,
             transactions,
             txs: (0..n).map(|_| OnceLock::new()).collect(),
-            status: (0..n).map(|_| AtomicU8::new(PENDING)).collect(),
-            invalidations: (0..n).map(|_| AtomicU64::new(0)).collect(),
-            waiting: (0..n).map(|_| AtomicUsize::new(usize::MAX)).collect(),
+            core: AtomicSchedule::new(n),
             sender_prev,
             slots: (0..n).map(|_| Mutex::new(None)).collect(),
-            frontier: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
             signal: WorkSignal::default(),
             idle_waits: AtomicUsize::new(0),
@@ -2024,14 +2149,16 @@ mod tests {
                     })
                 })
                 .collect(),
-            status: [PENDING, PENDING, EXECUTING].map(AtomicU8::new).into(),
-            invalidations: (0..3).map(|_| AtomicU64::new(0)).collect(),
-            waiting: [usize::MAX, usize::MAX, if sender_gate { usize::MAX } else { 1 }]
-                .map(AtomicUsize::new)
-                .into(),
+            core: AtomicSchedule {
+                status: [PENDING, PENDING, EXECUTING].map(AtomicU8::new).into(),
+                invalidations: (0..3).map(|_| AtomicU64::new(0)).collect(),
+                waiting: [usize::MAX, usize::MAX, if sender_gate { usize::MAX } else { 1 }]
+                    .map(AtomicUsize::new)
+                    .into(),
+                frontier: AtomicUsize::new(0),
+            },
             sender_prev: vec![None, None, sender_gate.then_some(1)],
             slots: (0..3).map(|_| Mutex::new(None)).collect(),
-            frontier: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
             signal: WorkSignal::default(),
             idle_waits: AtomicUsize::new(0),

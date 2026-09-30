@@ -1,4 +1,4 @@
-# Builder speculation contract (Phase 1b)
+# Builder speculation contract (Phase 1c)
 
 The basic builder alone selects and orders transactions. A speculator predicts work, never
 admission. `take` has a configurable frontier wait budget (10 ms by default), waking on reset
@@ -8,6 +8,9 @@ is wired. Engine invalidation is only a scheduling hint; owner validation is nev
 
 Each parent epoch fixes the EVM factory, environment and immutable parent database factory.
 Workers own their providers. Reset/cancel prevents results from an earlier epoch escaping.
+Authentic immutable parent account/storage reads are cached separately from committed writes;
+take validates this cache without constructing a provider. Cache misses fail closed into repair,
+which constructs an owner-local provider. The factory must also support that rare owner call.
 Submit retains a matching ordered suffix and appends new candidates to its plan. Skips remove
 speculative writes and invalidate readers; reordered plans start a new generation. A bounded
 generation has max(1024, 4 × initial-window-length) indices and rolls over when full, retaining
@@ -16,7 +19,8 @@ Workers forward writes, invalidate affected readers and block on ESTIMATE depend
 The builder alone advances the committed prefix through on_commit, including inline execution,
 fees and system changes. A returned result is only a proposal: a later choice without a commit
 discards its writes. An unpredicted choice executes inline and preserves the remaining plan.
-At most one failed consume validation is retried on a worker at the exact committed prefix;
+Store validation first repairs stale frontier work on the owner using an exact-prefix reader.
+At most one subsequent failed owner-State validation is retried on a worker at the exact prefix;
 a second failure or a wait timeout executes inline. Each take gets its own bounded wait budget.
 
 Consumption on the owner thread checks transaction identity, environment, every account
@@ -38,13 +42,18 @@ facade; integrating fallible providers needs an error-poisoning facade, not defa
 that could be mistaken for authentic state. Providers are constructed/used on their worker and
 need not be Send. cancel is nonblocking; Drop joins in-flight work, so provider I/O must be bounded.
 
-The builder queue reuses the validator's MvMemory, status phases, recorded observations, balance
-opcodes and write extraction. It does not instantiate the immutable, auto-committing Scheduler:
-the builder controls retirement, supports append/removal, and never accepts engine-side commits.
-Workers reuse an EVM within a generation and one base reader per parent epoch. Publication,
-removal and invalidation are serialized under the queue mutex; no provider reads hold that mutex.
-Actual committed state (including deferred fees and system changes) updates Store. Concurrent
-speculative reads may see mixed Store writes; the mandatory owner-State gate catches these too.
+Both execution modes share AtomicSchedule: per-position phases, invalidation counters, dependency
+waits and compare/exchange claims. Builder plans have a fixed-capacity append-only slot array;
+workers scan the lowest pending position and publish under that position's lock, never the owner
+queue lock. Retiring a running slot prevents late publication without waiting for provider I/O.
+Workers retain their base reader per epoch and reuse an EVM per generation. Panic/stop wakes waiters.
+
+`take` checks recorded values against Store and repairs invalid frontier work on the owner.
+It does NOT apply state: a builder commit-condition can still decline the proposal. Only
+`on_commit` applies the owner's admitted, fee-rebased state and advances the frontier. A later
+choice or submit removes a declined proposal's writes and invalidates readers without changing
+Store; cancellation discards every uncommitted proposal. Mandatory owner-State validation remains
+independent of this Store check. Unpredicted commits invalidate readers after a publication fence.
 Feeder calls/take/on_commit belong to one owner; cancellation/reset may come from another thread.
 
 Tests must exercise stale nonce/storage rejection, admitted balance drift and fee rebasing,

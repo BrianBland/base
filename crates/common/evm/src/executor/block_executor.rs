@@ -332,7 +332,7 @@ where
                         .is_some_and(|tx| *tx == candidate.transaction);
                 let valid = identity_matches
                     && candidate.validate_and_rebase(self.evm.db_mut()).unwrap_or(false);
-                speculator.record_validation(valid, validation_started.elapsed());
+                speculator.record_validation(valid, validation_started.elapsed(), &candidate);
                 if valid {
                     output = crate::ParallelTransaction {
                         hash: tx.tx().trie_hash(),
