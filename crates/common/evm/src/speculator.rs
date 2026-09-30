@@ -220,7 +220,7 @@ pub struct SpeculatorStats {
     pub store_validation_reads: usize,
     /// Owner repair nanoseconds within take, including provider construction.
     pub repair_nanos: u64,
-    /// Feeder transaction clone nanoseconds; results themselves are moved, not cloned.
+    /// Epoch-wide feeder clone nanoseconds, including initial prewarm; results move, never clone.
     pub submit_clone_nanos: u64,
     /// Owner time in take, including queue contention and bounded frontier waits.
     pub take_nanos: u64,
