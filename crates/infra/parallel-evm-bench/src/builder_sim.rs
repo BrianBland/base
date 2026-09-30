@@ -5,7 +5,13 @@
 //! predicates, wall-clock deadlines and resource-metering policy are deliberately not simulated.
 //! Both arms receive identical choices and skip invalid transactions and their nonce descendants.
 
-use crate::{BlockFixture, PreDb};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
 use alloy_consensus::{SignableTransaction, Transaction, TxLegacy, transaction::Recovered};
 use alloy_eips::{Encodable2718, Typed2718};
 use alloy_evm::{
@@ -22,12 +28,8 @@ use revm::{
     database::{BundleState, State, states::bundle_state::BundleRetention},
     state::EvmState,
 };
-use std::{
-    collections::HashSet,
-    path::Path,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+
+use crate::{BlockFixture, PreDb};
 
 /// One simulation arm; workers are additional to the builder's owner thread.
 #[derive(Debug, Clone)]
@@ -40,6 +42,8 @@ pub struct BuilderSim {
     pub forwarding: bool,
     /// Untimed pre-execution before entering the choice loop.
     pub idle_prewarm_ms: u64,
+    /// Maximum bounded frontier wait; zero benchmarks inline fallback.
+    pub frontier_wait_ms: u64,
     /// Deterministic invalid nonce fraction in [0, 1].
     pub inject_invalid: f64,
     /// Optional compressed transaction byte ceiling.
@@ -150,12 +154,24 @@ impl BuilderSim {
         }
         let mut rejected = HashSet::new();
         let mut da_bytes = 0u64;
+        if let Some(workers) = workers {
+            workers.reset_owner_timing();
+        }
         let started = Instant::now();
         for (index, tx) in candidates.iter().enumerate().skip(prefix) {
             if let Some(workers) = workers {
-                workers.submit(
-                    &candidates[index..candidates.len().min(index.saturating_add(self.window))],
-                );
+                let window =
+                    &candidates[index..candidates.len().min(index.saturating_add(self.window))];
+                if rejected.is_empty() {
+                    workers.submit(window);
+                } else {
+                    let visible: Vec<_> = window
+                        .iter()
+                        .filter(|tx| !rejected.contains(&tx.signer()))
+                        .cloned()
+                        .collect();
+                    workers.submit(&visible);
+                }
             }
             if rejected.contains(&tx.signer()) {
                 continue;
@@ -165,9 +181,6 @@ impl BuilderSim {
                 || self.block_da_limit.is_some_and(|limit| da_bytes.saturating_add(size) > limit)
             {
                 rejected.insert(tx.signer());
-                if let Some(workers) = workers {
-                    workers.submit(&[]);
-                }
                 continue;
             }
             match executor.execute_transaction_without_commit(tx) {
@@ -183,9 +196,6 @@ impl BuilderSim {
                     if !error.is_nonce_too_low() {
                         rejected.insert(tx.signer());
                     }
-                    if let Some(workers) = workers {
-                        workers.submit(&[]);
-                    }
                 }
                 Err(BlockExecutionError::Validation(error))
                     if matches!(
@@ -196,9 +206,6 @@ impl BuilderSim {
                                 Some(base_common_evm::BaseBlockExecutionError::TransactionDaFootprintAboveGasLimit { .. }))) =>
                 {
                     rejected.insert(tx.signer());
-                    if let Some(workers) = workers {
-                        workers.submit(&[]);
-                    }
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -252,14 +259,16 @@ impl BuilderSim {
         for &window in windows {
             for &threads in threads {
                 let arm = Self { window, threads, ..self.clone() };
-                arms.push((arm, Arc::new(Speculator::new(threads, self.forwarding)?)));
+                let mut workers = Speculator::new(threads, self.forwarding)?;
+                workers.frontier_wait = Duration::from_millis(self.frontier_wait_ms);
+                arms.push((arm, Arc::new(workers)));
             }
         }
         let mut sequential = Vec::new();
         let mut timings = vec![Vec::new(); arms.len()];
         let mut totals = vec![(0usize, 0usize, 0usize, 0usize); arms.len()];
         println!(
-"block,k,threads,forwarding,prewarm_ms,invalid,seq_ms,sim_ms,consumed,total,validation_failures,waste,included,not_ready,absent"
+            "block,k,threads,forwarding,prewarm_ms,invalid,seq_ms,sim_ms,consumed,total,validation_failures,waste,included,not_ready,absent,invalidations,blocked,frontier_retries,timeouts,validation_ns,wait_ms,take_ns,submit_ns,inline_ns,inline_executions,commit_ns,owner_queue_wait_ns,worker_queue_wait_ns,worker_busy_ns,worker_idle_ns"
         );
         for file in files {
             let fixture: BlockFixture = serde_json::from_slice(&std::fs::read(file)?)?;
@@ -307,7 +316,7 @@ impl BuilderSim {
                 totals[index].2 += stats.validation_failures;
                 totals[index].3 += waste;
                 println!(
-"{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                     fixture.header.number,
                     arm.window,
                     arm.threads,
@@ -320,9 +329,24 @@ impl BuilderSim {
                     best.considered,
                     stats.validation_failures,
                     waste,
-best.included.len(),
-stats.not_ready,
-stats.absent
+                    best.included.len(),
+                    stats.not_ready,
+                    stats.absent,
+                    stats.invalidations,
+                    stats.blocked,
+                    stats.frontier_retries,
+                    stats.timeouts,
+                    stats.validation_nanos,
+                    arm.frontier_wait_ms,
+                    stats.take_nanos,
+                    stats.submit_nanos,
+                    stats.inline_nanos,
+                    stats.inline_executions,
+                    stats.commit_nanos,
+                    stats.owner_queue_wait_nanos,
+                    stats.worker_queue_wait_nanos,
+                    stats.worker_busy_nanos,
+                    stats.worker_idle_nanos
                 );
             }
         }

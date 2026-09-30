@@ -44,6 +44,8 @@ enum Cmd {
         forwarding: bool,
         #[arg(long, default_value_t = 0)]
         idle_prewarm_ms: u64,
+        #[arg(long, default_value_t = 10)]
+        frontier_wait_ms: u64,
         #[arg(long, default_value_t = 0.0)]
         inject_invalid: f64,
         #[arg(long)]
@@ -348,6 +350,7 @@ fn main() -> Result<()> {
             iters,
             forwarding,
             idle_prewarm_ms,
+            frontier_wait_ms,
             inject_invalid,
             tx_da_limit,
             block_da_limit,
@@ -356,6 +359,7 @@ fn main() -> Result<()> {
             threads: 1,
             forwarding,
             idle_prewarm_ms,
+            frontier_wait_ms,
             inject_invalid,
             tx_da_limit,
             block_da_limit,
