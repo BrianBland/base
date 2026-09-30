@@ -1291,7 +1291,7 @@ pub struct AtomicSchedule {
     pub status: Vec<AtomicU8>,
     /// Lower publications observed while an incarnation executes.
     pub invalidations: Vec<AtomicU64>,
-    /// ESTIMATE dependency, or usize::MAX when runnable.
+    /// ESTIMATE dependency, or `usize::MAX` when runnable.
     pub waiting: Vec<AtomicUsize>,
     /// First uncommitted position.
     pub frontier: AtomicUsize,

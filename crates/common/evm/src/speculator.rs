@@ -202,9 +202,9 @@ pub struct SpeculatorStats {
     pub invalidations: usize,
     /// Executions stopped on an ESTIMATE dependency.
     pub blocked: usize,
-    /// Owner validation failures scheduled for a worker frontier retry.
+    /// Store-side owner repairs plus owner-State failures scheduled for worker retry.
     pub frontier_retries: usize,
-    /// Bounded frontier waits that expired.
+    /// Takes that waited and exhausted their budget without returning a result.
     pub timeouts: usize,
     /// Owner validation plus rebasing time in nanoseconds.
     pub validation_nanos: u64,
@@ -232,11 +232,11 @@ pub struct SpeculatorStats {
     pub inline_executions: usize,
     /// Owner time in the normal receipt/state commit path.
     pub commit_nanos: u64,
-    /// Owner wall time waiting to acquire the scheduler queue mutex.
+    /// Legacy queue-wait CSV placeholder (zero); epoch metadata locking is not instrumented.
     pub owner_queue_wait_nanos: u64,
-    /// Worker wall time waiting to acquire the scheduler queue mutex.
+    /// Legacy queue-wait CSV placeholder (zero); workers never lock the queue per transaction.
     pub worker_queue_wait_nanos: u64,
-    /// Aggregate worker time in execution or read revalidation, excluding publication.
+    /// Aggregate execution and prefix-reuse check time, excluding publication/late invalidation.
     pub worker_busy_nanos: u64,
     /// Aggregate worker condition-variable sleep time, including idle prewarm.
     pub worker_idle_nanos: u64,
@@ -565,7 +565,7 @@ impl Speculator {
     }
 
     /// Waits for the frontier, checks Store and repairs invalid work locally.
-    /// Store is unchanged until on_commit; independent owner-State validation remains mandatory.
+    /// Store is unchanged until `on_commit`; independent owner-State validation remains mandatory.
     pub fn take(&self, hash: B256, signer: Address) -> Option<SpeculativeResult> {
         let started = Instant::now();
         let (prediction, index) = {
@@ -734,7 +734,7 @@ impl Speculator {
         self.shared.2.notify_all();
     }
 
-    /// Current epoch counters; worker counts settle after cancellation and wait_idle.
+    /// Current epoch counters; worker counts settle after cancellation and `wait_idle`.
     pub fn stats(&self) -> SpeculatorStats {
         let queue = self.shared.0.lock().unwrap();
         SpeculatorStats {
@@ -753,14 +753,15 @@ impl Speculator {
         loop {
             let queue = self.shared.0.lock().unwrap();
             let idle = queue.prediction.as_ref().map_or(queue.active == 0, |p| {
-                p.stop.load(Ordering::SeqCst)
-                    || (0..p.tail.load(Ordering::Acquire)).all(|index| {
-                        let job = p.slots[index].get().unwrap();
-                        job.retired.load(Ordering::SeqCst)
-                            || job.delivered.load(Ordering::SeqCst)
-                            || p.core.status[index].load(Ordering::SeqCst)
-                                == ExecutionStatus::EXECUTED
-                    })
+                if p.stop.load(Ordering::SeqCst) {
+                    return queue.active == 0;
+                }
+                (0..p.tail.load(Ordering::Acquire)).all(|index| {
+                    let job = p.slots[index].get().unwrap();
+                    job.retired.load(Ordering::SeqCst)
+                        || job.delivered.load(Ordering::SeqCst)
+                        || p.core.status[index].load(Ordering::SeqCst) == ExecutionStatus::EXECUTED
+                })
             });
             if idle {
                 return true;
@@ -853,34 +854,35 @@ impl Speculator {
             let frontier = prediction.requested.load(Ordering::SeqCst) == index;
             let previous = job.slot.lock().unwrap().result.take();
             let busy = Instant::now();
-            let outcome = if let Some(result) =
-                previous.filter(|result| prediction.mv.reads_visible(&store, index, &result.reads))
-            {
-                Ok(Some(result))
-            } else {
-                prediction.counters.executions.fetch_add(1, Ordering::Relaxed);
-                let speculative = (forwarding && !frontier).then_some((
-                    &prediction.mv,
-                    prediction.core.status.as_slice(),
-                    index,
-                ));
-                RecordingDb::execute_reusing(
-                    &mut evm,
-                    parent.env.clone(),
-                    BaseTransaction::from_recovered_tx(
-                        job.transaction.inner(),
-                        job.transaction.signer(),
-                    ),
-                    speculative,
-                    !frontier,
-                )
-                .map(|result| {
-                    result.map(|mut result| {
-                        result.parent_hash = parent.hash;
-                        result
-                    })
-                })
-            };
+            let outcome = previous
+                .filter(|result| prediction.mv.reads_visible(&store, index, &result.reads))
+                .map_or_else(
+                    || {
+                        prediction.counters.executions.fetch_add(1, Ordering::Relaxed);
+                        let speculative = (forwarding && !frontier).then_some((
+                            &prediction.mv,
+                            prediction.core.status.as_slice(),
+                            index,
+                        ));
+                        RecordingDb::execute_reusing(
+                            &mut evm,
+                            parent.env.clone(),
+                            BaseTransaction::from_recovered_tx(
+                                job.transaction.inner(),
+                                job.transaction.signer(),
+                            ),
+                            speculative,
+                            !frontier,
+                        )
+                        .map(|result| {
+                            result.map(|mut result| {
+                                result.parent_hash = parent.hash;
+                                result
+                            })
+                        })
+                    },
+                    |result| Ok(Some(result)),
+                );
             prediction.counters.busy.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let affected = prediction.core.invalidations[index].load(Ordering::SeqCst) != seen
                 && outcome
@@ -1001,6 +1003,39 @@ mod tests {
         fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
             self.base.block_hash_ref(number)
         }
+    }
+
+    #[test]
+    fn panic_stops_waiters_but_idle_wait_still_waits_for_inflight_reads() {
+        let workers = Speculator::new(2, true).unwrap();
+        let mut epoch = parent();
+        let database = Arc::clone(&epoch.database);
+        let factories = AtomicUsize::new(0);
+        let (started, start) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = Mutex::new(Some(released));
+        let (panic_now, panic_wait) = std::sync::mpsc::channel();
+        let panic_wait = Mutex::new(panic_wait);
+        epoch.database = Arc::new(move || {
+            if factories.fetch_add(1, Ordering::SeqCst) != 0 {
+                panic_wait.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                panic!("injected sibling provider failure");
+            }
+            Box::new(GatedDb {
+                base: database(),
+                started: started.clone(),
+                release: Mutex::new(released.lock().unwrap().take()),
+            })
+        });
+        workers.reset(epoch);
+        workers.submit(&[transaction(10), transaction(20)]);
+        start.recv_timeout(Duration::from_secs(5)).unwrap();
+        panic_now.send(()).unwrap();
+        let prematurely_idle = workers.wait_idle(Duration::from_millis(100));
+        release.send(()).unwrap();
+        assert!(!prematurely_idle, "stopping a generation does not finish provider I/O");
+        workers.cancel();
+        assert!(workers.wait_idle(Duration::from_secs(5)));
     }
 
     #[test]
