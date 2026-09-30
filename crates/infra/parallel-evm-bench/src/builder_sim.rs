@@ -295,6 +295,10 @@ impl BuilderSim {
                 reference_seq = reference_seq.min(canonical_nanos);
                 let baseline = self.run(config, &fixture, None)?;
                 seq = seq.min(baseline.nanos);
+                println!(
+                    "# sample block={} iteration={} kind=sequential canonical_ns={} builder_ns={}",
+                    fixture.header.number, iteration, canonical_nanos, baseline.nanos
+                );
                 for offset in 0..arms.len() + threads.len() {
                     let index = (offset + iteration) % (arms.len() + threads.len());
                     if index >= arms.len() {
@@ -313,6 +317,14 @@ impl BuilderSim {
                         ensure!(outcome.txs == expected, "ordered reference receipts differ");
                         ensure!(store.diff(&bundle).is_empty(), "ordered reference state differs");
                         reference_best[reference] = reference_best[reference].min(nanos);
+                        println!(
+                            "# sample block={} iteration={} kind=ordered threads={} ns={} seq_ns={}",
+                            fixture.header.number,
+                            iteration,
+                            threads[reference],
+                            nanos,
+                            canonical_nanos
+                        );
                         continue;
                     }
                     let (arm, workers) = &arms[index];
@@ -334,6 +346,15 @@ impl BuilderSim {
                         actual.bundle.state == baseline.bundle.state,
                         actual.bundle.contracts == baseline.bundle.contracts,
                         actual.bundle.reverts == baseline.bundle.reverts
+                    );
+                    println!(
+                        "# sample block={} iteration={} kind=builder k={} threads={} ns={} seq_ns={}",
+                        fixture.header.number,
+                        iteration,
+                        arm.window,
+                        arm.threads,
+                        actual.nanos,
+                        baseline.nanos
                     );
                     if best[index].as_ref().is_none_or(|best| actual.nanos < best.nanos) {
                         best[index] = Some(actual);
