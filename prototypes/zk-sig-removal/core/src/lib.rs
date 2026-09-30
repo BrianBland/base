@@ -289,8 +289,11 @@ pub fn statement<B: Backend>(input: &[u8]) -> [u8; 32] {
                 assert!(sr != [0; 32] && sr < ORDER, "invalid r");
                 assert!(ss != [0; 32] && ss <= HALF_ORDER, "invalid s");
                 let sig = PendingSig { z, r: sr, s: ss, parity, key: r.u32() };
-                let sender =
-                    if per_sig && check_sigs { B::ecrecover(&sig) } else { addrs[sig.key as usize] };
+                let sender = if per_sig && check_sigs {
+                    B::ecrecover(&sig)
+                } else {
+                    addrs[sig.key as usize]
+                };
                 statement.update(&[0]);
                 statement.update(&z);
                 statement.update(&sender);
