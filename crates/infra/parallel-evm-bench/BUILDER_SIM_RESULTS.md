@@ -1,71 +1,69 @@
-# Phase 1 offline builder speculation measurements
+# Phase 1b: ordered builder speculation (experimental; performance targets NOT met)
 
-Shared-host directional measurements, min-of-3 with sequential/K/thread arms interleaved; no production speedup claim.
-Loop time excludes system/deposit prefix, provider/pool setup, idle prewarm and shutdown. Workers are additional to the owner.
-All rows passed included-hash order, full receipt and full bundle/revert equality on every iteration.
-`fwd` is batch-local forwarding; `idle` is milliseconds; `P` is injected invalid fraction. Times are milliseconds.
-`hit` is consumed/considered; `fail` is consume validation failures; `waste` is executions minus consumed after settling.
-`p50`/`p99` columns show sequential/simulator block percentiles. Bursts currently contain only block 51701002 (515 txs, ~91 Mgas).
+Interleaved min-of-3, owner plus 4/8/10 workers, K=32/64/128; complete forwarding × idle(0/20ms) × faults(0/.1) matrix on dev22, final66 and three bursts. Every measured iteration matched included order/set, full receipts and bundle/reverts. All 216 aggregate arms passed. Times exclude prefix, prewarm, setup and shutdown; these are shared-host directional measurements, not production claims.
+Final/burst measurements encountered concurrent RocksDB builds and a zk prover. One aggregate 900s command timed out after dev/final; bursts were rerun separately, each command bounded by 900s. Heavy-load results below are retained, not replaced by earlier favorable samples.
+Baseline diagnosis (instrumented Phase 1, dev clean): K32/4 had 3745 hits, 1092 validation failures and 450 not-ready misses; K128/4 had 3367 hits, 1811 failures and only 109 not-ready misses, out of 5309 choices. Nonblocking misses matter, but stale work is the larger loss. Rolling Phase 1 batches also disconnected newly appended work from retained MvMemory.
+Design: stable bounded plans, changed-write forwarding, reader invalidation, ESTIMATE blocking, worker frontier retries, worker-local reusable EVMs/providers. Builder alone retires/commits; skipped writes are removed and unrelated predictions retained. This adapts engine primitives, NOT the immutable auto-committing Scheduler itself. Consume-time owner-State validation/rebase remains mandatory; Store equivalence is not assumed as a soundness shortcut.
 
-|set|K/t|fwd|idle|P|seq total|sim total|p50 seq/sim|p99 seq/sim|hit|fail|waste|
-|---|---|---|---:|---:|---:|---:|---|---|---|---:|---:|
-|dev22|32/4|off|0|0|392.269|299.674|16.655/11.576|36.698/29.178|3943/5309|1263|1366|
-|dev22|32/8|off|0|0|392.269|366.111|16.655/13.530|36.698/38.502|3925/5309|1298|1384|
-|dev22|128/4|off|0|0|392.269|346.320|16.655/12.261|36.698/36.002|3423/5309|1815|1886|
-|dev22|128/8|off|0|0|392.269|411.996|16.655/15.070|36.698/45.013|3328/5309|1927|1980|
-|dev22|32/4|off|20|0|387.262|275.070|15.760/10.435|36.557/32.239|3972/5309|1288|1337|
-|dev22|32/8|off|20|0|387.262|380.219|15.760/14.209|36.557/36.997|3955/5309|1318|1354|
-|dev22|128/4|off|20|0|387.262|367.076|15.760/14.502|36.557/44.716|3251/5309|2036|2058|
-|dev22|128/8|off|20|0|387.262|454.590|15.760/18.054|36.557/57.752|3251/5309|2036|2058|
-|dev22|32/4|on|0|0|396.573|350.866|16.587/12.771|36.243/35.381|3966/5309|1234|1343|
-|dev22|32/8|on|0|0|396.573|494.101|16.587/17.810|36.243/62.412|3935/5309|1284|1374|
-|dev22|128/4|on|0|0|396.573|397.887|16.587/12.561|36.243/58.805|3827/5309|1400|1481|
-|dev22|128/8|on|0|0|396.573|480.485|16.587/17.949|36.243/67.825|3705/5309|1546|1604|
-|dev22|32/4|on|20|0|396.876|306.199|16.710/10.973|36.897/34.197|4032/5309|1220|1277|
-|dev22|32/8|on|20|0|396.876|386.289|16.710/15.440|36.897/35.241|3980/5309|1291|1329|
-|dev22|128/4|on|20|0|396.876|327.680|16.710/10.763|36.897/37.228|3791/5309|1496|1518|
-|dev22|128/8|on|20|0|396.876|415.472|16.710/14.711|36.897/42.013|3708/5309|1579|1601|
-|dev22|32/4|off|0|.1|345.207|333.916|14.066/14.446|32.270/30.299|2732/5309|841|8884|
-|dev22|32/8|off|0|.1|345.207|390.867|14.066/17.548|32.270/34.871|2907/5309|906|12270|
-|dev22|128/4|off|0|.1|345.207|357.869|14.066/15.576|32.270/32.593|2765/5309|827|10715|
-|dev22|128/8|off|0|.1|345.207|414.626|14.066/17.685|32.270/39.248|2940/5309|912|19821|
-|dev22|32/4|off|20|.1|343.582|341.811|14.565/13.448|32.814/32.306|2781/5309|849|9302|
-|dev22|32/8|off|20|.1|343.582|411.509|14.565/15.189|32.814/36.219|2959/5309|923|12698|
-|dev22|128/4|off|20|.1|343.582|359.599|14.565/14.214|32.814/31.464|2857/5309|862|13505|
-|dev22|128/8|off|20|.1|343.582|415.545|14.565/15.487|32.814/33.807|2959/5309|925|21393|
-|dev22|32/4|on|0|.1|343.097|327.589|14.112/13.054|33.124/30.776|2835/5309|641|8081|
-|dev22|32/8|on|0|.1|343.097|394.892|14.112/15.528|33.124/36.787|2947/5309|750|11963|
-|dev22|128/4|on|0|.1|343.097|350.683|14.112/13.947|33.124/33.211|2964/5309|625|9409|
-|dev22|128/8|on|0|.1|343.097|406.855|14.112/15.329|33.124/40.952|3014/5309|731|17126|
-|dev22|32/4|on|20|.1|368.015|379.672|15.717/14.839|33.231/36.827|2744/5309|606|7936|
-|dev22|32/8|on|20|.1|368.015|436.320|15.717/17.274|33.231/37.599|2798/5309|701|10614|
-|dev22|128/4|on|20|.1|368.015|437.170|15.717/16.721|33.231/45.191|2794/5309|613|11411|
-|dev22|128/8|on|20|.1|368.015|477.994|15.717/17.084|33.231/67.966|2794/5309|688|17366|
-|burst1|32/4|off|0|0|42.874|38.643|42.874/38.643|42.874/38.643|283/513|225|230|
-|burst1|32/4|off|20|0|42.189|35.662|42.189/35.662|42.189/35.662|283/513|227|230|
-|burst1|32/4|on|0|0|43.201|37.852|43.201/37.852|43.201/37.852|284/513|224|229|
-|burst1|32/4|on|20|0|42.554|36.329|42.554/36.329|42.554/36.329|284/513|226|229|
-|burst1|32/4|off|0|.1|38.765|32.243|38.765/32.243|38.765/32.243|211/513|117|858|
-|burst1|32/4|off|20|.1|37.492|32.472|37.492/32.472|37.492/32.472|220/513|119|915|
-|burst1|32/4|on|0|.1|37.871|35.519|37.871/35.519|37.871/35.519|225/513|99|793|
-|burst1|32/4|on|20|.1|37.465|35.054|37.465/35.054|37.465/35.054|223/513|103|833|
-|final66|32/4|off|0|0|1049.949|807.041|14.777/11.158|36.502/30.243|10807/14175|3068|3368|
-|final66|128/8|off|0|0|1049.949|1158.335|14.777/15.026|36.502/44.019|9369/14175|4623|4806|
-|final66|32/4|on|20|.1|922.279|931.039|12.703/12.530|34.499/45.223|7342/14175|1543|21629|
-|final66|128/8|on|20|.1|922.279|1177.798|12.703/16.227|34.499/56.352|7780/14175|1769|47694|
+Forwarding ON below. Triples are workers **4/8/10**; `P` is fault fraction; `idle` is ms. Hits are out of dev=5309, final=14175, bursts=778/513/934 choices. `fail` counts owner validation attempts, including faults; `waste` is settled execution attempts minus consumed. Totals sum rounded per-block CSV minima.
+|set|K|idle|P|seq ms|sim ms 4/8/10|hits 4/8/10|fail 4/8/10|waste 4/8/10|
+|---|---:|---:|---:|---:|---|---|---|---|
+|dev|32|0|0|392.354|226.584/258.549/269.186|5287/5287/5287|0/0/0|671/863/807|
+|dev|64|0|0|392.354|210.836/250.627/265.836|5287/5287/5287|0/1/0|687/917/899|
+|dev|128|0|0|392.354|221.284/263.836/277.290|5286/5287/5287|0/1/0|712/1138/1216|
+|dev|32|0|0.1|340.286|260.242/313.782/323.856|4549/4549/4549|500/502/502|2193/2646/2810|
+|dev|64|0|0.1|340.286|301.445/359.839/381.692|4549/4548/4548|471/473/474|3990/6117/7190|
+|dev|128|0|0.1|340.286|381.954/528.216/565.588|4550/4549/4550|426/426/428|7222/14116/17423|
+|dev|32|20|0|391.525|213.070/248.613/252.688|5287/5287/5287|0/1/1|646/842/762|
+|dev|32|20|0.1|343.329|266.818/283.978/287.760|4549/4549/4549|504/503/505|2240/2636/2871|
+|final|32|0|0|1132.803|1098.823/1135.113/1172.194|14108/14108/14107|1/1/2|1379/1513/1639|
+|final|64|0|0|1132.803|1001.291/1108.394/1152.625|14108/14109/14108|2/3/3|1489/1788/1823|
+|final|128|0|0|1132.803|1048.891/1200.936/1242.771|14109/14109/14109|0/3/1|1630/2360/2653|
+|final|32|0|0.1|1033.596|1265.303/1318.495/1318.557|11952/11951/11951|1302/1303/1303|5381/6200/6446|
+|final|64|0|0.1|1033.596|1346.029/1636.176/1675.282|11952/11952/11951|1259/1271/1264|9701/15919/18410|
+|final|128|0|0.1|1033.596|1668.862/2475.916/2738.379|11951/11952/11951|1180/1185/1182|17796/36287/47847|
+|final|32|20|0|1097.698|809.398/987.267/993.264|14109/14109/14109|4/3/3|1416/1480/1481|
+|final|32|20|0.1|1084.633|1624.529/1785.439/1657.426|11951/11952/11952|1310/1306/1307|5596/6317/7390|
+|50700012|32|0|0|110.442|86.162/126.386/78.050|777/777/777|0/0/0|246/200/257|
+|50700012|64|0|0|110.442|93.447/97.480/152.190|777/777/776|0/0/0|209/265/287|
+|50700012|128|0|0|110.442|111.179/86.253/110.926|777/777/777|0/0/0|192/261/282|
+|50700012|32|0|0.1|68.737|125.768/124.472/162.963|693/693/693|67/67/66|642/703/1057|
+|50700012|64|0|0.1|68.737|128.495/140.827/164.567|693/693/693|64/65/63|844/1406/2069|
+|50700012|128|0|0.1|68.737|208.191/278.314/275.860|693/693/693|60/59/59|2075/3412/3873|
+|50700012|32|20|0|77.497|99.132/113.599/85.390|777/776/777|0/0/0|223/263/178|
+|50700012|32|20|0.1|83.863|135.378/141.012/149.002|691/693/692|66/67/66|587/1160/1253|
+|51701002|32|0|0|64.716|47.959/82.575/61.117|512/512/512|0/0/0|83/121/87|
+|51701002|64|0|0|64.716|57.025/53.085/59.629|512/512/512|0/0/0|72/94/114|
+|51701002|128|0|0|64.716|53.880/62.593/67.495|512/512/512|0/0/0|111/147/176|
+|51701002|32|0|0.1|39.170|61.895/55.411/69.052|447/447/447|50/50/50|263/273/293|
+|51701002|64|0|0.1|39.170|59.787/110.783/90.338|447/447/447|50/50/50|335/368/384|
+|51701002|128|0|0.1|39.170|104.498/116.412/113.592|447/447/447|50/50/50|598/739/672|
+|51701002|32|20|0|87.230|47.892/42.418/76.632|512/512/512|0/0/0|85/118/135|
+|51701002|32|20|0.1|57.444|62.563/60.942/66.572|447/447/447|50/50/50|291/290/293|
+|51961520|32|0|0|93.963|101.083/134.675/111.364|933/933/933|0/0/0|141/176/150|
+|51961520|64|0|0|93.963|88.585/124.912/136.701|933/933/933|0/0/0|163/279/271|
+|51961520|128|0|0|93.963|115.497/135.549/130.791|933/933/933|0/0/0|161/271/442|
+|51961520|32|0|0.1|76.930|109.039/170.516/119.241|777/776/777|105/105/105|485/479/520|
+|51961520|64|0|0.1|76.930|109.597/140.109/163.529|777/777/777|104/105/105|664/733/750|
+|51961520|128|0|0.1|76.930|162.158/198.483/200.814|777/777/776|105/105/105|869/1079/1284|
+|51961520|32|20|0|175.798|101.357/117.122/187.567|933/933/933|0/0/0|143/174/176|
+|51961520|32|20|0.1|94.350|101.167/128.838/146.187|777/776/777|104/105/105|502/489/493|
 
-Deterministic admissions: dev 5,331 clean / 4,594 faulted; final 14,241 clean / 12,084 faulted (includes deposits).
-All 32 burst arms passed; larger K/thread clean burst totals ranged 42.48–52.53ms, usually worse than K32/4.
-Raw per-block local logs: `/tmp/spec-{dev,burst}-{false,true}-{0,20}-{0,0.1}.log`, `/tmp/spec-final{,-fault}.log`.
-Reproduce using README builder-sim command: K=32,128; threads=4,8; iters=3; the forwarding/prewarm/fault cross product.
-Final66 ran clean/off/0 and faulted/on/20 combinations. Every build/run was bounded by `timeout 900`.
-Legacy dev gate passed threads 1,2,4,8,10; via-executor dev+final passed 1,4,8 (receipts/bundles/reverts/hooks).
-Library: 137 tests passed; five speculator tests passed 20 repetitions; no-default-features check passed.
-Clippy passed with one pre-existing `parallel_payload.rs:180` manual-is-multiple-of warning; no new warnings.
+Forwarding OFF, K32/idle0 (same 4/8/10 ordering); larger-K/prewarm arms are in the raw logs.
+|set|P|seq ms|sim ms 4/8/10|
+|---|---:|---:|---|
+|dev|0|391.608|347.569/369.999/382.214|
+|dev|.1|339.025|333.177/352.562/352.082|
+|final|0|1037.440|953.097/1027.084/1001.361|
+|final|.1|905.258|861.402/950.036/944.043|
+|burst3|0|215.233|392.385/438.407/386.385|
+|burst3|.1|192.315|324.395/368.927/377.618|
 
-Interpretation: K32/4 without forwarding is a promising clean-fixture baseline, not justification to raise production gas yet.
-Prediction divergence can erase savings; larger windows increase stale work. One burst cannot characterize burst p99.
-Phase 2 needs an independent best-transactions snapshot feeder, bounded per-worker StateProviderFactory providers with
-explicit error poisoning (the current engine read facade is infallible+Sync), prefix/system-change publication, and an opt-in flag.
-Keep fair builder selection/checks/commit conditions unchanged. Measure real provider I/O, memory, deadlines, cancellation,
-CPU contention and burst tails before rollout; do not wire flashblocks. Preserve the immutable parent/factory/environment contract.
+Dev clean K32/4 p50 sequential/sim=16.442/8.375ms; p99=36.157/18.753ms; hit=5287/5309 (the 22 first ordinary transactions intentionally stay inline). K64/4 reaches 1.86x, but K64/8 only 1.57x: the ~3x target and no-thread-regression target fail. Large-K fault arms greatly exceed the 5% slowdown budget even without host saturation.
+Burst metadata: 50700012=779 tx/132.120 Mgas; 51701002=515 tx/91.054 Mgas; 51961520=935 tx/172.289 Mgas. An earlier lighter-host full-matrix pass measured K32/4 clean at 66.762→41.110, 41.913→19.328 and 85.695→54.093ms respectively; final K128/4 was 1030.179→567.100ms. These are context, not replacements for the final loaded-host rows.
+Bounded-wait comparison: dev K32/4, forwarding on, idle0, nonblocking `--frontier-wait-ms 0` measured 393.180→286.156ms, 5116 hits; default 10ms wait measured 392.353→226.587ms, 5287 hits. Separate interleaved runs, not an isolated causal estimate. Both settings also passed faults/prewarm on dev and bursts (K32/128, 4/8).
+Owner bottleneck diagnostic (lighter-host dev K128, 4/8): loop208.8/263.6ms; take52.6/35.9; validation+rebase25.4/29.4; inline1.5/1.6 (22 tx); commit53.2/74.7; submit23.4/29.8. Queue acquisition wait owner32.9/74.5, workers85.8/212.9ms; worker busy540/617, CV idle151/1161ms; waste712/1095. Queue waits overlap phases; worker totals include untimed prewarm/settling. Owner non-take time already caps scaling; removing validation alone cannot reach 3x.
+Quick 5s `sample` at 8/K128: top-of-stack CV wait26318, mutexwait2164, mutexdrop300, CV signal233 samples. The release binary is stripped, so Rust-frame attribution is unavailable. `/tmp/spec1b-sample.txt` and `/tmp/spec1b-profile-counters.log` retain evidence. Separate work/result condition variables, chained wakeups, O(1) reader lookup and EVM reuse helped; per-slot publication/retirement locks and a lighter incremental feeder are the next remedies.
+Validation: 141 library tests passed; added tests failed first for bounded pending take, inline-prefix repair, cancelled-work accounting and invalid-code terminal handling. Twenty repetitions of all nine speculator tests passed. Legacy dev/final/burst passed 1/2/4/8/10; via-executor passed 1/4/8. No-default-features passed; Clippy has only the pre-existing parallel_payload.rs manual-is-multiple-of warning. One pre-existing doctest is ignored.
+Reproduce: `CARGO_TARGET_DIR=/Users/brianbland/code/scratch/target-spec2 cargo build --release -p base-parallel-evm-bench`; wrap every README builder-sim invocation in `timeout 900`, crossing forwarding=false/true, idle=0/20 and inject-invalid=0/.1 with threads=4,8,10, K=32,64,128, iters=3 on all three fixture directories. Raw per-block and aggregate logs: `/tmp/spec1b-{dev,final,burst}-{false,true}-{0,20}-{0,0.1}.log`; nonblocking comparison: `/tmp/spec1b-nowait-{dev,burst}-{0,20}-{0,0.1}.log`.
+Phase 2: do NOT wire production yet. Preserve fair selection, predicates, gas/DA accounting and commit-condition callbacks; feed an independent pool snapshot, append newly visible lane successors, publish every system/deposit/inline/fee change, and cancel on parent replacement/deadline. Add fallible-provider error poisoning and bounded worker-local providers. Keep owner validation, immutable parent/environment identity and L1-cache safeguards; measure real I/O, memory and deadline tails. No flashblocks wiring and no gas-limit increase justified.

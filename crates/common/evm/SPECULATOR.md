@@ -1,19 +1,23 @@
 # Builder speculation contract (Phase 1b)
 
 The basic builder alone selects and orders transactions. A speculator predicts work, never
-admission. `take` waits at most 10 ms for the chosen frontier, waking on cancellation/reset.
+admission. `take` has a configurable frontier wait budget (10 ms by default), waking on reset
+or cancellation. This is a scheduling budget, not a hard real-time/provider-I/O deadline.
 Unsupported transactions, panics and timeouts fall back to ordinary execution. No real builder
-is wired. Owner-thread validation remains mandatory even after engine validation.
+is wired. Engine invalidation is only a scheduling hint; owner validation is never skipped.
 
 Each parent epoch fixes the EVM factory, environment and immutable parent database factory.
 Workers own their providers. Reset/cancel prevents results from an earlier epoch escaping.
 Submit retains a matching ordered suffix and appends new candidates to its plan. Skips remove
 speculative writes and invalidate readers; reordered plans start a new generation. A bounded
-generation rolls over when its index capacity is exhausted, retaining the committed overlay.
+generation has max(1024, 4 × initial-window-length) indices and rolls over when full, retaining
+the committed overlay but discarding advisory work. Live slots stay bounded by the submitted window.
 Workers forward writes, invalidate affected readers and block on ESTIMATE dependencies.
 The builder alone advances the committed prefix through on_commit, including inline execution,
 fees and system changes. A returned result is only a proposal: a later choice without a commit
-discards its writes. Frontier retries execute on workers against the committed Store.
+discards its writes. An unpredicted choice executes inline and preserves the remaining plan.
+At most one failed consume validation is retried on a worker at the exact committed prefix;
+a second failure or a wait timeout executes inline. Each take gets its own bounded wait budget.
 
 Consumption on the owner thread checks transaction identity, environment, every account
 existence/nonce/code read, every storage value, and every recorded balance range against
@@ -33,6 +37,15 @@ the immutable parent epoch. The current factory accepts the engine's infallible,
 facade; integrating fallible providers needs an error-poisoning facade, not default-value reads
 that could be mistaken for authentic state. Providers are constructed/used on their worker and
 need not be Send. cancel is nonblocking; Drop joins in-flight work, so provider I/O must be bounded.
+
+The builder queue reuses the validator's MvMemory, status phases, recorded observations, balance
+opcodes and write extraction. It does not instantiate the immutable, auto-committing Scheduler:
+the builder controls retirement, supports append/removal, and never accepts engine-side commits.
+Workers reuse an EVM within a generation and one base reader per parent epoch. Publication,
+removal and invalidation are serialized under the queue mutex; no provider reads hold that mutex.
+Actual committed state (including deferred fees and system changes) updates Store. Concurrent
+speculative reads may see mixed Store writes; the mandatory owner-State gate catches these too.
+Feeder calls/take/on_commit belong to one owner; cancellation/reset may come from another thread.
 
 Tests must exercise stale nonce/storage rejection, admitted balance drift and fee rebasing,
 identity mismatch, discarded work/reset, and a declined commit followed by another choice.

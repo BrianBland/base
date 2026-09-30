@@ -106,7 +106,7 @@ Deploy by building `cargo build --release -p base-reth-node` and starting the no
 structured events from `base_common_evm::executor::block_executor`. Database-service overhead
 and suffix-result retention need live measurement; fixture timings are not node speedup claims.
 
-## Basic-builder simulation (Phase 1 only)
+## Basic-builder simulation (Phase 1b, offline only)
 
 `builder-sim` chooses fixture transactions in canonical order, rather than taking an unordered
 parallel block suffix. Deposits/system calls are an untimed sequential prefix. Each subsequent
@@ -114,17 +114,17 @@ choice goes through the production `BaseBlockExecutor` without-commit/commit pai
 builder and flashblocks are not wired. This models fair ordering, not live pool selection.
 
 ```sh
-export CARGO_TARGET_DIR=/Users/brianbland/code/scratch/target-spec
+export CARGO_TARGET_DIR=/Users/brianbland/code/scratch/target-spec2
 cargo build --release -p base-parallel-evm-bench
-timeout 900 "$CARGO_TARGET_DIR/release/base-parallel-evm-bench" builder-sim --data /Users/brianbland/code/scratch/fixtures-dev --threads 4,8 --k 32,128 --iters 3 --forwarding false --idle-prewarm-ms 0 --inject-invalid 0
+timeout 900 "$CARGO_TARGET_DIR/release/base-parallel-evm-bench" builder-sim --data /Users/brianbland/code/scratch/fixtures-dev --threads 4,8,10 --k 32,64,128 --iters 3 --forwarding true --idle-prewarm-ms 0 --inject-invalid 0
 ```
 
-Repeat with `--forwarding true`, `--idle-prewarm-ms 20`, and `--inject-invalid 0.1`. The fault
+Repeat the cross product with `--forwarding false`, `--idle-prewarm-ms 20`, and `--inject-invalid 0.1`. The fault
 fraction is in [0,1], seeded from transaction hash/block/index; selected envelopes are replaced
 with synthetic high-nonce transactions using the fixture signer. Signatures are deliberately not
-recovered for those invalid candidates. Rejected nonce lanes are skipped, and a skip clears the
-prediction window before refilling it. Faulted paths can touch fixture-missing state, which `PreDb`
-treats as empty in both arms; these gates are loop-parity tests, not claims about canonical roots.
+recovered for those invalid candidates. Rejected nonce lanes are skipped and removed from the
+prediction; unrelated candidates remain. Faulted paths can touch fixture-missing state, which
+`PreDb` treats as empty in both arms; these are loop-parity gates, not canonical-root claims.
 
 Gas reservation and cumulative Jovian DA-footprint checks are enforced by the executor.
 `--tx-da-limit` and `--block-da-limit` add optional Fjord-estimated byte limits matching the basic
@@ -140,9 +140,20 @@ speedup. Output reports per-block timings, hits/considered choices, validation f
 (started executions minus consumed results, after bounded worker settling), and nearest-rank
 p50/p99 of per-block minima. Admission counts are deterministic; worker counts vary with scheduling.
 
-Forwarding is advisory and batch-local: overlapping submissions retain matching jobs, and newly
-queued jobs share the new batch's `MvMemory`. A rolling extension does not replay all retained
-predictions into its new batch. Candidate execution reconstructs an EVM per job. Both limitations
-are deliberate Phase 1 measurement baselines, not production scheduling recommendations.
+Forwarding now spans a stable, bounded ordered plan. Workers publish changed writes, invalidate
+their readers, block on ESTIMATE dependencies, and reuse their EVM and parent reader. The owner
+alone selects/commits; skipping removes published writes, and rolling submissions append newly
+visible candidates. Generation rollover/reordering discards advisory work, not committed state.
+`--forwarding false` disables forwarding but retains ordered waiting and frontier retries.
+
+`take` waits up to 10 ms by default. `--frontier-wait-ms 0` measures nonblocking inline fallback;
+timeouts, unsupported transactions and a failed exact-prefix retry fall back to normal execution.
+A failed owner validation gets at most one worker retry, with another bounded take. All accepted
+results still validate/rebase against owner State; engine invalidation is not a soundness gate.
+Additional CSV counters report not-ready takes, timeouts, dependency blocks, invalidations,
+frontier retries, owner take/validation/inline/commit/submit time and worker busy/idle/queue waits.
+Owner timings exclude the untimed prefix; worker times include prewarm and settling. Queue wait
+times overlap their parent phases; worker condition waits include mutex reacquisition. Diagnostic
+timers add overhead, and these shared-host fixture timings are not production throughput claims.
 
 See [measurements](BUILDER_SIM_RESULTS.md) and the library's [contract](../../common/evm/SPECULATOR.md).
