@@ -106,7 +106,7 @@ Deploy by building `cargo build --release -p base-reth-node` and starting the no
 structured events from `base_common_evm::executor::block_executor`. Database-service overhead
 and suffix-result retention need live measurement; fixture timings are not node speedup claims.
 
-## Basic-builder simulation (Phase 1c, offline only)
+## Basic-builder simulation (Phase 1d, offline only)
 
 `builder-sim` chooses fixture transactions in canonical order, rather than taking an unordered
 parallel block suffix. Deposits/system calls are an untimed sequential prefix. Each subsequent
@@ -114,18 +114,24 @@ choice goes through the production `BaseBlockExecutor` without-commit/commit pai
 builder and flashblocks are not wired. This models fair ordering, not live pool selection.
 
 ```sh
-export CARGO_TARGET_DIR=/Users/brianbland/code/scratch/target-spec3
+export CARGO_TARGET_DIR=/Users/brianbland/code/scratch/target-spec4
 cargo build --release -p base-parallel-evm-bench
 timeout 900 "$CARGO_TARGET_DIR/release/base-parallel-evm-bench" builder-sim --data /Users/brianbland/code/scratch/fixtures-dev --threads 4,8,10 --k 32,64,128 --iters 5 --forwarding true --idle-prewarm-ms 0 --inject-invalid 0
 ```
 
-`bash crates/infra/parallel-evm-bench/phase1c.sh` runs the complete dev/final/burst matrix plus
-legacy and via-executor gates; optional arguments select binary, fixture root and log directory.
+`bash crates/infra/parallel-evm-bench/measure-builder-sim.sh` runs the dev/final/burst clean/faulted
+K32/128 × 4/8/10 matrix (min-of-5), then legacy and via-executor gates. Optional arguments select
+binary, fixture root and log directory. `MODE=priority` selects dev/burst, K128, 4/8, min-of-3.
+Before each **cohort invocation**, the script waits for load1 < 6, polling every 30 seconds for
+`WAIT_SECS` (default 1200; shared-host budgeted run uses 300). After the cap it runs and records
+the high load. It does not gate again inside an invocation: that explicit budget concession
+differs from a strict per-timed-arm load gate. Start/end and per-block iteration loads are logged;
+`# sample` rows preserve all iteration timings, not just the selected minima.
 It snapshots fixtures before measuring, so newly arriving blocks cannot change later arms.
 Use a fresh log directory (an existing `fixtures` snapshot is deliberately rejected).
 Every builder run also interleaves the plain ordered engine with its own canonical sequential
 reference, using the same timing boundaries as `bench`. Fault injection applies only to the builder
-arms: canonical references are a ceiling, not a faulted-workload comparison. Reference threads count
+arms: canonical references are context, not a mathematical ceiling or a faulted-workload comparison. Reference threads count
 the caller; builder workers are additional to the owner. Per-iteration `uptime` records host load.
 
 Repeat the cross product with `--forwarding false`, `--idle-prewarm-ms 20`, and `--inject-invalid 0.1`. The fault
@@ -134,6 +140,12 @@ with synthetic high-nonce transactions using the fixture signer. Signatures are 
 recovered for those invalid candidates. Rejected nonce lanes are skipped and removed from the
 prediction; unrelated candidates remain. Faulted paths can touch fixture-missing state, which
 `PreDb` treats as empty in both arms; these are loop-parity gates, not canonical-root claims.
+Invalid nonces now read the visible sender rather than assuming the signed nonce. Transaction-error
+outcomes retain their reads, validate against both Store and owner State, and publish no writes.
+Duplicate synthetic hashes share an advisory slot; repeated snapshots retain completed work.
+Invalid-outcome/consumed, removal-invalidation, retired-writer, terminal-miss, repair and frontier
+wait counters distinguish faults from useful work. `# plan` rows report generations and replans.
+Consumed/hit counts include validated errors; included hashes and receipts still count admission.
 
 Gas reservation and cumulative Jovian DA-footprint checks are enforced by the executor.
 `--tx-da-limit` and `--block-da-limit` add optional Fjord-estimated byte limits matching the basic
