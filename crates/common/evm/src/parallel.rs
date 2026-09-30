@@ -227,12 +227,11 @@ impl<'a> Store<'a> {
     /// Checks only authentic cached/committed values. Missing parent observations fail closed.
     pub fn is_cached_current(&self, read: &Read) -> bool {
         match read {
-            Read::Account(address, seen, funds) => {
-                self.accounts
-                    .get(address)
-                    .or_else(|| self.parent_cache.as_ref()?.accounts.get(address))
-                    .is_some_and(|now| *seen == info_key(&now) && funds.admits(balance(&now)))
-            }
+            Read::Account(address, seen, funds) => self
+                .accounts
+                .get(address)
+                .or_else(|| self.parent_cache.as_ref()?.accounts.get(address))
+                .is_some_and(|now| *seen == info_key(&now) && funds.admits(balance(&now))),
             Read::Slot(address, key, seen) => {
                 let now = self.storage.get(&(*address, *key)).map(|v| *v).or_else(|| {
                     if self.cleared_storage.contains(address) {

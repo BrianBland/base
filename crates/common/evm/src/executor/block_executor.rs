@@ -1,6 +1,8 @@
 //! Contains the block executor for base.
 
 use alloc::{boxed::Box, vec::Vec};
+#[cfg(feature = "parallel")]
+use core::convert::Infallible;
 
 use alloy_consensus::{Eip658Value, Header, Transaction, TransactionEnvelope, TxReceipt};
 use alloy_eips::{Encodable2718, Typed2718};
@@ -18,6 +20,8 @@ use base_common_consensus::{DepositReceipt, Predeploys};
 use base_common_flz::tx_estimated_size_fjord as estimate_tx_compressed_size;
 #[cfg(feature = "std")]
 use base_execution_eip8130::IntrinsicGas;
+#[cfg(feature = "parallel")]
+use revm::context::result::EVMError;
 use revm::{
     Database as _, DatabaseCommit,
     context::{Block, result::ResultAndState},
@@ -334,24 +338,18 @@ where
                     && candidate.validate_and_rebase(self.evm.db_mut()).unwrap_or(false);
                 speculator.record_validation(valid, validation_started.elapsed(), &candidate);
                 if valid {
-                    output =
-                        crate::ParallelTransaction {
-                            hash: tx.tx().trie_hash(),
-                            signer: *tx.signer(),
-                            output:
-                                candidate.output.map_err(|error| {
-                                    BlockExecutionError::evm(
-                                        revm::context::result::EVMError::<
-                                            core::convert::Infallible,
-                                            _,
-                                        >::Transaction(
-                                            error
-                                        ),
-                                        tx.tx().trie_hash(),
-                                    )
-                                })?,
-                        }
-                        .into_output::<E::HaltReason>();
+                    let result = candidate.output.map_err(|error| {
+                        BlockExecutionError::evm(
+                            EVMError::<Infallible, _>::Transaction(error),
+                            tx.tx().trie_hash(),
+                        )
+                    })?;
+                    output = crate::ParallelTransaction {
+                        hash: tx.tx().trie_hash(),
+                        signer: *tx.signer(),
+                        output: result,
+                    }
+                    .into_output::<E::HaltReason>();
                     break;
                 }
                 if !identity_matches || attempt != 0 {
