@@ -73,3 +73,18 @@ trace_cells=11098778857
 blocks=15 txs=4636 ecdsa=4621 keys=1235 bytes=1651095 flags=0 instret=76909236 cells=5264428013 segments=77 exec_ms=637
 app_prove_ms=519613
          16222924896  peak memory footprint
+== ovm2x-5blk --blocks 5
+trace_cells=1784964661
+blocks=5 txs=1582 ecdsa=1577 keys=601 bytes=583394 flags=0 instret=17641999 cells=1381475527 segments=14 exec_ms=207
+app_prove_ms=259491
+         19932789616  peak memory footprint
+== ovm2x-15blk --blocks 15
+trace_cells=5424456710
+blocks=15 txs=4636 ecdsa=4621 keys=1235 bytes=1651095 flags=0 instret=46636248 cells=3768235584 segments=43 exec_ms=558
+app_prove_ms=551084
+         19743635928  peak memory footprint
+== ovm2x-60blk --blocks 60
+trace_cells=21441013982
+blocks=60 txs=17743 ecdsa=17683 keys=2705 bytes=6574699 flags=0 instret=161683965 cells=13886578470 segments=154 exec_ms=1726
+app_prove_ms=2017803
+         20262583272  peak memory footprint

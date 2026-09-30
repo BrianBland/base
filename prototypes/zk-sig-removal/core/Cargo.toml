@@ -1,0 +1,9 @@
+[package]
+name = "zk-sig-removal-core"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+# Keccak comes from the zkVM: both OpenVM and ZisK export `native_keccak256`.
+alloy-trie = { version = "0.9", default-features = false }
+alloy-primitives = { version = "1", default-features = false, features = ["native-keccak"] }

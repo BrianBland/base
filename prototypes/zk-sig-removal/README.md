@@ -1,4 +1,4 @@
-# ZK signature removal — OpenVM prototype and feasibility study
+# ZK signature removal — OpenVM + ZisK prototype and feasibility study
 
 Prototype for replacing per-transaction ECDSA signatures in Base span batches with sender
 addresses, per-block `transactionsRoot`s, and one ZK proof per batch
@@ -23,6 +23,13 @@ Everything here was measured on real Base mainnet blocks `51770854..=51771153` (
   MSM (plus a leaner Pippenger) cut proving time 5.4x vs per-signature `ecrecover` (953 s → 177 s
   for 5 blocks on the Mac). What remains is mostly keccak (signing
   hashes + transaction trie) and zkVM memory overhead, both linear in batch bytes.
+- **Two independent proofs of the same statement are affordable.** The statement logic lives in
+  one zkVM-independent crate (`core/`) with an OpenVM 2.x backend and a ZisK backend. For a full
+  6-blob batch, OpenVM 2.x needs **157M instructions** and ZisK **94M steps**. Each is roughly one
+  Ethereum L1 block of proving: an estimated **~15–50 GPU-s (OpenVM) + ~10–35 GPU-s (ZisK)**,
+  i.e. **~$0.01–0.07 per batch for both** on 5090-class GPUs. Requiring both proofs (AND) means a
+  forgery needs soundness bugs in two unrelated proof systems. The ZK-sig proofs are separate from
+  Base's SP1 withdrawal proofs.
 - **Biggest open issue is not proving:** nodes that derive only from L1 lose signatures, so they
   cannot compute transaction hashes. See [open questions](#open-questions-and-risks).
 
@@ -135,6 +142,49 @@ Merkle hashing but added instructions: 566 s vs 478 s for 5 blocks. An allocatio
 ordered-trie implementation matched alloy's `HashBuilder` within 0.3% — the trie cost is keccak,
 not bookkeeping — so the prototype keeps alloy.
 
+## Double proof: OpenVM 2.x and ZisK
+
+Layout: `core/` holds input parsing, RLP handling, the statement, the Fiat-Shamir challenge, and
+all range checks behind a small `Backend` trait (keccak, key loading, `ecrecover`, batch MSM).
+`openvm/guest` (OpenVM `v2.x.0-preview.2`, RV64) and `zisk/guest` (ZisK `v1.3.0-alpha`, RV64IMA)
+implement it with each zkVM's accelerators. Both reveal the identical 32-byte statement; the
+OpenVM host checks it against an independent alloy implementation, and `--zisk-input` writes the
+same witness for ZisK and prints the expected statement. `TAMPER_KEY` and `TAMPER_RLP` inputs make
+both guests panic.
+
+Derivation rule: a ZK batch is valid iff **both** proofs verify for the statement it recomputes.
+Soundness needs only one honest system; liveness needs both provers, and a missing proof falls back
+to today's signed format. Proofs run in parallel, so latency is the slower of the two and cost is
+their sum. Two wrapped proofs add ~3 KB to a batch (OpenVM Halo2 1,760 B; ZisK PLONK not measured).
+The shared `core` crate is the remaining common-mode risk and should get the most audit attention.
+
+Execution cost (60 blocks, 17,683 signatures, 6.57 MB; same fixture as above):
+
+| zkVM | ISA | work | accelerator share | secp256k1 adds |
+|---|---|---|---|---:|
+| OpenVM 2.0.2 (earlier) | RV32 | 269.6M insns, 19.2G metered cells | keccak 31% of cells | 490,809 |
+| OpenVM 2.x preview.2 | RV64 | 157.1M insns, 13.7G metered cells, 36 segments | — | same |
+| ZisK 1.3.0-alpha | RV64IMA | 94.3M steps, 15.8G cost units | keccak 32%, secp add 5%, modular 1.4% | 554,916 |
+
+ZisK steps scale linearly: 2.6M (1 block), 9.8M (5), 26.4M (15), 94.3M (60). Its top cost is the
+transaction trie (34%, alloy `HashBuilder` + keccak) and one-shot `keccak256` calls (29%).
+
+OpenVM 2.x Mac CPU app proofs (4 GiB segments): 5 blocks 259 s, 15 blocks 551 s, 60 blocks
+**2,018 s** (vs 2,365 s on 2.0.2). The 5-block run overlapped a ZisK build, so its number is high.
+ZisK needed a 34 GB proving key that grew past 59 GB during a Mac proof attempt and filled the
+disk, so I deleted it: **ZisK numbers are emulator-only; no ZisK proof was generated locally.**
+
+GPU estimates for one 6-blob batch (single-GPU seconds, app + aggregation, no final wrap):
+
+| zkVM | method A | method B | estimate |
+|---|---|---|---:|
+| OpenVM 2.x | Mac time / Mac-to-GPU ratio on OpenVM's rv64 CI benchmarks (keccak 45x, regex 67x), +16–35% aggregation: 35–61 GPU-s | ethproofs: 5.9M insns per GPU-s on 16x5090 (26.5 GPU-s for 157M insns); ~2x better on 4 GPUs (~13) | **~15–50** |
+| ZisK | ethproofs 2x5090: 4.66M steps per GPU-s → 20 GPU-s | ethproofs 8x5090: 2.67M steps per GPU-s → 35 GPU-s | **~10–35** |
+
+Ethproofs numbers are per-proof `proving_cycles` and `proving_time` for current Ethereum L1 blocks
+(OpenVM 2.1 preview averages 245M insns; ZisK 60–95M steps), so both estimates assume our
+keccak-heavy mix costs about the same per cycle as an L1 block. Treat each as ±2x until a GPU run.
+
 ## GPU cost and latency forecast
 
 Calibration: OpenVM's published CI benchmarks run on an AWS `g7.4xlarge` (one Blackwell RTX PRO
@@ -174,10 +224,10 @@ GPU-seconds do not change.
   archive (verifiable against the proven roots), or accept signature-less bodies on L1-only nodes.
   This needs a product decision before anything else.
 - **Fault / validity proofs must verify the proof.** Derivation runs inside Base's proof programs,
-  so they must verify a Halo2/KZG proof (BN254 pairings) per batch. Its in-program cost is not
-  measured here.
-- **Soundness surface.** Derivation now trusts OpenVM's circuits (keccak and RV32IM are formally
-  verified in Lean per OpenVM 2.0; the ECC extension and aggregation are audited, not formally
+  so they must verify the posted proofs per batch (OpenVM's Halo2/KZG and ZisK's PLONK, both BN254
+  pairing checks). Their in-program cost is not measured here.
+- **Soundness surface.** Derivation now trusts the zkVM circuits (OpenVM's keccak and RV32IM are
+  formally verified in Lean; its ECC extension and aggregation are audited, not formally
   verified) and the Fiat-Shamir batch check. A soundness bug would let the batcher assert false
   senders with no on-chain detection. An independent review of the guest found one such bug —
   32-bit wrap in RLP long-length decoding let a malformed leaf share a valid signing preimage —
@@ -186,7 +236,7 @@ GPU-seconds do not change.
 - **Fallback.** Batches without a proof must fall back to today's format without a hard fork, as
   the design doc says.
 - **Remaining speedups (not done):** fewer segments per batch on 15+ GiB GPUs (less per-segment
-  memory commitment overhead); OpenVM 2.1's RV64 and faster execution; a leaner MSM inner loop
+  memory commitment overhead); a leaner MSM inner loop
   (each bucket add still costs a few thousand cells of RISC-V overhead around one EC-add chip row). Keccak
   over signing preimages and trie leaves (~2 passes over batch bytes) is a floor set by the
   Ethereum formats.
@@ -195,18 +245,24 @@ GPU-seconds do not change.
 
 ```bash
 # 1. Fetch blocks (any Base RPC with eth_getBlockByNumber full txs) as JSONL, then:
-cargo run -p base-protocol --example zk_sig_removal_analysis --release -- \
-  blocks.jsonl /tmp/zksig-fixture.bin
+cargo run -p base-protocol --example zk_sig_removal_analysis --release -- blocks.jsonl fixture.bin
+export ZKSIG_FIXTURE=$PWD/fixture.bin
 
-# 2. Prover (standalone workspace; guest needs `rustup install nightly-2026-01-18` + rust-src).
-cd prototypes/zk-sig-removal/host
+# 2. OpenVM (standalone workspace). Guest toolchain: bash ci/install-openvm-toolchain.sh from the
+#    openvm repo at v2.x.0-preview.2 (installs `openvm-1.94.1`).
+cd prototypes/zk-sig-removal/openvm/host
 cargo build --release
 ./target/release/zk-sig-removal-host --blocks 60                    # execute + cost metrics
 ./target/release/zk-sig-removal-host --blocks 5 --mode app --seg-mem-gib 4
 TAMPER_KEY=1 ./target/release/zk-sig-removal-host --blocks 1        # wrong key: must panic
 TAMPER_RLP=1 ./target/release/zk-sig-removal-host --blocks 1        # forged length: must panic
 BREAKDOWN=1 ./target/release/zk-sig-removal-host --blocks 5         # per-AIR trace cells
-../scripts/prove_matrix.sh <label> --blocks 15                      # append to results/matrix.txt
+../../scripts/prove_matrix.sh <label> --blocks 15                   # append to results/matrix.txt
+
+# 3. ZisK (install with ziskup --version 1.3.0-alpha --nokey).
+./target/release/zk-sig-removal-host --blocks 60 --zisk-input /tmp/in60.bin   # prints statement
+cd ../../zisk/guest && cargo-zisk build --release
+ziskemu -e target/elf/riscv64ima-zisk-zkvm-elf/release/zk-sig-removal-zisk -i /tmp/in60.bin -X -c
 ```
 
 Guest flags (benchmark attribution only): `1` skip signature checks, `2` skip trie, `4`

@@ -41,7 +41,8 @@ enum Mode {
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(long, default_value = "/tmp/zksig-fixture.bin")]
+    /// Fixture written by `zk_sig_removal_analysis`.
+    #[arg(long, env = "ZKSIG_FIXTURE")]
     fixture: PathBuf,
     #[arg(long, default_value = "../guest")]
     guest: PathBuf,
@@ -64,6 +65,10 @@ struct Args {
     /// Metered memory budget per app segment (OpenVM default 15 GiB, sized for GPUs).
     #[arg(long, default_value_t = 15.0)]
     seg_mem_gib: f64,
+    /// Write the guest input framed for ZisK (`u64` length prefix, 8-byte padded) to this path,
+    /// print the expected statement, and exit without running OpenVM.
+    #[arg(long)]
+    zisk_input: Option<PathBuf>,
 }
 
 struct Block {
@@ -205,6 +210,21 @@ fn main() -> eyre::Result<()> {
     let ecdsa = blocks.iter().flat_map(|b| &b.txs).filter(|t| is_ecdsa(t)).count();
     let bytes: usize = blocks.iter().flat_map(|b| &b.txs).map(Vec::len).sum();
 
+    if let Some(path) = &args.zisk_input {
+        let (input, keys) = guest_input(args.flags, &blocks)?;
+        let mut framed = (input.len() as u64).to_le_bytes().to_vec();
+        framed.extend(&input);
+        framed.resize(framed.len().next_multiple_of(8), 0);
+        std::fs::write(path, framed)?;
+        let expected = expected_statement(&blocks)?;
+        println!(
+            "blocks={} txs={txs} ecdsa={ecdsa} keys={keys} bytes={bytes} statement={}",
+            blocks.len(),
+            expected.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        return Ok(());
+    }
+
     let vm_config =
         SdkVmConfig::from_toml(&std::fs::read_to_string(args.guest.join("openvm.toml"))?)?;
     let mut vm_config = vm_config;
@@ -226,13 +246,13 @@ fn main() -> eyre::Result<()> {
     stdin.write_bytes(&input);
 
     let t = Instant::now();
-    let public = sdk.execute(exe.clone(), stdin.clone())?;
+    let public = sdk.compile_and_execute(exe.clone(), stdin.clone())?;
     let exec_ms = t.elapsed().as_millis();
     if args.flags & 3 == 0 {
         eyre::ensure!(public[..32] == expected_statement(&blocks)?, "statement mismatch");
     }
-    let (_, (cells, instret)) = sdk.execute_metered_cost(exe.clone(), stdin.clone())?;
-    let (_, segments) = sdk.execute_metered(exe.clone(), stdin.clone())?;
+    let (_, (cells, instret)) = sdk.compile_and_execute_metered_cost(exe.clone(), stdin.clone())?;
+    let (_, segments) = sdk.compile_and_execute_metered(exe.clone(), stdin.clone())?;
     {
         let pk = &sdk.app_pk().app_vm_pk.vm_pk.per_air;
         let mut per_air: Vec<(u64, &str)> = pk

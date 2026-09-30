@@ -1,0 +1,15 @@
+[package]
+name = "zk-sig-removal-zisk"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+zk-sig-removal-core = { path = "../../core" }
+ziskos = { git = "https://github.com/0xPolygonHermez/zisk.git", tag = "v1.3.0-alpha" }
+
+[profile.release]
+panic = "abort"
+lto = "fat"
+codegen-units = 1
