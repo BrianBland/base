@@ -487,7 +487,7 @@ impl Readers {
 
     /// Readers with an index above `tx`.
     pub fn above(&self, tx: usize) -> impl Iterator<Item = usize> + '_ {
-        self.at_or_above(tx + 1)
+        self.at_or_above(tx.saturating_add(1))
     }
 
     /// Readers at or above an external commit frontier.
@@ -2247,6 +2247,7 @@ mod tests {
         assert_eq!(readers.above(64).collect::<Vec<_>>(), [65, 127, 128, 199]);
         assert_eq!(readers.above(127).collect::<Vec<_>>(), [128, 199]);
         assert_eq!(readers.above(199).count(), 0);
+        assert_eq!(readers.above(usize::MAX).count(), 0);
     }
 
     #[test]
