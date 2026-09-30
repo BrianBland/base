@@ -857,9 +857,17 @@ impl RecordingDb<'_> {
         let result = handler.run(evm);
         *evm.ctx_mut().error() = Ok(());
         let state = evm.ctx_mut().journal_mut().finalize();
-        let reads = std::mem::take(&mut evm.ctx_mut().db_mut().reads);
-        let result = match result {
-            Ok(result) => result,
+        let mut reads = std::mem::take(&mut evm.ctx_mut().db_mut().reads);
+        let output = match result {
+            Ok(result) => Ok(ResultAndState { result, state }),
+            Err(EVMError::Transaction(error)) => {
+                for read in &mut reads {
+                    if let Read::Account(_, _, balance) = read {
+                        *balance = BalanceRead::exact(balance.seen);
+                    }
+                }
+                Err(error)
+            }
             Err(EVMError::Database(blocked)) if blocked.0 == Blocked::INVALID_CODE => {
                 return Ok(None);
             }
@@ -873,9 +881,9 @@ impl RecordingDb<'_> {
             transaction: tx,
             environment: env,
             parent_hash: B256::ZERO,
-            output: ResultAndState { result, state },
+            fees: if output.is_ok() { handler.fees.take() } else { Vec::new() },
+            output,
             reads,
-            fees: handler.fees.take(),
         }))
     }
 

@@ -1,4 +1,4 @@
-# Builder speculation contract (Phase 1c)
+# Builder speculation contract (Phase 1d)
 
 The basic builder alone selects and orders transactions. A speculator predicts work, never
 admission. `take` has a configurable frontier wait budget (10 ms by default), waking on reset
@@ -55,6 +55,17 @@ choice or submit removes a declined proposal's writes and invalidates readers wi
 Store; cancellation discards every uncommitted proposal. Mandatory owner-State validation remains
 independent of this Store check. Unpredicted commits invalidate readers after a publication fence.
 Feeder calls/take/on_commit belong to one owner; cancellation/reset may come from another thread.
+
+Invalid-transaction outcomes retain their transaction error and every observation just like successful
+executions. Builder workers do not assume the signed nonce is valid: nonce errors read the real
+visible sender. Invalid outcomes publish no writes and defer no fees. Before reusing an error,
+both Store and independent owner-State validation must pass; failed executions conservatively
+require exact observed balances. A changed nonce, balance or fee parameter must retry, not skip
+a transaction that is now valid. Unsupported/provider failures remain misses, never transaction
+errors. Removing a write-free invalid slot must not invalidate unrelated readers.
+Duplicate hashes in a submitted snapshot share one advisory slot at their first position;
+resubmitting the same ordered unique candidates must retain completed work. Admission of repeated
+choices still belongs to the owner, and a delivered/retired result cannot be consumed twice.
 
 Tests must exercise stale nonce/storage rejection, admitted balance drift and fee rebasing,
 identity mismatch, discarded work/reset, and a declined commit followed by another choice.

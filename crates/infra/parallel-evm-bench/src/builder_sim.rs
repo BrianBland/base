@@ -272,7 +272,7 @@ impl BuilderSim {
         let mut timings = vec![Vec::new(); arms.len()];
         let mut totals = vec![(0usize, 0usize, 0usize, 0usize); arms.len()];
         println!(
-            "block,k,threads,forwarding,prewarm_ms,invalid,seq_ms,sim_ms,consumed,total,validation_failures,waste,included,not_ready,absent,invalidations,blocked,frontier_retries,timeouts,validation_ns,wait_ms,take_ns,submit_ns,inline_ns,inline_executions,commit_ns,owner_queue_wait_ns,worker_queue_wait_ns,worker_busy_ns,worker_idle_ns,read_validation_ns,rebase_ns,validation_lookups,store_validation_ns,store_validation_reads,repair_ns,submit_clone_ns"
+            "block,k,threads,forwarding,prewarm_ms,invalid,seq_ms,sim_ms,consumed,total,validation_failures,waste,included,not_ready,absent,invalidations,blocked,frontier_retries,timeouts,validation_ns,wait_ms,take_ns,submit_ns,inline_ns,inline_executions,commit_ns,owner_queue_wait_ns,worker_queue_wait_ns,worker_busy_ns,worker_idle_ns,read_validation_ns,rebase_ns,validation_lookups,store_validation_ns,store_validation_reads,repair_ns,submit_clone_ns,invalid_outcomes,invalid_consumed,removal_invalidations,retired_writers,terminal_misses,invalid_repairs,frontier_wait_ns"
         );
         for file in files {
             let fixture: BlockFixture = serde_json::from_slice(&std::fs::read(file)?)?;
@@ -357,6 +357,14 @@ impl BuilderSim {
                 let best = best.unwrap();
                 let arm = &arms[index].0;
                 let stats = best.stats;
+                println!(
+                    "# plan block={} threads={} k={} generations={} replans={}",
+                    fixture.header.number,
+                    arm.threads,
+                    arm.window,
+                    stats.generations,
+                    stats.replans
+                );
                 let waste = stats.executions.saturating_sub(stats.consumed);
                 timings[index].push(best.nanos);
                 totals[index].0 += stats.consumed;
@@ -364,7 +372,7 @@ impl BuilderSim {
                 totals[index].2 += stats.validation_failures;
                 totals[index].3 += waste;
                 println!(
-                    "{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                     fixture.header.number,
                     arm.window,
                     arm.threads,
@@ -401,7 +409,14 @@ impl BuilderSim {
                     stats.store_validation_nanos,
                     stats.store_validation_reads,
                     stats.repair_nanos,
-                    stats.submit_clone_nanos
+                    stats.submit_clone_nanos,
+                    stats.invalid_outcomes,
+                    stats.invalid_consumed,
+                    stats.removal_invalidations,
+                    stats.retired_writers,
+                    stats.terminal_misses,
+                    stats.invalid_repairs,
+                    stats.frontier_wait_nanos
                 );
             }
         }

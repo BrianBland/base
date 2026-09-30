@@ -334,12 +334,24 @@ where
                     && candidate.validate_and_rebase(self.evm.db_mut()).unwrap_or(false);
                 speculator.record_validation(valid, validation_started.elapsed(), &candidate);
                 if valid {
-                    output = crate::ParallelTransaction {
-                        hash: tx.tx().trie_hash(),
-                        signer: *tx.signer(),
-                        output: candidate.output,
-                    }
-                    .into_output::<E::HaltReason>();
+                    output =
+                        crate::ParallelTransaction {
+                            hash: tx.tx().trie_hash(),
+                            signer: *tx.signer(),
+                            output:
+                                candidate.output.map_err(|error| {
+                                    BlockExecutionError::evm(
+                                        revm::context::result::EVMError::<
+                                            core::convert::Infallible,
+                                            _,
+                                        >::Transaction(
+                                            error
+                                        ),
+                                        tx.tx().trie_hash(),
+                                    )
+                                })?,
+                        }
+                        .into_output::<E::HaltReason>();
                     break;
                 }
                 if !identity_matches || attempt != 0 {

@@ -40,8 +40,9 @@ use revm::{
 };
 
 use crate::{
-    AtomicSchedule, BaseEvmFactory, BaseHaltReason, BaseSpecId, BaseTransaction, ExecutionStatus,
-    Loc, MvMemory, ParallelDatabase, Read, RecordingDb, Store, Value, WorkSignal,
+    AtomicSchedule, BaseEvmFactory, BaseHaltReason, BaseSpecId, BaseTransaction,
+    BaseTransactionError, ExecutionStatus, Loc, MvMemory, ParallelDatabase, Read, RecordingDb,
+    Store, Value, WorkSignal,
 };
 
 /// Recorded execution before committed-state validation and fee rebasing.
@@ -53,8 +54,8 @@ pub struct SpeculativeResult {
     pub environment: EvmEnv<BaseSpecId>,
     /// Immutable parent identity, checked again at consumption.
     pub parent_hash: B256,
-    /// EVM output, excluding deferred fees until rebased.
-    pub output: ResultAndState<BaseHaltReason>,
+    /// EVM output or a transaction-validation error. Errors never carry writes or fees.
+    pub output: Result<ResultAndState<BaseHaltReason>, BaseTransactionError>,
     /// All state observations, including L1 fee parameters.
     pub reads: Vec<Read>,
     /// Deferred fee credits, including zero-valued touches.
@@ -95,7 +96,9 @@ impl SpeculativeResult {
         }
         self.read_validation_nanos = started.elapsed().as_nanos() as u64;
         let started = Instant::now();
-        Self::rebase(&mut self.output.state, &self.reads, &self.fees, db)?;
+        if let Ok(output) = &mut self.output {
+            Self::rebase(&mut output.state, &self.reads, &self.fees, db)?;
+        }
         self.rebase_nanos = started.elapsed().as_nanos() as u64;
         Ok(true)
     }
@@ -206,6 +209,24 @@ pub struct SpeculatorStats {
     pub frontier_retries: usize,
     /// Takes that waited and exhausted their budget without returning a result.
     pub timeouts: usize,
+    /// Worker transaction-error outcomes, including invalidated incarnations.
+    pub invalid_outcomes: usize,
+    /// Transaction errors accepted after mandatory owner validation.
+    pub invalid_consumed: usize,
+    /// Reader invalidations attributable to removing uncommitted writes.
+    pub removal_invalidations: usize,
+    /// Retired predictions that had published writes.
+    pub retired_writers: usize,
+    /// Finished worker attempts without a supported result.
+    pub terminal_misses: usize,
+    /// Owner repairs whose exact-prefix outcome is an invalid transaction.
+    pub invalid_repairs: usize,
+    /// Plan generations allocated, including bounded-capacity rollover.
+    pub generations: usize,
+    /// Plans replaced because retained candidates were no longer an ordered prefix.
+    pub replans: usize,
+    /// Total frontier polling time, excluding Store validation and repair.
+    pub frontier_wait_nanos: u64,
     /// Owner validation plus rebasing time in nanoseconds.
     pub validation_nanos: u64,
     /// Owner-State validation-only nanoseconds.
@@ -248,6 +269,10 @@ pub struct SpeculationCounters {
     executions: AtomicUsize,
     blocked: AtomicUsize,
     invalidations: AtomicUsize,
+    invalid_outcomes: AtomicUsize,
+    removal_invalidations: AtomicUsize,
+    retired_writers: AtomicUsize,
+    terminal_misses: AtomicUsize,
     busy: AtomicU64,
     idle: AtomicU64,
 }
@@ -273,13 +298,14 @@ impl Prediction {
     pub const GENERATION_WINDOWS: usize = 4;
 
     /// Invalidates readers after publication, removal or inline commit.
-    pub fn invalidate(&self, index: Option<usize>, changed: &[Loc]) {
+    pub fn invalidate(&self, index: Option<usize>, changed: &[Loc]) -> usize {
         fence(Ordering::SeqCst);
         let first = self.core.frontier.load(Ordering::SeqCst);
         let readers = index.map_or_else(
             || self.mv.readers_from(first, changed),
             |index| self.mv.affected_readers(index, changed),
         );
+        let mut invalidated = 0;
         for reader in readers {
             if reader < first {
                 continue;
@@ -293,7 +319,9 @@ impl Prediction {
                 self.core.status[reader].store(ExecutionStatus::EXECUTED, Ordering::SeqCst);
             }
             self.counters.invalidations.fetch_add(1, Ordering::Relaxed);
+            invalidated += 1;
         }
+        invalidated
     }
 
     /// Removes speculative writes without applying a declined proposal.
@@ -302,7 +330,11 @@ impl Prediction {
         let mut slot = job.slot.lock().unwrap();
         job.retired.store(true, Ordering::SeqCst);
         self.mv.remove(index, &slot.writes);
-        self.invalidate(Some(index), &MvMemory::removed_locations(&slot.writes));
+        self.counters
+            .retired_writers
+            .fetch_add(usize::from(!slot.writes.is_empty()), Ordering::Relaxed);
+        let invalidated = self.invalidate(Some(index), &MvMemory::removed_locations(&slot.writes));
+        self.counters.removal_invalidations.fetch_add(invalidated, Ordering::Relaxed);
         slot.result = None;
         slot.writes.clear();
         self.core.status[index].store(ExecutionStatus::EXECUTED, Ordering::SeqCst);
@@ -456,23 +488,23 @@ impl Speculator {
                 .copied()
                 .eq(candidates.iter().take(queue.order.len()).map(|tx| tx.inner().tx_hash()));
         if !matching_suffix {
-            let wanted: HashSet<_> = candidates.iter().map(|tx| tx.inner().tx_hash()).collect();
+            let mut wanted = HashSet::<B256>::default();
+            let ordered: Vec<_> = candidates
+                .iter()
+                .map(|tx| tx.inner().tx_hash())
+                .filter(|hash| wanted.insert(*hash))
+                .collect();
             let removed: Vec<_> =
                 queue.order.iter().copied().filter(|h| !wanted.contains(h)).collect();
             for hash in removed {
                 queue.remove(hash);
             }
-            let retained: Vec<_> = candidates
-                .iter()
-                .map(|tx| tx.inner().tx_hash())
-                .filter(|hash| queue.slots.contains_key(hash))
-                .collect();
-            let append_only = candidates
-                .iter()
-                .take(retained.len())
-                .map(|tx| tx.inner().tx_hash())
-                .eq(retained.iter().copied());
+            let retained: Vec<_> =
+                ordered.iter().copied().filter(|hash| queue.slots.contains_key(hash)).collect();
+            let append_only =
+                ordered.iter().copied().take(retained.len()).eq(retained.iter().copied());
             if !append_only || !retained.iter().eq(queue.order.iter()) {
+                queue.stats.replans += 1;
                 queue.clear();
             }
         }
@@ -482,6 +514,7 @@ impl Speculator {
             queue.clear();
         }
         if queue.prediction.is_none() {
+            queue.stats.generations += 1;
             let capacity = candidates
                 .len()
                 .saturating_mul(Prediction::GENERATION_WINDOWS)
@@ -500,7 +533,7 @@ impl Speculator {
             self.shared.1.notify_all();
         }
         let prediction = Arc::clone(queue.prediction.as_ref().unwrap());
-        let retained = queue.order.len();
+        let retained = if matching_suffix { queue.order.len() } else { 0 };
         for transaction in &candidates[retained..] {
             let hash = transaction.inner().tx_hash();
             if queue.slots.contains_key(&hash) {
@@ -630,6 +663,7 @@ impl Speculator {
                 std::thread::park_timeout(Self::FRONTIER_POLL);
             }
         }
+        let frontier_wait_nanos = started.elapsed().as_nanos() as u64;
         let validation_started = Instant::now();
         let mut checked = 0;
         let valid = result.as_ref().is_none_or(|result| {
@@ -676,6 +710,9 @@ impl Speculator {
         queue.stats.store_validation_nanos += validation_nanos;
         queue.stats.store_validation_reads += checked;
         queue.stats.repair_nanos += repair_nanos;
+        queue.stats.frontier_wait_nanos += frontier_wait_nanos;
+        queue.stats.invalid_repairs +=
+            usize::from(repair_nanos != 0 && result.as_ref().is_some_and(|r| r.output.is_err()));
         queue.stats.not_ready += usize::from(waited);
         queue.stats.timeouts +=
             usize::from(waited && result.is_none() && started.elapsed() >= self.frontier_wait);
@@ -716,6 +753,7 @@ impl Speculator {
         let mut queue = self.shared.0.lock().unwrap();
         if valid {
             queue.stats.consumed += 1;
+            queue.stats.invalid_consumed += usize::from(result.output.is_err());
         } else {
             queue.stats.validation_failures += 1;
         }
@@ -741,6 +779,10 @@ impl Speculator {
             executions: queue.counters.executions.load(Ordering::Relaxed),
             blocked: queue.counters.blocked.load(Ordering::Relaxed),
             invalidations: queue.counters.invalidations.load(Ordering::Relaxed),
+            invalid_outcomes: queue.counters.invalid_outcomes.load(Ordering::Relaxed),
+            removal_invalidations: queue.counters.removal_invalidations.load(Ordering::Relaxed),
+            retired_writers: queue.counters.retired_writers.load(Ordering::Relaxed),
+            terminal_misses: queue.counters.terminal_misses.load(Ordering::Relaxed),
             worker_busy_nanos: queue.counters.busy.load(Ordering::Relaxed),
             worker_idle_nanos: queue.counters.idle.load(Ordering::Relaxed),
             ..queue.stats
@@ -872,7 +914,7 @@ impl Speculator {
                                 job.transaction.signer(),
                             ),
                             speculative,
-                            !frontier,
+                            false,
                         )
                         .map(|result| {
                             result.map(|mut result| {
@@ -901,9 +943,22 @@ impl Speculator {
                     prediction.core.status[index].store(ExecutionStatus::PENDING, Ordering::SeqCst);
                 }
                 Ok(result) => {
+                    prediction.counters.invalid_outcomes.fetch_add(
+                        usize::from(result.as_ref().is_some_and(|r| r.output.is_err())),
+                        Ordering::Relaxed,
+                    );
+                    prediction
+                        .counters
+                        .terminal_misses
+                        .fetch_add(usize::from(result.is_none()), Ordering::Relaxed);
                     let writes = result
                         .as_ref()
-                        .map(|r| MvMemory::candidate_writes(&r.output.state, &r.reads))
+                        .and_then(|r| {
+                            r.output
+                                .as_ref()
+                                .ok()
+                                .map(|output| MvMemory::candidate_writes(&output.state, &r.reads))
+                        })
                         .unwrap_or_default();
                     if forwarding {
                         let changed = prediction.mv.publish_observed(
@@ -1101,7 +1156,91 @@ mod tests {
     }
 
     #[test]
-    fn take_rejects_a_nonce_invalid_at_the_committed_frontier() {
+    fn invalid_nonce_balance_and_fee_outcomes_match_sequential_errors() {
+        for upgrade in [BaseUpgrade::Bedrock, BaseUpgrade::Jovian] {
+            for case in 0..3 {
+                let epoch = parent();
+                let pre = (epoch.database)();
+                let store = Store::new(pre.as_ref());
+                let mut env = environment();
+                env.cfg_env.spec = BaseSpecId::new(upgrade);
+                let mut tx = BaseTransaction::from_recovered_tx(
+                    transaction(10).inner(),
+                    Address::repeat_byte(1),
+                );
+                match case {
+                    0 => tx.base.nonce = 1,
+                    1 => tx.base.value = U256::from(2_000_000),
+                    _ => {
+                        env.block_env.basefee = 2;
+                        tx.base.gas_price = 1;
+                    }
+                }
+                let mut sequential =
+                    epoch.factory.create_evm(CacheDB::new(pre.as_ref()), env.clone());
+                let revm::context::result::EVMError::Transaction(expected) =
+                    sequential.transact(tx.clone()).unwrap_err()
+                else {
+                    panic!("expected invalid transaction");
+                };
+                let mut outcome =
+                    RecordingDb::execute_recorded(&epoch.factory, env, &store, tx, None, false)
+                        .unwrap()
+                        .expect("invalid transactions are recorded outcomes");
+                assert_eq!(outcome.output.as_ref().unwrap_err(), &expected);
+                assert!(outcome.fees.is_empty());
+                let mut owner = CacheDB::new(pre.as_ref());
+                assert!(outcome.validate_and_rebase(&mut owner).unwrap());
+                if case != 2 {
+                    owner.insert_account_info(
+                        Address::repeat_byte(1),
+                        AccountInfo {
+                            balance: U256::from(3_000_000),
+                            nonce: u64::from(case == 0),
+                            ..Default::default()
+                        },
+                    );
+                    assert!(
+                        !outcome.validate_and_rebase(&mut owner).unwrap(),
+                        "stale invalid result must not skip a now-valid transaction"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn executor_consumes_validated_errors_without_inline_reexecution() {
+        let workers = Arc::new(Speculator::new(1, true).unwrap());
+        let epoch = parent();
+        let mut state = revm::database::State::builder()
+            .with_database_ref((epoch.database)())
+            .with_bundle_update()
+            .build();
+        workers.reset(epoch);
+        let factory = BaseBlockExecutorFactory::new(
+            AlloyReceiptBuilder::default(),
+            ChainUpgrades::mainnet(),
+            BaseEvmFactory::default(),
+        );
+        let evm = factory.evm_factory().create_evm(&mut state, environment());
+        let mut executor = factory.create_executor(
+            evm,
+            BaseBlockExecutionCtx { speculator: Some(Arc::clone(&workers)), ..Default::default() },
+        );
+        executor.execute_transaction(&transaction(10)).unwrap();
+        let invalid = transaction(20);
+        workers.submit(std::slice::from_ref(&invalid));
+        assert!(workers.wait_idle(Duration::from_secs(5)));
+        let inline = workers.stats().inline_executions;
+        assert!(executor.execute_transaction_without_commit(&invalid).is_err());
+        assert_eq!(workers.stats().inline_executions, inline);
+        assert_eq!(workers.stats().invalid_consumed, 1);
+        assert_eq!(executor.receipts.len(), 1);
+    }
+
+    #[test]
+    fn take_retains_a_nonce_invalid_at_the_committed_frontier() {
         let workers = Speculator::new(2, true).unwrap();
         workers.reset(parent());
         let tx = transaction(10);
@@ -1114,7 +1253,52 @@ mod tests {
         workers.on_commit(B256::ZERO, &EvmState::from_iter([(tx.signer(), sender)]));
         workers.submit(std::slice::from_ref(&tx));
         assert!(workers.wait_idle(Duration::from_secs(5)));
-        assert!(workers.take(tx.inner().tx_hash(), tx.signer()).is_none());
+        assert!(workers.take(tx.inner().tx_hash(), tx.signer()).is_some());
+    }
+
+    #[test]
+    fn duplicate_prediction_hashes_retain_completed_work() {
+        let workers = Speculator::new(1, true).unwrap();
+        workers.reset(parent());
+        let first = transaction(10);
+        let second = transaction(20);
+        let candidates = [first.clone(), first, second];
+        workers.submit(&candidates);
+        assert!(workers.wait_idle(Duration::from_secs(5)));
+        let executions = workers.stats().executions;
+        workers.submit(&candidates);
+        assert!(workers.wait_idle(Duration::from_secs(5)));
+        assert_eq!(workers.stats().executions, executions);
+        assert_eq!(workers.stats().replans, 0);
+    }
+
+    #[test]
+    fn invalid_candidate_does_not_publish_writes_or_invalidate_unrelated_readers() {
+        let workers = Speculator::new(1, true).unwrap();
+        workers.reset(parent());
+        let invalid = Recovered::new_unchecked(
+            BaseTxEnvelope::Legacy(
+                TxLegacy {
+                    nonce: u64::MAX - 1,
+                    gas_limit: 21_000,
+                    value: U256::from(10),
+                    to: TxKind::Call(Address::repeat_byte(2)),
+                    ..Default::default()
+                }
+                .into_signed(Signature::new(U256::from(1), U256::from(2), false)),
+            ),
+            Address::repeat_byte(1),
+        );
+        let valid = transaction(20);
+        workers.submit(&[invalid, valid.clone()]);
+        assert!(workers.wait_idle(Duration::from_secs(5)));
+        let executions = workers.stats().executions;
+        workers.submit(std::slice::from_ref(&valid));
+        assert!(workers.wait_idle(Duration::from_secs(5)));
+        assert_eq!(workers.stats().executions, executions, "removing an invalid tx writes nothing");
+        let mut proposal = workers.take(valid.inner().tx_hash(), valid.signer()).unwrap();
+        let mut owner = CacheDB::new((parent().database)());
+        assert!(proposal.validate_and_rebase(&mut owner).unwrap());
     }
 
     #[test]
@@ -1138,7 +1322,10 @@ mod tests {
             workers.submit(std::slice::from_ref(&second));
             let mut proposal = workers.take(second.inner().tx_hash(), second.signer()).unwrap();
             assert!(proposal.validate_and_rebase(&mut owner).unwrap());
-            assert_eq!(proposal.output.state[&second.signer()].info.balance, U256::from(999_980));
+            assert_eq!(
+                proposal.output.unwrap().state[&second.signer()].info.balance,
+                U256::from(999_980)
+            );
         }
     }
 
@@ -1208,7 +1395,10 @@ mod tests {
         revm::DatabaseCommit::commit(&mut owner, state);
         let mut result = workers.take(tx.inner().tx_hash(), tx.signer()).unwrap();
         assert!(result.validate_and_rebase(&mut owner).unwrap());
-        assert_eq!(result.output.state[&target].storage[&U256::ZERO].present_value, U256::from(8));
+        assert_eq!(
+            result.output.unwrap().state[&target].storage[&U256::ZERO].present_value,
+            U256::from(8)
+        );
     }
 
     #[test]
@@ -1449,8 +1639,11 @@ mod tests {
             AccountInfo { balance: U256::from(2_000_000), nonce: 1, ..Default::default() },
         );
         assert!(result.validate_and_rebase(&mut pre).unwrap());
-        assert_eq!(result.output.state[&sender].info.balance, U256::from(1_999_990));
-        assert!(result.output.state.contains_key(&env.block_env.beneficiary));
+        assert_eq!(
+            result.output.as_ref().unwrap().state[&sender].info.balance,
+            U256::from(1_999_990)
+        );
+        assert!(result.output.as_ref().unwrap().state.contains_key(&env.block_env.beneficiary));
         pre.insert_account_info(
             sender,
             AccountInfo { balance: U256::from(2_000_000), nonce: 2, ..Default::default() },
