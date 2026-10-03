@@ -26,6 +26,22 @@ const CHAIN_ID: u64 = 8453;
 /// Usable bytes per blob with the OP blob encoding.
 const BLOB_CAPACITY: usize = 130_044;
 const TARGET_BLOBS: usize = 6;
+/// Blob budget per 12 s L1 block used for the throughput projection.
+const BLOBS_PER_L1_BLOCK: usize = 14;
+const L1_BLOCK_SECS: f64 = 12.0;
+/// Uniswap Universal Router, Uniswap V2/V3 router and Aerodrome router swap selectors.
+const SWAP_SELECTORS: [&str; 10] = [
+    "0x3593564c",
+    "0x24856bc3",
+    "0x04e45aaf",
+    "0x414bf389",
+    "0xb858183f",
+    "0x38ed1739",
+    "0x7ff36ab5",
+    "0x18cbafe5",
+    "0xcac88ea9",
+    "0x5c11d795",
+];
 
 struct Block {
     root: B256,
@@ -33,6 +49,8 @@ struct Block {
     raw: Vec<Vec<u8>>,
     /// Non-deposit transactions and their senders.
     user: Vec<(Bytes, Address)>,
+    /// Calldata of each non-deposit transaction, parallel to `user`.
+    inputs: Vec<String>,
 }
 
 fn brotli10(data: &[u8]) -> usize {
@@ -87,6 +105,7 @@ fn main() {
         let root: B256 = serde_json::from_value(blk["transactionsRoot"].clone()).unwrap();
         let mut raw = Vec::new();
         let mut user = Vec::new();
+        let mut inputs = Vec::new();
         for t in blk["transactions"].as_array().unwrap() {
             let tx: Transaction = serde_json::from_value(t.clone()).unwrap();
             let from = tx.inner.inner.signer();
@@ -95,11 +114,12 @@ fn main() {
             *type_counts.entry(bytes[0].min(0x7f)).or_default() += 1;
             if !matches!(env, BaseTxEnvelope::Deposit(_)) {
                 user.push((Bytes::from(bytes.clone()), from));
+                inputs.push(t["input"].as_str().unwrap().to_owned());
             }
             raw.push(bytes);
         }
         assert_eq!(ordered_trie_root_encoded(&raw), root, "tx root mismatch");
-        blocks.push(Block { root, raw, user });
+        blocks.push(Block { root, raw, user, inputs });
     }
 
     let n_tx: usize = blocks.iter().map(|b| b.raw.len()).sum();
@@ -171,4 +191,30 @@ fn main() {
         k += 5;
     }
     println!("\n{TARGET_BLOBS} blobs ({target} B): current fills at {cur_hit:?}, zk at {zk_hit:?}");
+
+    // Homogeneous batches of one transaction class, to project DA-bound throughput if the
+    // chain were full of that class.
+    let capacity = (BLOBS_PER_L1_BLOCK * BLOB_CAPACITY) as f64 / L1_BLOCK_SECS;
+    let classes: [(&str, fn(&str) -> bool); 3] = [
+        ("eth+erc20 transfer", |i| i == "0x" || i.starts_with("0xa9059cbb")),
+        ("dex swap", |i| SWAP_SELECTORS.iter().any(|s| i.starts_with(s))),
+        ("all user txs", |_| true),
+    ];
+    println!(
+        "\nclass,txs,current_B_per_tx,zk_B_per_tx,current_tps,zk_tps ({BLOBS_PER_L1_BLOCK} blobs / 12 s)"
+    );
+    for (name, pred) in classes {
+        let user: Vec<_> = blocks
+            .iter()
+            .flat_map(|b| b.user.iter().zip(&b.inputs))
+            .filter(|(_, i)| pred(i))
+            .map(|(u, _)| u.clone())
+            .take(4_000)
+            .collect();
+        let n = user.len();
+        let (cur, zk, _, _) =
+            encodings(&[Block { root: B256::ZERO, raw: vec![], user, inputs: vec![] }]);
+        let (cb, zb) = (brotli10(&cur) as f64 / n as f64, brotli10(&zk) as f64 / n as f64);
+        println!("{name},{n},{cb:.1},{zb:.1},{:.0},{:.0}", capacity / cb, capacity / zb);
+    }
 }
