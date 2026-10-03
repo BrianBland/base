@@ -1,0 +1,90 @@
+== v2-bump-1blk --blocks 1
+Building guest package: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem
+cargo command: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem --target-dir /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/target --profile release --manifest-path /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/Cargo.toml
+trace_cells=1060681028
+blocks=1 txs=353 ecdsa=352 keys=204 bytes=120760 flags=0 instret=11965463 cells=649253336 segments=9 exec_ms=87
+app_prove_ms=74117
+         16383488144  peak memory footprint
+== v1-bump-1blk --blocks 1 --flags 4
+Building guest package: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem
+cargo command: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem --target-dir /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/target --profile release --manifest-path /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/Cargo.toml
+trace_cells=1106919130
+blocks=1 txs=353 ecdsa=352 keys=204 bytes=120760 flags=4 instret=11866125 cells=764346238 segments=9 exec_ms=261
+app_prove_ms=77787
+         16810209856  peak memory footprint
+== v2-embedded-1blk --blocks 1
+Building guest package: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem
+cargo command: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem --target-dir /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/target --profile release --manifest-path /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/Cargo.toml
+trace_cells=926194695
+blocks=1 txs=353 ecdsa=352 keys=204 bytes=120760 flags=0 instret=12721709 cells=675639021 segments=9 exec_ms=91
+app_prove_ms=73392
+         16170512456  peak memory footprint
+== v2-bump-5blk --blocks 5
+Building guest package: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem
+cargo command: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem --target-dir /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/target --profile release --manifest-path /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/Cargo.toml
+trace_cells=4975157195
+blocks=5 txs=1582 ecdsa=1577 keys=601 bytes=583394 flags=0 instret=43633635 cells=2518844135 segments=34 exec_ms=302
+app_prove_ms=477639
+         16072601576  peak memory footprint
+== v1-bump-5blk --blocks 5 --flags 4
+Building guest package: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem
+cargo command: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem --target-dir /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/target --profile release --manifest-path /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/Cargo.toml
+trace_cells=4992031634
+blocks=5 txs=1582 ecdsa=1577 keys=601 bytes=583394 flags=4 instret=52935046 cells=3436202414 segments=39 exec_ms=1162
+app_prove_ms=952858
+         16622531256  peak memory footprint
+== v2-embedded-5blk --blocks 5
+Building guest package: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem
+cargo command: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem --target-dir /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/target --profile release --manifest-path /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/Cargo.toml
+trace_cells=4565576859
+blocks=5 txs=1582 ecdsa=1577 keys=601 bytes=583394 flags=0 instret=47105956 cells=2640060027 segments=34 exec_ms=353
+app_prove_ms=566138
+         15981195192  peak memory footprint
+== v2-15blk --blocks 15
+Building guest package: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem
+cargo command: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem --target-dir /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/target --profile release --manifest-path /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/Cargo.toml
+trace_cells=14419933346
+blocks=15 txs=4636 ecdsa=4621 keys=1235 bytes=1651095 flags=0 instret=104143634 cells=6336788594 segments=100 exec_ms=730
+app_prove_ms=1033193
+         16092541000  peak memory footprint
+Building guest package: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem
+cargo command: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem --target-dir /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/target --profile release --manifest-path /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/Cargo.toml
+blocks=1 txs=353 ecdsa=352 keys=204 bytes=120760 flags=0 instret=7699462 cells=482792738 segments=6 exec_ms=77
+stark_prove_ms=82640
+         16086151072  peak memory footprint
+== v2-60blk --blocks 60
+Building guest package: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem
+cargo command: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem --target-dir /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/target --profile release --manifest-path /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/Cargo.toml
+trace_cells=41021775507
+blocks=60 txs=17743 ecdsa=17683 keys=2705 bytes=6574699 flags=0 instret=269559701 cells=19193967511 segments=275 exec_ms=2113
+app_prove_ms=2365306
+         16617271704  peak memory footprint
+== v3-5blk --blocks 5
+Building guest package: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem
+cargo command: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem --target-dir /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/target --profile release --manifest-path /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/Cargo.toml
+trace_cells=3247632213
+blocks=5 txs=1582 ecdsa=1577 keys=601 bytes=583394 flags=0 instret=28915178 cells=1941964821 segments=24 exec_ms=250
+app_prove_ms=177032
+         16191778912  peak memory footprint
+== v3-15blk --blocks 15
+Building guest package: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem
+cargo command: cargo +nightly-2026-01-18 build --target riscv32im-risc0-zkvm-elf -Z build-std=alloc,core,proc_macro,panic_abort,std -Z build-std-features=compiler-builtins-mem --target-dir /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/target --profile release --manifest-path /Users/brianbland/.mux/worktrees/base/zk-signature-removal-prototype/prototypes/zk-sig-removal/guest/Cargo.toml
+trace_cells=11098778857
+blocks=15 txs=4636 ecdsa=4621 keys=1235 bytes=1651095 flags=0 instret=76909236 cells=5264428013 segments=77 exec_ms=637
+app_prove_ms=519613
+         16222924896  peak memory footprint
+== ovm2x-5blk --blocks 5
+trace_cells=1784964661
+blocks=5 txs=1582 ecdsa=1577 keys=601 bytes=583394 flags=0 instret=17641999 cells=1381475527 segments=14 exec_ms=207
+app_prove_ms=259491
+         19932789616  peak memory footprint
+== ovm2x-15blk --blocks 15
+trace_cells=5424456710
+blocks=15 txs=4636 ecdsa=4621 keys=1235 bytes=1651095 flags=0 instret=46636248 cells=3768235584 segments=43 exec_ms=558
+app_prove_ms=551084
+         19743635928  peak memory footprint
+== ovm2x-60blk --blocks 60
+trace_cells=21441013982
+blocks=60 txs=17743 ecdsa=17683 keys=2705 bytes=6574699 flags=0 instret=161683965 cells=13886578470 segments=154 exec_ms=1726
+app_prove_ms=2017803
+         20262583272  peak memory footprint
