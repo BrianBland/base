@@ -177,7 +177,7 @@ impl ParallelPayload {
         let result = failure.map_or(result, Err);
         if result.is_ok() {
             let runs = COMPLETED_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if runs.is_power_of_two() || runs % 500 == 0 {
+            if runs.is_power_of_two() || runs.is_multiple_of(500) {
                 tracing::info!(runs, "parallel payload executions completed");
             }
         }
