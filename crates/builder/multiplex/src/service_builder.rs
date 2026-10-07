@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use base_builder_core::{BuilderConfig, FlashblocksServiceBuilder, NodeBounds, PoolBounds};
 use base_execution_evm::BaseEvmConfig;
-use base_execution_payload_builder::{ResourceMeteringConfig, config::BaseBuilderConfig};
+use base_execution_payload_builder::{
+    BuilderSpeculation, ResourceMeteringConfig, config::BaseBuilderConfig,
+};
 use base_node_core::{
     BaseConsensusBuilder, BaseEngineTypes, BaseExecutorBuilder, BaseNetworkBuilder,
     node::BasePoolBuilder,
@@ -64,8 +66,11 @@ impl MultiplexingServiceBuilder {
     /// cache and metering provider must be the same objects Flashblocks uses,
     /// otherwise permanently rejected hashes and `meterBundle` data diverge
     /// after cutover.
-    fn native_payload_config(&self, state_provider_metrics: bool) -> BaseBuilderConfig {
-        BaseBuilderConfig {
+    fn native_payload_config(
+        &self,
+        state_provider_metrics: bool,
+    ) -> eyre::Result<BaseBuilderConfig> {
+        Ok(BaseBuilderConfig {
             da_config: self.builder_config.da_config.clone(),
             gas_limit_config: self.builder_config.gas_limit_config.clone(),
             manifest_precheck_enabled: self.builder_config.manifest_precheck_enabled,
@@ -79,8 +84,8 @@ impl MultiplexingServiceBuilder {
             },
             rejection_cache: self.builder_config.rejection_cache.clone(),
             state_provider_metrics,
-            speculation: None,
-        }
+            speculation: BuilderSpeculation::with_workers(self.builder_config.speculative_workers)?,
+        })
     }
 }
 
@@ -116,7 +121,7 @@ where
                 pool.clone(),
                 ctx.provider().clone(),
                 evm_config.clone(),
-                self.native_payload_config(builder_config.state_provider_metrics),
+                self.native_payload_config(builder_config.state_provider_metrics)?,
             );
 
         let payload_config = ctx.config().builder.clone();
@@ -219,7 +224,8 @@ mod tests {
         builder_config.rejection_cache.insert(hash);
         let provider = Arc::clone(&builder_config.metering_provider);
 
-        let native = MultiplexingServiceBuilder::new(builder_config).native_payload_config(false);
+        let native =
+            MultiplexingServiceBuilder::new(builder_config).native_payload_config(false).unwrap();
         assert!(native.rejection_cache.contains_key(&hash));
         assert!(Arc::ptr_eq(&native.resource_metering.provider, &provider));
     }

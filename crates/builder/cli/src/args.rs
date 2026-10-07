@@ -228,6 +228,11 @@ pub struct Args {
     #[arg(long = "builder.predicate-eval-hard-cutoff-ms", default_value = "10")]
     pub predicate_eval_hard_cutoff_ms: u64,
 
+    /// Speculative workers that pre-execute pool candidates for the basic payload builder.
+    /// Only validated results are used; zero disables speculation.
+    #[arg(long = "builder.speculative-workers", default_value_t = 0)]
+    pub speculative_workers: usize,
+
     /// Parked predicate bucket depth at which state wakeups become threshold-aware.
     #[arg(
         long = "builder.predicate-bucket-ordered-threshold",
@@ -339,6 +344,7 @@ impl Default for Args {
             max_uncompressed_block_size: None,
             metering_wait_duration_ms: None,
             predicate_eval_hard_cutoff_ms: 10,
+            speculative_workers: 0,
             predicate_bucket_ordered_threshold: 32,
             resting_predicate_mode: RestingPredicateMode::Off,
             tx_data_store_buffer_size: 10000,
@@ -410,6 +416,7 @@ impl Args {
             max_uncompressed_block_size: self.max_uncompressed_block_size,
             metering_wait_duration: self.metering_wait_duration_ms.map(Duration::from_millis),
             predicate_eval_hard_cutoff: Duration::from_millis(self.predicate_eval_hard_cutoff_ms),
+            speculative_workers: self.speculative_workers,
             predicate_bucket_ordered_threshold: self.predicate_bucket_ordered_threshold,
             resting_predicate_mode: self.resting_predicate_mode,
             metering_provider,

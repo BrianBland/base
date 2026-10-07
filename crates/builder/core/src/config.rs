@@ -94,6 +94,10 @@ pub struct BuilderConfig {
     /// IO from the engine's validation-path IO. Adds overhead to every state read, so this is
     /// driven by reth's `--engine.state-provider-metrics` and stays off by default.
     pub state_provider_metrics: bool,
+
+    /// Speculative workers that pre-execute pool candidates for the basic payload builder.
+    /// Zero disables speculation.
+    pub speculative_workers: usize,
 }
 
 impl BuilderConfig {
@@ -129,6 +133,7 @@ impl core::fmt::Debug for BuilderConfig {
             .field("rejection_cache_size", &self.rejection_cache.entry_count())
             .field("manifest_precheck_enabled", &self.manifest_precheck_enabled)
             .field("state_provider_metrics", &self.state_provider_metrics)
+            .field("speculative_workers", &self.speculative_workers)
             .finish()
     }
 }
@@ -156,6 +161,7 @@ impl Default for BuilderConfig {
             rejection_cache: RejectionCache::default(),
             manifest_precheck_enabled: true,
             state_provider_metrics: false,
+            speculative_workers: 0,
         }
     }
 }

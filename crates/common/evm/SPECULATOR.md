@@ -83,9 +83,11 @@ receipts and BundleState against a sequential loop at every measured iteration.
 ## Phase 2: basic payload builder integration
 
 `BasePayloadBuilder` (crate `base-execution-payload-builder`) owns one persistent `Speculator`
-when the node is started with `--rollup.builder-speculative-workers N` (N > 0). The default is 0,
-which constructs no workers, installs nothing into the execution context and leaves every builder
-code path identical to the sequential builder.
+when `BaseBuilderConfig::speculation` is set. The builder binary sets it from
+`--builder.speculative-workers N` (N > 0) in its basic-only and cutover modes; worker spawn failure
+fails startup. The default is 0, which constructs no workers, installs nothing into the execution
+context and leaves every builder code path identical to the sequential builder. The node's own
+payload-builder component always builds sequentially.
 
 ```mermaid
 stateDiagram-v2
