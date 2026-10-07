@@ -62,8 +62,8 @@ base-precompile-storage = { workspace = true, features = ["test-utils"] }
 serde_json = { workspace = true, default-features = false, features = ["alloc", "preserve_order"] }
 
 [features]
-parallel = ["std", "dep:eyre", "dep:rayon", "dep:dashmap", "dep:tracing"]
-scheduler-watchdog = ["parallel"]
+parallel = [ "dep:dashmap", "dep:eyre", "dep:rayon", "dep:tracing", "std" ]
+scheduler-watchdog = [ "parallel" ]
 default = [ "blst", "c-kzg", "portable", "secp256k1", "std" ]
 std = [
 	"alloy-consensus/std",
@@ -82,6 +82,7 @@ std = [
 	"revm/std",
 	"serde?/std",
 	"thiserror/std",
+	"tracing?/std",
 ]
 serde = [
 	"alloy-consensus/serde",
@@ -90,6 +91,7 @@ serde = [
 	"base-common-chains/serde",
 	"base-common-consensus/serde",
 	"base-common-genesis/serde",
+	"dashmap?/serde",
 	"dep:serde",
 	"revm/serde",
 ]

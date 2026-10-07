@@ -35,4 +35,4 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 revm = { workspace = true, features = ["std", "blst", "c-kzg", "p256-aws-lc-rs", "secp256k1"] }
 
 [features]
-scheduler-watchdog = ["base-common-evm/scheduler-watchdog"]
+scheduler-watchdog = [ "base-common-evm/scheduler-watchdog" ]
