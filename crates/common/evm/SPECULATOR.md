@@ -1,10 +1,10 @@
-# Builder speculation contract (Phase 1d)
+# Builder speculation contract
 
 The basic builder alone selects and orders transactions. A speculator predicts work, never
 admission. `take` has a configurable frontier wait budget (10 ms by default), waking on reset
 or cancellation. This is a scheduling budget, not a hard real-time/provider-I/O deadline.
-Unsupported transactions, panics and timeouts fall back to ordinary execution. No real builder
-is wired. Engine invalidation is only a scheduling hint; owner validation is never skipped.
+Unsupported transactions, panics and timeouts fall back to ordinary execution. The basic payload
+builder is wired behind an off-by-default flag (see Phase 2 below). Engine invalidation is only a scheduling hint; owner validation is never skipped.
 
 Each parent epoch fixes the EVM factory, environment and immutable parent database factory.
 Workers own their providers. Reset/cancel prevents results from an earlier epoch escaping.
@@ -41,6 +41,8 @@ the immutable parent epoch. The current factory accepts the engine's infallible,
 facade; integrating fallible providers needs an error-poisoning facade, not default-value reads
 that could be mistaken for authentic state. Providers are constructed/used on their worker and
 need not be Send. cancel is nonblocking; Drop joins in-flight work, so provider I/O must be bounded.
+A worker releases its provider as soon as its epoch is cancelled or replaced, so no reader outlives
+the build that installed it. A worker panic stops its generation and is logged at warn level.
 
 Both execution modes share AtomicSchedule: per-position phases, invalidation counters, dependency
 waits and compare/exchange claims. Builder plans have a fixed-capacity append-only slot array;
@@ -77,3 +79,67 @@ Tests must exercise stale nonce/storage rejection, admitted balance drift and fe
 identity mismatch, discarded work/reset, and a declined commit followed by another choice.
 The offline gate compares the same deterministic fault stream's included hashes, full
 receipts and BundleState against a sequential loop at every measured iteration.
+
+## Phase 2: basic payload builder integration
+
+`BasePayloadBuilder` (crate `base-execution-payload-builder`) owns one persistent `Speculator`
+when the node is started with `--rollup.builder-speculative-workers N` (N > 0). The default is 0,
+which constructs no workers, installs nothing into the execution context and leaves every builder
+code path identical to the sequential builder.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Epoch: pool build starts and acquires the workers
+    Idle --> Sequential: workers busy with another build, no_tx_pool, or unsupported EVM environment
+    Epoch --> Fed: sequencer transactions committed, pool snapshot submitted
+    Fed --> Fed: builder executes its next choice (validated hit or sequential execution)
+    Fed --> Idle: loop ends, finalization, cancellation, deadline or error (cancel + release)
+    Epoch --> Idle: error before feeding (cancel + release)
+    Sequential --> [*]
+```
+
+Contract:
+
+- **Authority.** The builder loop (`execute_best_transactions`) is unchanged and remains the sole
+  selector: fair priority order, validity predicates, commit condition, admission/metering
+  callbacks and DA/gas limits all run exactly as without speculation. Speculation only executes
+  candidates ahead of the loop.
+- **Epoch.** A build installs `SpeculationParent { parent hash, next-block EvmEnv, production
+  BaseEvmFactory, provider factory }` before pre-execution changes, and installs the speculator
+  into the block executor's context. Sequencer transactions commit through the executor and so
+  update the overlay. Pre-block system-call writes (beacon root, block-hash history) are not
+  forwarded; a prediction that read those slots fails validation and executes sequentially.
+  Amsterdam (BAL) environments do not start an epoch. No BAL output is produced.
+- **Feed.** After the sequencer transactions, the build takes an independent
+  `best_transactions_with_attributes` snapshot of the pool with the same attributes as the
+  builder's own iterator and submits up to `Prediction::MIN_CAPACITY` candidates in that order.
+  Divergence between the snapshot and the builder's choices (parked/promoted validity candidates,
+  skipped nonce lanes, newly arrived transactions) only causes misses.
+- **Consumption.** For each choice the executor takes the matching prediction, compares identity
+  and environment, and validates every observation against the builder's committed `State` before
+  rebasing. Valid results (including validated transaction errors) feed the unchanged commit
+  condition; anything else executes sequentially. A result the commit condition declines is never
+  committed, and its speculative writes are retired on the next choice.
+- **Providers.** Each worker constructs its own reader with
+  `StateProviderFactory::state_by_block_hash(parent)` on its own thread; reth is unchanged. The
+  reader is wrapped in an error-poisoning facade: a provider error is logged at warn level and
+  aborts that worker's generation by unwinding (without invoking the panic hook). Every abort is
+  contained by the speculator, so provider errors and worker panics become misses, never build
+  failures.
+- **Lifetime.** At most one build owns the workers at a time; a concurrent build runs sequentially.
+  The owning build cancels the epoch when its pool loop ends or on any early return (finalization,
+  payload cancellation, deadline, error). Cancellation is nonblocking: workers stop at their next
+  check, drop their readers and park until the next epoch. Worker threads are joined when the
+  builder is dropped.
+- **Observability.** On release each session increments `base_builder_speculative_hits_total`
+  (validated results consumed), `base_builder_speculative_misses_total` (pool transactions executed
+  sequentially while speculating, including those after a rejection) and
+  `base_builder_speculative_rejected_total` (results that failed consume-time validation), and logs
+  the same counts at debug level.
+
+Required tests: with speculation enabled and disabled, a pool containing a same-sender nonce chain,
+cross-transaction storage and balance dependencies, a commit-condition rejection and an invalid
+transaction produces identical transactions, receipts, gas, `BundleState` and hashed post-state;
+cancellation and finalization release the workers for the next build; failing worker providers
+fall back to the sequential payload.
