@@ -40,6 +40,12 @@ pub use parkable::{
 mod metrics;
 pub use metrics::{BuilderMetrics, ValidityMetrics};
 
+mod speculation;
+pub use speculation::{
+    BuilderSpeculation, SpeculationFeed, SpeculationSession, SpeculativeDatabaseFactory,
+    SpeculativeEvmConfig, SpeculativeStateReader,
+};
+
 mod deferrals;
 pub use deferrals::BlockDeferrals;
 
