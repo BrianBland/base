@@ -861,11 +861,18 @@ impl Speculator {
                 );
             }));
             if outcome.is_err() {
+                tracing::warn!(
+                    parent = %prediction.parent.hash,
+                    "speculative worker aborted; remaining predictions execute sequentially"
+                );
                 prediction.stop.store(true, Ordering::SeqCst);
                 prediction.signal.notify();
                 provider = None;
             }
             let mut queue = shared.0.lock().unwrap();
+            if queue.parent.as_ref().is_none_or(|parent| !Arc::ptr_eq(parent, &prediction.parent)) {
+                provider = None;
+            }
             queue.active -= 1;
             shared.2.notify_all();
         }
@@ -1128,6 +1135,59 @@ mod tests {
         release.send(()).unwrap();
         assert!(workers.wait_idle(Duration::from_secs(5)));
         assert_eq!(workers.stats().executions, 1);
+    }
+
+    /// Provider wrapper that counts how many worker readers are still alive.
+    #[derive(Debug)]
+    struct CountedDb {
+        base: Box<dyn ParallelDatabase>,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl Drop for CountedDb {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl revm::DatabaseRef for CountedDb {
+        type Error = std::convert::Infallible;
+
+        fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            self.base.basic_ref(address)
+        }
+
+        fn storage_ref(&self, address: Address, slot: U256) -> Result<U256, Self::Error> {
+            self.base.storage_ref(address, slot)
+        }
+
+        fn code_by_hash_ref(&self, hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
+            self.base.code_by_hash_ref(hash)
+        }
+
+        fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+            self.base.block_hash_ref(number)
+        }
+    }
+
+    #[test]
+    fn cancellation_releases_worker_providers() {
+        let workers = Speculator::new(2, true).unwrap();
+        let mut epoch = parent();
+        let database = Arc::clone(&epoch.database);
+        let live = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&live);
+        epoch.database = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::new(CountedDb { base: database(), live: Arc::clone(&counter) })
+        });
+        workers.reset(epoch);
+        workers.submit(&[transaction(10), transaction(20)]);
+        assert!(workers.wait_idle(Duration::from_secs(5)));
+        assert!(live.load(Ordering::SeqCst) > 0, "workers keep their reader within an epoch");
+        workers.cancel();
+        assert!(workers.wait_idle(Duration::from_secs(5)));
+        assert_eq!(live.load(Ordering::SeqCst), 0);
     }
 
     fn transaction(value: u64) -> Recovered<BaseTxEnvelope> {
