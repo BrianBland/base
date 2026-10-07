@@ -42,8 +42,8 @@ the immutable parent epoch. The current factory accepts the engine's infallible,
 facade; integrating fallible providers needs an error-poisoning facade, not default-value reads
 that could be mistaken for authentic state. Providers are constructed/used on their worker and
 need not be Send. cancel is nonblocking; Drop joins in-flight work, so provider I/O must be bounded.
-A worker releases its provider as soon as its epoch is cancelled or replaced, so no reader outlives
-the build that installed it. A worker panic stops its generation and is logged at warn level.
+A worker releases its provider whenever it has no live generation to work on (cancelled, replaced
+or stopped by a sibling panic) and before it parks, so no reader outlives its generation. A worker panic stops its generation and is logged at warn level.
 
 Both execution modes share AtomicSchedule: per-position phases, invalidation counters, dependency
 waits and compare/exchange claims. Builder plans have a fixed-capacity append-only slot array;

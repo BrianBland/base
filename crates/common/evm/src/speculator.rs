@@ -803,6 +803,8 @@ impl Speculator {
                 while queue.prediction.as_ref().is_none_or(|p| p.stop.load(Ordering::SeqCst))
                     && !queue.stopped
                 {
+                    // A parked worker must not pin a parent reader.
+                    provider = None;
                     queue = shared.1.wait(queue).unwrap();
                 }
                 if queue.stopped {
@@ -835,7 +837,11 @@ impl Speculator {
                 provider = None;
             }
             let mut queue = shared.0.lock().unwrap();
-            if queue.parent.as_ref().is_none_or(|parent| !Arc::ptr_eq(parent, &prediction.parent)) {
+            // Release before reporting idle, so settled workers hold no reader.
+            let reusable =
+                queue.parent.as_ref().is_some_and(|parent| Arc::ptr_eq(parent, &prediction.parent))
+                    && queue.prediction.as_ref().is_some_and(|p| !p.stop.load(Ordering::SeqCst));
+            if !reusable {
                 provider = None;
             }
             queue.active -= 1;
@@ -1136,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_releases_worker_providers() {
+    fn cancellation_and_sibling_panics_release_worker_providers() {
         let workers = Speculator::new(2, true).unwrap();
         let mut epoch = parent();
         let database = Arc::clone(&epoch.database);
@@ -1150,6 +1156,37 @@ mod tests {
         workers.submit(&[transaction(10), transaction(20)]);
         assert!(workers.wait_idle(Duration::from_secs(5)));
         assert!(live.load(Ordering::SeqCst) > 0, "workers keep their reader within an epoch");
+        workers.cancel();
+        assert!(workers.wait_idle(Duration::from_secs(5)));
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+
+        // A sibling panic stops the generation while the parent stays installed: the healthy
+        // worker must release its reader before parking, and again across cancel wakeups.
+        let mut epoch = parent();
+        let database = Arc::clone(&epoch.database);
+        let counter = Arc::clone(&live);
+        let (constructed, healthy_constructed) = std::sync::mpsc::channel();
+        let healthy_constructed = Mutex::new(healthy_constructed);
+        let (panicking, sibling_panicked) = std::sync::mpsc::channel();
+        let factories = AtomicUsize::new(0);
+        epoch.database = Arc::new(move || {
+            if factories.fetch_add(1, Ordering::SeqCst) != 0 {
+                healthy_constructed.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                panicking.send(()).unwrap();
+                panic!("injected sibling provider failure");
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            constructed.send(()).unwrap();
+            Box::new(CountedDb { base: database(), live: Arc::clone(&counter) })
+        });
+        workers.reset(epoch);
+        workers.submit(&[transaction(10), transaction(20), transaction(30)]);
+        sibling_panicked.recv_timeout(Duration::from_secs(5)).unwrap();
+        let parked = Instant::now();
+        while live.load(Ordering::SeqCst) != 0 && parked.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(live.load(Ordering::SeqCst), 0, "parked workers hold no reader");
         workers.cancel();
         assert!(workers.wait_idle(Duration::from_secs(5)));
         assert_eq!(live.load(Ordering::SeqCst), 0);
