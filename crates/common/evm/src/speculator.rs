@@ -164,7 +164,7 @@ pub struct SpeculationParent {
     /// Production EVM configuration.
     pub factory: BaseEvmFactory,
     /// Thread-local provider constructor; providers need not be Send.
-    /// Workers reuse one per epoch. A rare owner repair constructs its own reader.
+    /// Workers reuse one per epoch; the owner never constructs one.
     pub database: Arc<dyn Fn() -> Box<dyn ParallelDatabase> + Send + Sync>,
     overlay: Store<'static>,
 }
@@ -210,7 +210,7 @@ pub struct SpeculatorStats {
     pub invalidations: usize,
     /// Executions stopped on an ESTIMATE dependency.
     pub blocked: usize,
-    /// Store-side owner repairs plus owner-State failures scheduled for worker retry.
+    /// Owner-State validation failures scheduled for a worker retry.
     pub frontier_retries: usize,
     /// Takes that waited and exhausted their budget without returning a result.
     pub timeouts: usize,
@@ -224,13 +224,11 @@ pub struct SpeculatorStats {
     pub retired_writers: usize,
     /// Finished worker attempts without a supported result.
     pub terminal_misses: usize,
-    /// Owner repairs whose exact-prefix outcome is an invalid transaction.
-    pub invalid_repairs: usize,
     /// Plan generations allocated, including bounded-capacity rollover.
     pub generations: usize,
     /// Plans replaced because retained candidates were no longer an ordered prefix.
     pub replans: usize,
-    /// Take setup and frontier polling time, excluding Store validation and repair.
+    /// Take setup and frontier polling time, excluding Store validation.
     pub frontier_wait_nanos: u64,
     /// Owner validation plus rebasing time in nanoseconds.
     pub validation_nanos: u64,
@@ -244,8 +242,6 @@ pub struct SpeculatorStats {
     pub store_validation_nanos: u64,
     /// Store validation observations checked.
     pub store_validation_reads: usize,
-    /// Owner repair nanoseconds within take, including provider construction.
-    pub repair_nanos: u64,
     /// Epoch-wide feeder clone nanoseconds, including initial prewarm; results move, never clone.
     pub submit_clone_nanos: u64,
     /// Owner time in take, including queue contention and bounded frontier waits.
@@ -610,7 +606,9 @@ impl Speculator {
         queue.requested = None;
     }
 
-    /// Waits for the frontier, checks Store and repairs invalid work locally.
+    /// Waits for the frontier and checks the result against Store; a stale result is a miss.
+    /// The owner never executes or constructs a provider here, so a miss costs no more than
+    /// the caller's own sequential execution.
     /// Store is unchanged until `on_commit`; independent owner-State validation remains mandatory.
     pub fn take(&self, hash: B256, signer: Address) -> Option<SpeculativeResult> {
         let started = Instant::now();
@@ -686,46 +684,13 @@ impl Speculator {
             })
         });
         let validation_nanos = validation_started.elapsed().as_nanos() as u64;
-        let mut repair_nanos = 0;
-        if !valid && !prediction.stop.load(Ordering::SeqCst) {
-            let repair_started = Instant::now();
-            prediction.counters.executions.fetch_add(1, Ordering::Relaxed);
-            let pre = catch_unwind(AssertUnwindSafe(|| (prediction.parent.database)()));
-            result = pre.ok().and_then(|pre| {
-                let store = prediction.parent.overlay.fork(pre.as_ref());
-                self.shared.0.lock().unwrap().stats.frontier_retries += 1;
-                catch_unwind(AssertUnwindSafe(|| {
-                    let mut evm = RecordingDb::candidate_evm(
-                        &prediction.parent.factory,
-                        prediction.parent.env.clone(),
-                        &store,
-                    );
-                    RecordingDb::execute_reusing(
-                        &mut evm,
-                        prediction.parent.env.clone(),
-                        BaseTransaction::from_recovered_tx(job.transaction.inner(), signer),
-                        None,
-                        false,
-                    )
-                    .ok()
-                    .flatten()
-                    .map(|mut result| {
-                        result.parent_hash = prediction.parent.hash;
-                        result
-                    })
-                }))
-                .ok()
-                .flatten()
-            });
-            repair_nanos = repair_started.elapsed().as_nanos() as u64;
+        if !valid {
+            result = None;
         }
         let mut queue = self.shared.0.lock().unwrap();
         queue.stats.store_validation_nanos += validation_nanos;
         queue.stats.store_validation_reads += checked;
-        queue.stats.repair_nanos += repair_nanos;
         queue.stats.frontier_wait_nanos += frontier_wait_nanos;
-        queue.stats.invalid_repairs +=
-            usize::from(repair_nanos != 0 && result.as_ref().is_some_and(|r| r.output.is_err()));
         queue.stats.not_ready += usize::from(waited);
         queue.stats.timeouts +=
             usize::from(waited && result.is_none() && started.elapsed() >= self.frontier_wait);
@@ -1418,10 +1383,15 @@ mod tests {
     }
 
     #[test]
-    fn frontier_repairs_predictions_after_an_inline_storage_commit() {
-        let workers = Speculator::new(2, true).unwrap();
+    fn stale_store_results_are_misses_without_owner_execution() {
+        // Without forwarding no readers are registered, so the inline commit leaves the
+        // worker's stale result in place for `take` to reject.
+        let workers = Speculator::new(1, false).unwrap();
         let mut epoch = parent();
-        epoch.database = Arc::new(|| {
+        let providers = Arc::new(AtomicUsize::new(0));
+        let constructed = Arc::clone(&providers);
+        epoch.database = Arc::new(move || {
+            constructed.fetch_add(1, Ordering::SeqCst);
             let mut db = CacheDB::new(EmptyDB::default());
             db.insert_account_info(
                 Address::repeat_byte(1),
@@ -1437,6 +1407,7 @@ mod tests {
             );
             Box::new(db)
         });
+        let factory = epoch.factory;
         let mut owner = CacheDB::new((epoch.database)());
         workers.reset(epoch);
         let tx = Recovered::new_unchecked(
@@ -1466,12 +1437,15 @@ mod tests {
         let state = EvmState::from_iter([(target, changed)]);
         workers.on_commit(B256::repeat_byte(9), &state);
         revm::DatabaseCommit::commit(&mut owner, state);
-        let mut result = workers.take(tx.inner().tx_hash(), tx.signer()).unwrap();
-        assert!(result.validate_and_rebase(&mut owner).unwrap());
-        assert_eq!(
-            result.output.unwrap().state[&target].storage[&U256::ZERO].present_value,
-            U256::from(8)
-        );
+        let providers_before_take = providers.load(Ordering::SeqCst);
+
+        assert!(workers.take(tx.inner().tx_hash(), tx.signer()).is_none());
+        assert_eq!(providers.load(Ordering::SeqCst), providers_before_take);
+        let sequential = factory
+            .create_evm(&mut owner, environment())
+            .transact(BaseTransaction::from_recovered_tx(tx.inner(), tx.signer()))
+            .unwrap();
+        assert_eq!(sequential.state[&target].storage[&U256::ZERO].present_value, U256::from(8));
     }
 
     #[test]

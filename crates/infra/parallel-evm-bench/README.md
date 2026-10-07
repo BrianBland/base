@@ -143,7 +143,7 @@ prediction; unrelated candidates remain. Faulted paths can touch fixture-missing
 Invalid nonces now read the visible sender rather than assuming the signed nonce. Transaction-error
 outcomes retain their reads, validate against both Store and owner State, and publish no writes.
 Duplicate synthetic hashes share an advisory slot; repeated snapshots retain completed work.
-Invalid-outcome/consumed, removal-invalidation, retired-writer, terminal-miss, repair and frontier
+Invalid-outcome/consumed, removal-invalidation, retired-writer, terminal-miss and frontier
 wait counters distinguish faults from useful work. `# plan` rows report generations and replans.
 Consumed/hit counts include validated errors; included hashes and receipts still count admission.
 
@@ -171,12 +171,12 @@ forwarding but retains the same claim/retirement protocol.
 
 `take` waits up to 10 ms by default. `--frontier-wait-ms 0` measures nonblocking inline fallback;
 timeouts, unsupported transactions and a failed exact-prefix retry fall back to normal execution.
-`take` validates against authentic cached parent reads plus Store and repairs stale work on the
-owner. Store mutation remains in `on_commit`, because a commit-condition may still decline a taken
+`take` validates against authentic cached parent reads plus Store; stale work is a miss that the
+owner executes inline. Store mutation remains in `on_commit`, because a commit-condition may still decline a taken
 proposal. A failed independent owner-State validation gets at most one worker retry. Every accepted
 proposal still validates/rebases against owner State; engine invalidation is not a soundness gate.
-CSV counters split owner-State read validation, lookup count, rebase, Store read validation, exact
-repair and feeder transaction cloning. Results move rather than clone. Parent AccountInfo/bytecode
+CSV counters split owner-State read validation, lookup count, rebase, Store read validation and
+feeder transaction cloning. Results move rather than clone. Parent AccountInfo/bytecode
 clone costs remain inside their lookup/rebase phases; `submit_clone_ns` is epoch-wide feeder envelope
 cloning, including the untimed initial plan (an upper bound on timed-loop clone cost).
 Legacy queue-wait columns are retained as zero placeholders, not measurements of rare epoch locks.

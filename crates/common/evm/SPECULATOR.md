@@ -9,8 +9,8 @@ builder is wired behind an off-by-default flag (see Phase 2 below). Engine inval
 Each parent epoch fixes the EVM factory, environment and immutable parent database factory.
 Workers own their providers. Reset/cancel prevents results from an earlier epoch escaping.
 Authentic immutable parent account/storage reads are cached separately from committed writes;
-take validates this cache without constructing a provider. Cache misses fail closed into repair,
-which constructs an owner-local provider. The factory must also support that rare owner call.
+take validates this cache without constructing a provider. A cache miss or stale value makes the
+result a miss; the owner never constructs a provider or executes speculatively.
 Submit retains a matching ordered suffix and appends new candidates to its plan. Skips remove
 speculative writes and invalidate readers; reordered plans start a new generation. A bounded
 generation has max(1024, 4 × initial-window-length) indices and rolls over when full, retaining
@@ -19,9 +19,10 @@ Workers forward writes, invalidate affected readers and block on ESTIMATE depend
 The builder alone advances the committed prefix through on_commit, including inline execution,
 fees and system changes. A returned result is only a proposal: a later choice without a commit
 discards its writes. An unpredicted choice executes inline and preserves the remaining plan.
-Store validation first repairs stale frontier work on the owner using an exact-prefix reader.
-At most one subsequent failed owner-State validation is retried on a worker at the exact prefix;
-a second failure or a wait timeout executes inline. Each take gets its own bounded wait budget.
+A result that fails Store validation is a miss: the builder executes the transaction on its
+normal sequential path, at the same cost as without speculation. At most one failed owner-State
+validation is retried on a worker at the exact prefix; a second failure or a wait timeout executes
+inline. Each take gets its own bounded wait budget.
 
 Consumption on the owner thread checks transaction identity, environment, every account
 existence/nonce/code read, every storage value, and every recorded balance range against
@@ -50,7 +51,7 @@ workers scan the lowest pending position and publish under that position's lock,
 queue lock. Retiring a running slot prevents late publication without waiting for provider I/O.
 Workers retain their base reader per epoch and reuse an EVM per generation. Panic/stop wakes waiters.
 
-`take` checks recorded values against Store and repairs invalid frontier work on the owner.
+`take` checks recorded values against Store and returns no result when any is stale.
 It does NOT apply state: a builder commit-condition can still decline the proposal. Only
 `on_commit` applies the owner's admitted, fee-rebased state and advances the frontier. A later
 choice or submit removes a declined proposal's writes and invalidates readers without changing
