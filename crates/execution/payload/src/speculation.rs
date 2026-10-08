@@ -218,7 +218,8 @@ impl SpeculativeStateReader {
         Self::new(factory.state_by_block_hash(hash).unwrap_or_else(|error| Self::abort(error)))
     }
 
-    fn read<T>(
+    /// Runs one provider read, aborting the worker's generation on failure.
+    pub fn read<T>(
         &self,
         read: impl FnOnce(&StateProviderDatabase<StateProviderBox>) -> Result<T, ProviderError>,
     ) -> Result<T, std::convert::Infallible> {
@@ -226,7 +227,8 @@ impl SpeculativeStateReader {
         Ok(read(&provider).unwrap_or_else(|error| Self::abort(error)))
     }
 
-    fn abort(error: ProviderError) -> ! {
+    /// Logs a provider failure and unwinds with it as payload, without the panic hook.
+    pub fn abort(error: ProviderError) -> ! {
         warn!(
             target: "payload_builder",
             error = %error,
