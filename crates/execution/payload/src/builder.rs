@@ -15,7 +15,7 @@ use alloy_rpc_types_debug::ExecutionWitness;
 use alloy_rpc_types_engine::PayloadId;
 use base_common_chains::Upgrades;
 use base_common_consensus::{BaseTransaction, CoinbaseTip, Predeploys};
-use base_common_evm::L1BlockInfo;
+use base_common_evm::{L1BlockInfo, Prediction};
 use base_execution_eip8130::IntrinsicGas;
 use base_execution_txpool::{
     BasePooledTx, GuardMetrics, ParkableTransactionPool, PredicateContext, ValidityPredicate,
@@ -57,7 +57,8 @@ use crate::{
     Attributes, BasePayloadBuilderAttributes, BlockDeferrals, BuilderMetrics,
     CoinbaseTipAffordability, InclusionTracker, MeteringProvider, ParkableBestPayloadTransactions,
     ParkablePayloadTransactions, ParkedPredicateIndex, PayloadPrimitives, PredicateLoadTracker,
-    PredicateReadRecorder, RejectionCacheMetrics, StateChangeEffects, ValidityMetrics,
+    PredicateReadRecorder, RejectionCacheMetrics, SpeculationFeed, SpeculationSession,
+    SpeculativeEvmConfig, SpeculativeStateReader, StateChangeEffects, ValidityMetrics,
     ValidityPredicateEvaluation, config::BaseBuilderConfig, error::BasePayloadBuilderError,
     payload::BaseBuiltPayload,
 };
@@ -180,6 +181,8 @@ where
         best: impl FnOnce(BestTransactionsAttributes) -> Txs + Send + Sync + 'a,
     ) -> Result<BuildOutcome<BaseBuiltPayload<N>>, PayloadBuilderError>
     where
+        Evm: SpeculativeEvmConfig,
+        Client: Clone + Sync + 'static,
         Txs: ParkablePayloadTransactions<
             Transaction: PoolTransaction<Consensus = N::SignedTx> + BasePooledTx,
         >,
@@ -205,9 +208,28 @@ where
         tracing::Span::current().record("parent_num", ctx.parent().number());
 
         let pool = self.pool.clone();
-        let builder = Builder::new(best).with_permanent_eviction(move |hashes| {
+        let mut builder = Builder::new(best).with_permanent_eviction(move |hashes| {
             let _ = pool.remove_transactions(hashes);
         });
+        if let Some(speculation) = &self.config.speculation
+            && !ctx.attributes().no_tx_pool()
+        {
+            let client = self.client.clone();
+            let parent_hash = ctx.parent().hash();
+            let pool = self.pool.clone();
+            builder = builder.with_speculation(SpeculationFeed {
+                speculation: Arc::clone(speculation),
+                database: Arc::new(move || {
+                    Box::new(SpeculativeStateReader::open(&client, parent_hash))
+                }),
+                candidates: Box::new(move |attributes| {
+                    pool.best_transactions_with_attributes(attributes)
+                        .take(Prediction::MIN_CAPACITY)
+                        .map(|transaction| Evm::speculation_candidate(transaction.to_consensus()))
+                        .collect()
+                }),
+            });
+        }
 
         let state_provider = crate::BuilderStateProvider::new(
             self.client.state_by_block_hash(ctx.parent().hash())?,
@@ -267,9 +289,14 @@ where
 impl<Pool, Client, Evm, N, Attrs> PayloadBuilder for BasePayloadBuilder<Pool, Client, Evm, Attrs>
 where
     N: PayloadPrimitives,
-    Client: StateProviderFactory + ChainSpecProvider<ChainSpec: Upgrades> + BlockReader + Clone,
+    Client: StateProviderFactory
+        + ChainSpecProvider<ChainSpec: Upgrades>
+        + BlockReader
+        + Clone
+        + Sync
+        + 'static,
     Pool: ParkableTransactionPool<Transaction: BasePooledTx<Consensus = N::SignedTx>>,
-    Evm: ConfigureEvm<
+    Evm: SpeculativeEvmConfig<
             Primitives = N,
             NextBlockEnvCtx: BuildNextEnv<Attrs, N::BlockHeader, Client::ChainSpec>,
         >,
@@ -341,18 +368,30 @@ pub struct Builder<'a, Txs> {
     /// Permanently removes mempool transactions that exceeded a per-transaction resource limit.
     #[debug(skip)]
     evict_permanently_rejected: Box<dyn FnOnce(Vec<TxHash>) + 'a>,
+    /// Ahead-of-builder speculation for the pool scan, if enabled.
+    speculation: Option<SpeculationFeed<'a>>,
 }
 
 impl<'a, Txs> Builder<'a, Txs> {
     /// Creates a new [`Builder`].
     pub fn new(best: impl FnOnce(BestTransactionsAttributes) -> Txs + Send + Sync + 'a) -> Self {
-        Self { best: Box::new(best), evict_permanently_rejected: Box::new(|_| {}) }
+        Self {
+            best: Box::new(best),
+            evict_permanently_rejected: Box::new(|_| {}),
+            speculation: None,
+        }
     }
 
     /// Sets the callback used to permanently remove mempool transactions that exceeded a
     /// per-transaction resource limit.
     pub fn with_permanent_eviction(mut self, evict: impl FnOnce(Vec<TxHash>) + 'a) -> Self {
         self.evict_permanently_rejected = Box::new(evict);
+        self
+    }
+
+    /// Pre-executes pool candidates on speculative workers; the builder's choices are unchanged.
+    pub fn with_speculation(mut self, speculation: SpeculationFeed<'a>) -> Self {
+        self.speculation = Some(speculation);
         self
     }
 }
@@ -367,7 +406,7 @@ impl<Txs> Builder<'_, Txs> {
         ctx: BasePayloadBuilderCtx<Evm, ChainSpec, Attrs>,
     ) -> Result<BuildOutcomeKind<BaseBuiltPayload<N>>, PayloadBuilderError>
     where
-        Evm: ConfigureEvm<
+        Evm: SpeculativeEvmConfig<
                 Primitives = N,
                 NextBlockEnvCtx: BuildNextEnv<Attrs, N::BlockHeader, ChainSpec>,
             >,
@@ -378,7 +417,7 @@ impl<Txs> Builder<'_, Txs> {
         >,
         Attrs: Attributes<Transaction = N::SignedTx>,
     {
-        let Self { best, evict_permanently_rejected } = self;
+        let Self { best, evict_permanently_rejected, speculation } = self;
         debug!(target: "payload_builder", id=%ctx.payload_id(), parent_header = ?ctx.parent().hash(), parent_number = ctx.parent().number(), "building new payload");
 
         let mut db = State::builder().with_database(db).with_bundle_update().build();
@@ -388,7 +427,11 @@ impl<Txs> Builder<'_, Txs> {
         // scalar.
         db.load_cache_account(Predeploys::L1_BLOCK_INFO).map_err(BlockExecutionError::other)?;
 
-        let mut builder = ctx.block_builder(&mut db)?;
+        let session = match &speculation {
+            Some(feed) => ctx.start_speculation(feed)?,
+            None => None,
+        };
+        let mut builder = ctx.speculative_block_builder(&mut db, session.as_ref())?;
 
         if let Some(task) = state_root_handle.as_mut() {
             builder.evm_mut().db_mut().set_state_hook(Some(Box::new(task.take_state_hook())));
@@ -405,8 +448,13 @@ impl<Txs> Builder<'_, Txs> {
 
         // 3. if mem pool transactions are requested we execute them
         if !ctx.attributes().no_tx_pool() {
-            let best_txs = best(ctx.best_transaction_attributes(builder.evm_mut().block()));
+            let best_attributes = ctx.best_transaction_attributes(builder.evm_mut().block());
+            if let (Some(session), Some(speculation)) = (&session, speculation) {
+                session.submit(&(speculation.candidates)(best_attributes));
+            }
+            let best_txs = best(best_attributes);
             let cancelled = ctx.execute_best_transactions(&mut info, &mut builder, best_txs)?;
+            drop(session);
             if !info.permanently_rejected_txs.is_empty() {
                 let rejected = std::mem::take(&mut info.permanently_rejected_txs);
                 let count = rejected.len();
@@ -730,6 +778,69 @@ where
                 .map_err(PayloadBuilderError::other)?,
             )
             .map_err(PayloadBuilderError::other)
+    }
+
+    /// Installs this payload's parent epoch on the feed's workers.
+    ///
+    /// Returns `None` when the workers are busy with another build or the environment is
+    /// unsupported; the build then runs sequentially. The session owns the epoch until dropped.
+    pub fn start_speculation(
+        &self,
+        feed: &SpeculationFeed<'_>,
+    ) -> Result<Option<SpeculationSession>, PayloadBuilderError>
+    where
+        Evm: SpeculativeEvmConfig,
+    {
+        let attributes = Evm::NextBlockEnvCtx::build_next_env(
+            self.attributes(),
+            self.parent(),
+            self.chain_spec.as_ref(),
+        )
+        .map_err(PayloadBuilderError::other)?;
+        let evm_env = self
+            .evm_config
+            .next_evm_env(self.parent(), &attributes)
+            .map_err(PayloadBuilderError::other)?;
+        Ok(self
+            .evm_config
+            .speculation_parent(self.parent().hash(), &evm_env, Arc::clone(&feed.database))
+            .and_then(|parent| feed.speculation.start(parent)))
+    }
+
+    /// Prepares a [`BlockBuilder`] whose executor consumes validated results of `session`.
+    ///
+    /// Without a session the builder is identical to [`Self::block_builder`].
+    pub fn speculative_block_builder<'a, DB: Database>(
+        &'a self,
+        db: &'a mut State<DB>,
+        session: Option<&SpeculationSession>,
+    ) -> Result<
+        impl BlockBuilder<Primitives = Evm::Primitives, Executor = BlockExecutorForEvm<'a, Evm, DB>>
+        + 'a,
+        PayloadBuilderError,
+    >
+    where
+        Evm: SpeculativeEvmConfig,
+    {
+        let attributes = Evm::NextBlockEnvCtx::build_next_env(
+            self.attributes(),
+            self.parent(),
+            self.chain_spec.as_ref(),
+        )
+        .map_err(PayloadBuilderError::other)?;
+        let evm_env = self
+            .evm_config
+            .next_evm_env(self.parent(), &attributes)
+            .map_err(PayloadBuilderError::other)?;
+        let mut execution_ctx = self
+            .evm_config
+            .context_for_next_block(self.parent(), attributes)
+            .map_err(PayloadBuilderError::other)?;
+        if let Some(session) = session {
+            Evm::install_speculator(&mut execution_ctx, session.speculator());
+        }
+        let evm = self.evm_config.evm_with_env(db, evm_env);
+        Ok(self.evm_config.create_block_builder(evm, self.parent(), execution_ctx))
     }
 
     /// Closes the iterator's current candidate.
@@ -1538,6 +1649,8 @@ mod tests {
     use alloy_eips::eip2718::Encodable2718;
     use alloy_evm::Evm;
     use alloy_primitives::{Address, B256, Signature, StorageKey, TxHash, TxKind, U256};
+    use alloy_signer::SignerSync;
+    use alloy_signer_local::PrivateKeySigner;
     use base_bundles::{MeterBundleResponse, OpcodeGas, TransactionResult};
     use base_common_chains::BaseUpgrade;
     use base_common_consensus::{BasePrimitives, BaseTxEnvelope, Predeploys};
@@ -1551,6 +1664,7 @@ mod tests {
     use reth_ethereum_forks::ForkCondition;
     use reth_evm::execute::BlockBuilder;
     use reth_payload_builder::PayloadId;
+    use reth_payload_primitives::BuiltPayload;
     use reth_payload_util::{NoopPayloadTransactions, PayloadTransactions};
     use reth_primitives_traits::{Account, SealedHeader, SignedTransaction, WithEncoded};
     use reth_provider::noop::NoopProvider;
@@ -1570,10 +1684,11 @@ mod tests {
 
     use super::{BasePayloadBuilderCtx, Builder, ExecutionInfo};
     use crate::{
-        BasePayloadBuilderAttributes, MeteringProvider, NoopMeteringProvider,
+        BasePayloadBuilderAttributes, BuilderSpeculation, MeteringProvider, NoopMeteringProvider,
         ParkablePayloadTransactions, ResourceMeteringConfig, ResourceMeteringDimension,
         ResourceMeteringOperation, ResourceMeteringSchedule, SharedMeteringProvider,
-        config::BaseBuilderConfig, payload::EthPayloadBuilderAttributes,
+        SpeculationFeed, SpeculativeStateReader, config::BaseBuilderConfig,
+        payload::EthPayloadBuilderAttributes,
     };
 
     #[derive(Debug)]
@@ -2872,6 +2987,311 @@ mod tests {
             2,
             "the cache hit must be timed as well as the read-through; recording only the \
              read-through would hide the benefit of a warm cache"
+        );
+    }
+
+    const COUNTER: Address = Address::repeat_byte(0xc0);
+    const BURNER: Address = Address::repeat_byte(0xb0);
+    /// `slot0 += 1`.
+    const COUNTER_CODE: [u8; 10] = [0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00];
+
+    /// Writes ten fresh storage slots, so its executed gas exceeds the test metering limit.
+    fn burner_code() -> Vec<u8> {
+        let mut code: Vec<u8> = (1..=10).flat_map(|slot| [0x60, 0x01, 0x60, slot, 0x55]).collect();
+        code.push(0x00);
+        code
+    }
+
+    /// A transaction signed by the deterministic test key `sender`.
+    fn signed_pool_transaction(
+        sender: u8,
+        nonce: u64,
+        to: Address,
+        value: U256,
+        gas_limit: u64,
+    ) -> BasePooledTransaction {
+        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(sender)).unwrap();
+        let tx = TxEip1559 {
+            chain_id: 8_453,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: 2_000_000_000,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(to),
+            value,
+            ..Default::default()
+        };
+        let signature = signer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        let envelope = BaseTxEnvelope::Eip1559(tx.into_signed(signature));
+        let encoded_len = envelope.encode_2718_len();
+        BasePooledTransaction::new(
+            envelope.try_into_recovered().expect("test signature must recover"),
+            encoded_len,
+        )
+    }
+
+    /// The SPECULATOR.md Phase 2 scenario, in builder order: a nonce chain, storage and balance
+    /// dependencies, an invalid transaction, a commit-condition rejection and an expired
+    /// validity predicate.
+    fn speculation_scenario() -> (Vec<BasePooledTransaction>, StateProviderTest) {
+        let chain = |nonce, to, value| signed_pool_transaction(1, nonce, to, value, 100_000);
+        let recipient = signed_pool_transaction(3, 0, COUNTER, U256::ZERO, 100_000);
+        let transactions = vec![
+            chain(0, COUNTER, U256::ZERO),
+            chain(1, COUNTER, U256::ZERO),
+            signed_pool_transaction(
+                2,
+                0,
+                recipient.sender(),
+                U256::from(10).pow(U256::from(18)),
+                100_000,
+            ),
+            recipient,
+            chain(2, Address::repeat_byte(0x11), U256::from(7)),
+            signed_pool_transaction(4, 0, COUNTER, U256::ZERO, 100_000),
+            signed_pool_transaction(5, 0, BURNER, U256::ZERO, 400_000),
+            signed_pool_transaction(6, 0, COUNTER, U256::ZERO, 100_000),
+            signed_pool_transaction(7, 0, COUNTER, U256::ZERO, 100_000).with_validity_predicates(
+                vec![ValidityPredicate::BlockNumber {
+                    op: ValidityOperator::Equal,
+                    value: U256::ZERO,
+                }],
+            ),
+        ];
+        let mut provider = test_state_provider();
+        // Key 3 is unfunded until key 2's transfer; key 4 is never funded and stays invalid.
+        for sender in [1, 2, 5, 6, 7] {
+            provider.insert_account(
+                signed_pool_transaction(sender, 0, Address::ZERO, U256::ZERO, 21_000).sender(),
+                Account { balance: U256::MAX, ..Default::default() },
+                None,
+                HashMap::default(),
+            );
+        }
+        provider.insert_account(
+            COUNTER,
+            Account::default(),
+            Some(COUNTER_CODE.to_vec().into()),
+            HashMap::default(),
+        );
+        provider.insert_account(
+            BURNER,
+            Account::default(),
+            Some(burner_code().into()),
+            HashMap::default(),
+        );
+        (transactions, provider)
+    }
+
+    fn speculation_context(timestamp: u64) -> BasePayloadBuilderCtx<BaseEvmConfig, BaseChainSpec> {
+        let mut ctx = pool_payload_context(timestamp);
+        ctx.builder_config.resource_metering = metering_config(
+            cpu_schedule(1_000_000, Some(150_000), false),
+            Arc::new(NoopMeteringProvider),
+        );
+        ctx
+    }
+
+    fn speculative_workers() -> Arc<BuilderSpeculation> {
+        let mut speculator = base_common_evm::Speculator::new(4, true).unwrap();
+        // A generous frontier budget makes every predicted choice wait for its worker result.
+        speculator.frontier_wait = Duration::from_secs(5);
+        Arc::new(BuilderSpeculation::new(speculator))
+    }
+
+    fn build_speculative_payload<Txs>(
+        ctx: BasePayloadBuilderCtx<BaseEvmConfig, BaseChainSpec>,
+        transactions: Txs,
+        candidates: Vec<BasePooledTransaction>,
+        provider: &StateProviderTest,
+        speculation: Option<(Arc<BuilderSpeculation>, crate::SpeculativeDatabaseFactory)>,
+    ) -> (BuildOutcomeKind<crate::BaseBuiltPayload<BasePrimitives>>, Vec<TxHash>)
+    where
+        Txs: crate::ParkablePayloadTransactions<Transaction = BasePooledTransaction> + Send + Sync,
+    {
+        let evicted = Arc::new(Mutex::new(Vec::new()));
+        let mut builder = Builder::new(|_| transactions).with_permanent_eviction({
+            let evicted = Arc::clone(&evicted);
+            move |hashes| evicted.lock().unwrap().extend(hashes)
+        });
+        if let Some((speculation, database)) = speculation {
+            builder = builder.with_speculation(SpeculationFeed {
+                speculation,
+                database,
+                candidates: Box::new(move |_| {
+                    candidates.iter().map(|tx| tx.clone_into_consensus()).collect()
+                }),
+            });
+        }
+        let outcome = builder
+            .build(StateProviderDatabase::new(provider), provider, Some(state_root_handle()), ctx)
+            .expect("payload must build");
+        let evicted = evicted.lock().unwrap().clone();
+        (outcome, evicted)
+    }
+
+    fn provider_readers(provider: &StateProviderTest) -> crate::SpeculativeDatabaseFactory {
+        let provider = provider.clone();
+        Arc::new(move || Box::new(SpeculativeStateReader::new(Box::new(provider.clone()))))
+    }
+
+    fn built_payload(
+        outcome: BuildOutcomeKind<crate::BaseBuiltPayload<BasePrimitives>>,
+    ) -> crate::BaseBuiltPayload<BasePrimitives> {
+        match outcome {
+            BuildOutcomeKind::Better { payload } | BuildOutcomeKind::Freeze(payload) => payload,
+            other => panic!("expected a built payload, got {other:?}"),
+        }
+    }
+
+    fn assert_same_payload(
+        speculative: &crate::BaseBuiltPayload<BasePrimitives>,
+        sequential: &crate::BaseBuiltPayload<BasePrimitives>,
+    ) {
+        assert_eq!(speculative.block(), sequential.block(), "transactions, gas and header roots");
+        let speculative = speculative.executed_block().expect("executed block");
+        let sequential = sequential.executed_block().expect("executed block");
+        assert_eq!(
+            speculative.execution_output, sequential.execution_output,
+            "receipts, gas and bundle state"
+        );
+        assert_eq!(speculative.hashed_state, sequential.hashed_state, "post-state");
+    }
+
+    #[test]
+    fn speculation_builds_the_sequential_payload() {
+        let (transactions, provider) = speculation_scenario();
+        let (sequential, sequential_evicted) = build_speculative_payload(
+            speculation_context(DENIM_TIMESTAMP),
+            TestParkableTransactions::new(transactions.clone()),
+            Vec::new(),
+            &provider,
+            None,
+        );
+        let sequential = built_payload(sequential);
+        let included = &sequential.block().body().transactions;
+        assert_eq!(included.len(), 6, "invalid, rejected and expired transactions are skipped");
+        assert_eq!(sequential_evicted, vec![*transactions[6].hash()]);
+
+        let speculation = speculative_workers();
+        let (speculative, speculative_evicted) = build_speculative_payload(
+            speculation_context(DENIM_TIMESTAMP),
+            TestParkableTransactions::new(transactions.clone()),
+            transactions,
+            &provider,
+            Some((Arc::clone(&speculation), provider_readers(&provider))),
+        );
+
+        assert_same_payload(&built_payload(speculative), &sequential);
+        assert_eq!(speculative_evicted, sequential_evicted);
+        assert!(speculation.speculator().stats().consumed > 0, "speculative results were used");
+    }
+
+    #[test]
+    fn failing_speculative_providers_fall_back_to_the_sequential_payload() {
+        let (transactions, provider) = speculation_scenario();
+        let (sequential, _) = build_speculative_payload(
+            speculation_context(DENIM_TIMESTAMP),
+            TestParkableTransactions::new(transactions.clone()),
+            Vec::new(),
+            &provider,
+            None,
+        );
+        let failing: crate::SpeculativeDatabaseFactory =
+            Arc::new(|| panic!("injected speculative provider failure"));
+        let speculation = speculative_workers();
+        let (speculative, _) = build_speculative_payload(
+            speculation_context(DENIM_TIMESTAMP),
+            TestParkableTransactions::new(transactions.clone()),
+            transactions,
+            &provider,
+            Some((Arc::clone(&speculation), failing)),
+        );
+
+        assert_same_payload(&built_payload(speculative), &built_payload(sequential));
+        assert_eq!(speculation.speculator().stats().consumed, 0);
+    }
+
+    /// Cancels the payload job when the builder asks for its second candidate.
+    struct CancelAfterFirstTransaction {
+        transactions: TestParkableTransactions,
+        calls: usize,
+        cancel: Option<CancelOnDrop>,
+    }
+
+    impl PayloadTransactions for CancelAfterFirstTransaction {
+        type Transaction = BasePooledTransaction;
+
+        fn next(&mut self, _ctx: ()) -> Option<Self::Transaction> {
+            self.calls += 1;
+            if self.calls == 2 {
+                drop(self.cancel.take());
+            }
+            self.transactions.next(())
+        }
+
+        fn mark_invalid(&mut self, sender: Address, nonce: u64) {
+            self.transactions.mark_invalid(sender, nonce);
+        }
+    }
+
+    impl crate::ParkablePayloadTransactions for CancelAfterFirstTransaction {
+        fn park_current(&mut self) {
+            self.transactions.park_current();
+        }
+
+        fn mark_current_committed(&mut self) {
+            self.transactions.mark_current_committed();
+        }
+
+        fn promote(&mut self, transaction_hash: B256) -> bool {
+            self.transactions.promote(transaction_hash)
+        }
+
+        fn discard_parked(&mut self, transaction_hash: B256) -> bool {
+            self.transactions.discard_parked(transaction_hash)
+        }
+    }
+
+    #[test]
+    fn cancellation_and_finalization_release_speculative_workers() {
+        let (transactions, provider) = speculation_scenario();
+        let speculation = speculative_workers();
+        let speculate = || Some((Arc::clone(&speculation), provider_readers(&provider)));
+
+        let ctx = speculation_context(DENIM_TIMESTAMP);
+        let cancelled = CancelAfterFirstTransaction {
+            transactions: TestParkableTransactions::new(transactions.clone()),
+            calls: 0,
+            cancel: Some(ctx.cancel.clone()),
+        };
+        let (outcome, _) =
+            build_speculative_payload(ctx, cancelled, transactions.clone(), &provider, speculate());
+        assert!(matches!(outcome, BuildOutcomeKind::Cancelled));
+        assert!(speculation.speculator().wait_idle(Duration::from_secs(5)));
+
+        let ctx = speculation_context(DENIM_TIMESTAMP);
+        let finalized = FinalizeAfterFirstTransaction {
+            transactions: TestParkableTransactions::new(transactions.clone()),
+            calls: 0,
+            cancel: ManuallyDrop::new(ctx.cancel.clone()),
+        };
+        let (outcome, _) =
+            build_speculative_payload(ctx, finalized, transactions.clone(), &provider, speculate());
+        assert_eq!(built_payload(outcome).block().body().transactions.len(), 1);
+        assert!(speculation.speculator().wait_idle(Duration::from_secs(5)));
+
+        let (outcome, _) = build_speculative_payload(
+            speculation_context(DENIM_TIMESTAMP),
+            TestParkableTransactions::new(transactions.clone()),
+            transactions,
+            &provider,
+            speculate(),
+        );
+        assert_eq!(built_payload(outcome).block().body().transactions.len(), 6);
+        assert!(
+            speculation.speculator().stats().consumed > 0,
+            "a released session lets the next build speculate"
         );
     }
 }

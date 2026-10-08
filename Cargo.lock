@@ -3649,8 +3649,11 @@ dependencies = [
  "base-execution-eip8130",
  "base-metrics",
  "base-precompile-storage",
+ "dashmap",
+ "eyre",
  "k256 0.13.4",
  "metrics",
+ "rayon",
  "reth-evm",
  "revm",
  "rstest",
@@ -3658,6 +3661,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.19",
+ "tracing",
 ]
 
 [[package]]
@@ -4550,6 +4554,8 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-debug",
  "alloy-rpc-types-engine",
+ "alloy-signer 2.4.1",
+ "alloy-signer-local 2.4.1",
  "base-bundles",
  "base-common-chains",
  "base-common-consensus",
@@ -5213,6 +5219,32 @@ dependencies = [
  "alloy-transport",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "base-parallel-evm-bench"
+version = "0.0.0"
+dependencies = [
+ "alloy-consensus 2.4.1",
+ "alloy-eips 2.4.1",
+ "alloy-evm",
+ "alloy-primitives",
+ "alloy-provider",
+ "base-common-consensus",
+ "base-common-evm",
+ "base-common-flz",
+ "base-common-network",
+ "base-execution-chainspec",
+ "base-execution-evm",
+ "clap",
+ "eyre",
+ "reth-evm",
+ "reth-primitives-traits",
+ "reth-revm",
+ "revm",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

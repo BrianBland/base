@@ -141,12 +141,11 @@ where
         let mut state =
             State::builder().with_database(&mut self.trie_db).with_bundle_update().build();
         let evm = self.factory.evm_factory().create_evm(&mut state, evm_env);
-        let ctx = BaseBlockExecutionCtx {
+        let ctx = BaseBlockExecutionCtx::new(
             parent_hash,
-            parent_beacon_block_root: attrs.payload_attributes.parent_beacon_block_root,
-            // This field is unused for individual block building jobs.
-            extra_data: Default::default(),
-        };
+            attrs.payload_attributes.parent_beacon_block_root,
+            Default::default(),
+        );
         let executor = self.factory.create_executor(evm, ctx);
 
         // Step 3. Execute the block containing the transactions within the payload attributes.

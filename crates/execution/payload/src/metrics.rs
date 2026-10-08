@@ -84,6 +84,12 @@ base_metrics::define_metrics! {
     #[label(name = "flow", default = ["standard", "validity"])]
     #[label(name = "bid", default = ["coinbase_tip", "priority_fee"])]
     tip_per_gas: histogram,
+    #[describe("Speculative results consumed after passing consume-time validation")]
+    speculative_hits_total: counter,
+    #[describe("Pool transactions executed sequentially while speculation was active")]
+    speculative_misses_total: counter,
+    #[describe("Speculative results rejected by consume-time validation")]
+    speculative_rejected_total: counter,
 }
 
 impl ValidityMetrics {

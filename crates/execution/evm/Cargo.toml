@@ -52,6 +52,7 @@ reth-revm = { workspace = true, features = ["test-utils"] }
 base-common-consensus = { workspace = true, features = ["arbitrary"] }
 
 [features]
+parallel = [ "base-common-evm/parallel", "std" ]
 default = [ "metrics", "std" ]
 metrics = [ "base-common-evm/metrics", "reth-evm/metrics" ]
 std = [
