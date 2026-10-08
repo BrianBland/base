@@ -214,6 +214,10 @@ digest = "e0d063f6c5"
 summary = "Base revm-based EVM support: upgrade-to-SpecId mapping, BaseEvmFactory, block executors, receipt builders, and create2 deployer handling. Use when changing per-upgrade execution rules."
 digest = "835735d39b"
 
+["crates/common/evm/SPECULATOR.md"]
+summary = "Contract for consume-validated builder speculation: epochs, Store/owner-State validation, misses, worker provider lifetime, and the Phase 2 basic payload builder flag, sessions and metrics."
+digest = "c5659dc120"
+
 ["crates/common/evm2/README.md"]
 summary = "Scaffold for Base's EVM2 integration (BaseEvmTypes, currently mirroring stock Ethereum), not wired into the node, for differential testing against revm. Use when working on EVM2 groundwork."
 digest = "e8fa087a1d"
@@ -441,6 +445,14 @@ digest = "2f4698e823"
 ["crates/infra/load-tests/README.md"]
 summary = "Load-testing framework (base-load-tests lib, base-load-tester bin): just/cargo commands, YAML config, tx mixes (precompile, B-20, swap, validity). Use to run or configure devnet/sepolia load tests."
 digest = "bdd5c4caec"
+
+["crates/infra/parallel-evm-bench/BUILDER_SIM_RESULTS.md"]
+summary = "Historical Phase 1d builder-sim measurements on frozen fixtures: fault diagnosis, owner-cost ablation and per-block speedup tables; read before comparing new builder-sim runs."
+digest = "e84e3122e2"
+
+["crates/infra/parallel-evm-bench/README.md"]
+summary = "How to run base-parallel-evm-bench: fetch fixtures, bench sequential vs parallel, stress/watchdog diagnostics, executor-gated payload validation and builder-sim with its CSV counters."
+digest = "32c82290a9"
 
 ["crates/infra/roxy/README.md"]
 summary = "Scaffold-only Rust JSON-RPC reverse proxy meant to replace the ProxyD fork; currently just a listen-address flag plus /healthz and /readyz probes, no proxying yet."
