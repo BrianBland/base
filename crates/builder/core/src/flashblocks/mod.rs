@@ -29,7 +29,7 @@ pub use context::{
 mod payload;
 
 mod resting;
-pub use resting::{RestingPayloadTransactions, RestingStats};
+pub use resting::{RestingFilter, RestingPayloadTransactions, RestingState, RestingStats};
 
 mod service;
 pub use service::FlashblocksServiceBuilder;

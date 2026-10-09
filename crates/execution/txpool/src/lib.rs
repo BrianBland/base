@@ -26,6 +26,7 @@ mod validator;
 pub use validator::{BaseL1BlockInfo, BaseTransactionValidator, BaseTxPoolError, LimitClassCache};
 
 mod best;
+pub use best::MergeBestTransactions;
 
 mod validity;
 pub use validity::{
@@ -51,7 +52,7 @@ pub use ordering::{
 mod parking;
 pub use parking::{
     BestTransactionLane, BestTransactionLaneState, ParkableBestTransactions,
-    ParkableTransactionPool, ParkedBestTransactions,
+    ParkableTransactionPool, ParkedBestTransactions, ParkingFilter,
 };
 
 mod pool;

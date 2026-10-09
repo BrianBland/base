@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use alloy_primitives::{Address, TxHash};
-use base_execution_txpool::{BasePooledTx, ParkableBestTransactions};
+use base_execution_txpool::{BasePooledTx, ParkableBestTransactions, ParkingFilter};
 pub use reth_payload_util::NoopPayloadTransactions;
 use reth_payload_util::PayloadTransactions;
 use reth_transaction_pool::{
@@ -51,6 +51,10 @@ pub trait ParkablePayloadTransactions:
 
     /// Excludes a predicate-parked transaction for the remainder of this iterator.
     fn discard_parked(&mut self, transaction_hash: TxHash) -> bool;
+
+    /// Installs a filter that parks matching candidates instead of yielding them, as if the
+    /// caller had called [`Self::park_current`] on each. Adapters without parking ignore it.
+    fn set_parking_filter(&mut self, _filter: Arc<dyn ParkingFilter<Self::Pooled>>) {}
 }
 
 impl<T> ParkablePayloadTransactions for NoopPayloadTransactions<Arc<ValidPoolTransaction<T>>>
@@ -163,5 +167,9 @@ where
             transaction_hash,
             InvalidPoolTransactionError::other(PayloadTransactionInvalidated),
         )
+    }
+
+    fn set_parking_filter(&mut self, filter: Arc<dyn ParkingFilter<T>>) {
+        self.inner.set_parking_filter(filter);
     }
 }
