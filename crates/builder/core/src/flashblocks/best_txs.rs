@@ -1,23 +1,24 @@
 //! Flashblocks adapters for parkable best-transaction iterators.
 
-use std::{marker::PhantomData, time::Instant};
+use std::{marker::PhantomData, sync::Arc};
 
 use alloy_primitives::{Address, TxHash, map::B256Set};
-use base_execution_payload_builder::{ParkablePayloadTransactions, ParkedPredicateIndex};
+use base_execution_payload_builder::ParkablePayloadTransactions;
 use base_execution_txpool::{BasePooledTx, ValidityPredicate};
 use reth_payload_util::PayloadTransactions;
 use revm::state::EvmState;
 
 use crate::{
-    BuilderMetrics, RejectionCache, RestingPayloadTransactions, RestingPredicateMode, RestingStats,
+    BuilderMetrics, RejectionCache, RestingFilter, RestingPayloadTransactions,
+    RestingPredicateMode, RestingStats,
 };
 
 /// An adapter that skips transactions already committed or permanently rejected by flashblocks.
 ///
 /// It also holds back validity transactions resting under an unchanged predicate, see
-/// [`RestingPayloadTransactions`]. A resting transaction is parked in the inner iterator, so its
-/// nonce lane stays blocked, and is promoted back at its priority position once a commit changes
-/// the state its predicate reads.
+/// [`RestingPayloadTransactions`]. In enforce mode the inner iterator parks a resting transaction
+/// through a [`RestingFilter`] instead of yielding it, so its nonce lane stays blocked, and it is
+/// promoted back at its priority position once a commit changes the state its predicate reads.
 pub struct BestFlashblocksTxs<T, I>
 where
     T: BasePooledTx,
@@ -32,12 +33,7 @@ where
     // Identity of the transaction most recently returned to the build loop.
     current_transaction: Option<(TxHash, Address, u64)>,
     resting_predicate_mode: RestingPredicateMode,
-    // Transactions resting in this block, indexed by the predicate last found unsatisfied.
-    resting: ParkedPredicateIndex<()>,
-    // Resting transactions parked by `next` in the current inner iterator. Transactions the build
-    // loop parked are woken by its own predicate index instead.
-    parked_resting: B256Set,
-    resting_stats: RestingStats,
+    resting: Arc<RestingFilter>,
     transaction: PhantomData<T>,
 }
 
@@ -51,7 +47,7 @@ where
             .field("committed_transactions", &self.committed_transactions)
             .field("rejection_cache_size", &self.rejection_cache.entry_count())
             .field("resting_predicate_mode", &self.resting_predicate_mode)
-            .field("parked_resting", &self.parked_resting.len())
+            .field("resting", &self.resting)
             .finish_non_exhaustive()
     }
 }
@@ -66,20 +62,19 @@ where
         Self {
             inner,
             committed_transactions: Default::default(),
+            resting: Arc::new(RestingFilter::new(rejection_cache.clone())),
             rejection_cache,
             current_transaction: None,
             resting_predicate_mode: RestingPredicateMode::Off,
-            resting: ParkedPredicateIndex::default(),
-            parked_resting: B256Set::default(),
-            resting_stats: RestingStats::default(),
             transaction: PhantomData,
         }
     }
 
     /// Sets whether resting validity transactions are tracked and held back.
     #[must_use]
-    pub const fn with_resting_predicate_mode(mut self, mode: RestingPredicateMode) -> Self {
+    pub fn with_resting_predicate_mode(mut self, mode: RestingPredicateMode) -> Self {
         self.resting_predicate_mode = mode;
+        self.install_resting_filter();
         self
     }
 
@@ -88,12 +83,23 @@ where
     pub fn refresh_iterator(&mut self, inner: I) {
         self.inner = inner;
         self.current_transaction = None;
-        self.parked_resting.clear();
+        self.resting.state().parked.clear();
+        self.install_resting_filter();
+    }
+
+    /// Lets the inner iterator park resting transactions as it would yield them.
+    pub fn install_resting_filter(&mut self) {
+        if self.resting_predicate_mode.is_enforced() {
+            self.inner.set_parking_filter(Arc::clone(&self.resting) as _);
+        }
     }
 
     /// Remove transaction from next iteration since it is already in the state
     pub fn mark_committed(&mut self, txs: &[TxHash]) {
         self.committed_transactions.extend(txs);
+        if self.resting_predicate_mode.is_enforced() {
+            self.resting.state().committed.extend(txs);
+        }
     }
 
     /// Mark transactions as permanently rejected. They will be skipped in all
@@ -113,10 +119,9 @@ where
 {
     type Transaction = I::Transaction;
 
-    /// Resting time is measured once per call, from the first resting check to the return, so it
-    /// also covers advancing the inner iterator between resting transactions.
+    /// Resting transactions are parked by the inner iterator's [`RestingFilter`] before they
+    /// reach this loop.
     fn next(&mut self, ctx: ()) -> Option<Self::Transaction> {
-        let mut resting_filter_start = None;
         let next = loop {
             let Some(pooled) = self.inner.next(ctx) else { break None };
             let tx = &pooled.transaction;
@@ -139,25 +144,9 @@ where
                 continue;
             }
 
-            if self.resting_predicate_mode.is_enforced()
-                && !self.resting.is_empty()
-                && !tx.validity_predicates().is_empty()
-            {
-                resting_filter_start.get_or_insert_with(Instant::now);
-                if self.is_resting(hash, tx.validity_predicates()) {
-                    self.inner.park_current();
-                    self.parked_resting.insert(hash);
-                    self.current_transaction = None;
-                    self.resting_stats.parked += 1;
-                    continue;
-                }
-            }
-
             break Some(pooled);
         };
-        if let Some(start) = resting_filter_start {
-            self.resting_stats.duration += start.elapsed();
-        }
+        self.resting.finish_next();
         next
     }
 
@@ -192,6 +181,9 @@ where
         self.inner.mark_current_committed();
         if let Some((transaction_hash, _, _)) = self.current_transaction.take() {
             self.committed_transactions.insert(transaction_hash);
+            if self.resting_predicate_mode.is_enforced() {
+                self.resting.state().committed.insert(transaction_hash);
+            }
         }
     }
 
@@ -217,29 +209,28 @@ where
         {
             return;
         }
-        self.resting.park(transaction_hash, (), predicate.clone());
+        self.resting.state().resting.park(transaction_hash, (), predicate.clone());
     }
 
     fn record_committed_state(&mut self, state: &EvmState) {
-        if self.resting.is_empty() {
+        let mut resting = self.resting.state();
+        if resting.resting.is_empty() {
             return;
         }
-        for transaction_hash in self.resting.affected_by_state(state).affected_transactions {
-            self.resting.remove(transaction_hash);
-            if self.parked_resting.remove(&transaction_hash) {
+        for transaction_hash in resting.resting.affected_by_state(state).affected_transactions {
+            resting.resting.remove(transaction_hash);
+            if resting.parked.remove(&transaction_hash) {
                 self.inner.promote(transaction_hash);
             }
         }
     }
 
-    /// A hash re-added to the pool with a batch that no longer contains the recorded predicate
-    /// does not rest.
     fn is_resting(&self, transaction_hash: TxHash, predicates: &[ValidityPredicate]) -> bool {
-        self.resting.predicate(transaction_hash).is_some_and(|blocker| predicates.contains(blocker))
+        self.resting.state().is_resting(transaction_hash, predicates)
     }
 
     fn take_resting_stats(&mut self) -> RestingStats {
-        std::mem::take(&mut self.resting_stats)
+        std::mem::take(&mut self.resting.state().stats)
     }
 }
 
@@ -249,11 +240,18 @@ mod tests {
 
     use alloy_consensus::{SignableTransaction, TxEip1559};
     use alloy_eips::eip2718::Encodable2718;
-    use alloy_primitives::{Address, Signature, TxHash, TxKind, U256};
-    use base_common_consensus::{BaseTransactionSigned, BaseTxEnvelope};
+    use alloy_primitives::{
+        Address, Bytes, Signature, TxHash, TxKind, U256,
+        map::{B256Map, B256Set},
+    };
+    use base_common_consensus::{
+        BasePooledTransaction as ConsensusPooledTransaction, BaseTransactionSigned, BaseTxEnvelope,
+        Eip8130Signed, TxEip8130,
+    };
+    use base_execution_payload_builder::ParkedPredicateIndex;
     use base_execution_txpool::{
-        BaseOrdering, BasePooledTransaction, ParkedBestTransactions, ValidityOperator,
-        ValidityPredicate,
+        BaseOrdering, BasePooledTransaction, BasePooledTx, MergeBestTransactions,
+        ParkedBestTransactions, ValidityOperator, ValidityPredicate,
     };
     use reth_payload_util::PayloadTransactions;
     use reth_primitives_traits::Recovered;
@@ -806,6 +804,62 @@ mod tests {
         assert_eq!(*iterator.next(()).unwrap().hash(), *readded.hash());
     }
 
+    /// A hash re-added without its rested predicate can commit; once committed, a later re-add
+    /// with that predicate is skipped as committed, releasing its lane, rather than resting.
+    #[test]
+    fn committed_transaction_does_not_rest() {
+        let original = validity_transaction(0, 0, 10, vec![balance_at_least(WATCHED, 1)]);
+        let readded = validity_transaction(0, 0, 10, vec![balance_at_least(UNRELATED, 1)]);
+        let child = transaction(0, 1, 5);
+        let mut iterator = resting_iterator(&pending_pool(&[Arc::clone(&original)]));
+
+        let first = iterator.next(()).unwrap();
+        park_unsatisfied(&mut iterator, &first);
+
+        iterator.refresh_iterator(parkable(&pending_pool(&[readded])));
+        iterator.next(()).unwrap();
+        iterator.mark_current_committed();
+
+        iterator.refresh_iterator(parkable(&pending_pool(&[original, Arc::clone(&child)])));
+        assert_eq!(*iterator.next(()).unwrap().hash(), *child.hash());
+        assert_eq!(iterator.take_resting_stats().parked, 0);
+    }
+
+    /// A committed hash stays in the resting index, so with 31 others resting under its stale
+    /// blocker that bucket is ordered, and a write that crosses no threshold wakes none of them.
+    #[test]
+    fn committed_hash_keeps_its_resting_bucket_ordered() {
+        let blocked = vec![balance_at_least(WATCHED, 2)];
+        let stale = validity_transaction(0, 0, 50, blocked.clone());
+        let replaced = validity_transaction(0, 0, 50, Vec::new());
+        let resting: Vec<_> =
+            (1..=31).map(|sender| validity_transaction(sender, 0, 20, blocked.clone())).collect();
+        let writer = transaction(40, 0, 5);
+        let mut iterator = resting_iterator(&pending_pool(&[stale]));
+        let first = iterator.next(()).unwrap();
+        park_unsatisfied(&mut iterator, &first);
+
+        let mut second = vec![Arc::clone(&replaced)];
+        second.extend(resting.iter().cloned());
+        iterator.refresh_iterator(parkable(&pending_pool(&second)));
+        assert_eq!(*iterator.next(()).unwrap().hash(), *replaced.hash());
+        iterator.mark_current_committed();
+        for _ in &resting {
+            let candidate = iterator.next(()).unwrap();
+            park_unsatisfied(&mut iterator, &candidate);
+        }
+
+        let mut third = resting.clone();
+        third.push(Arc::clone(&writer));
+        iterator.refresh_iterator(parkable(&pending_pool(&third)));
+        assert_eq!(*iterator.next(()).unwrap().hash(), *writer.hash());
+        iterator.record_committed_state(&balance_change(WATCHED, 0, 1));
+        iterator.mark_current_committed();
+
+        assert!(iterator.next(()).is_none());
+        assert_eq!(iterator.take_resting_stats().parked, 31);
+    }
+
     #[test]
     fn flashblock_index_predicate_does_not_rest() {
         let resting = validity_transaction(
@@ -855,5 +909,396 @@ mod tests {
         iterator.rest(*resting.hash(), &predicates[0]);
 
         assert!(!iterator.is_resting(*resting.hash(), predicates));
+    }
+
+    /// An EIP-8130 transaction on its own nonce channel, which the production pool serves from
+    /// the 2D nonce sidecar.
+    fn sidecar_transaction(
+        sender: u64,
+        priority_fee: u128,
+        predicates: Vec<ValidityPredicate>,
+    ) -> Arc<ValidPoolTransaction<BasePooledTransaction>> {
+        let tx = TxEip8130 {
+            chain_id: 1,
+            sender: Some(sender_address(sender)),
+            nonce_key: U256::from(sender + 1),
+            nonce_sequence: 0,
+            valid_after: 0,
+            valid_before: 0,
+            max_priority_fee_per_gas: priority_fee,
+            max_fee_per_gas: priority_fee + 100,
+            gas_limit: 50_000,
+            account_changes: Vec::new(),
+            calls: Vec::new(),
+            metadata: Bytes::new(),
+            payer: None,
+        };
+        let pooled =
+            ConsensusPooledTransaction::Eip8130(Eip8130Signed::new(tx, Bytes::new(), Bytes::new()));
+        let encoded_length = pooled.encode_2718_len();
+        let transaction = BasePooledTransaction::new(
+            Recovered::new_unchecked(BaseTransactionSigned::from(pooled), sender_address(sender)),
+            encoded_length,
+        )
+        .with_validity_predicates(predicates);
+        assert!(transaction.is_eip8130_sidecar_transaction());
+        Arc::new(ValidPoolTransaction {
+            transaction_id: TransactionId::new(sender.into(), 0),
+            transaction,
+            propagate: true,
+            timestamp: std::time::Instant::now(),
+            origin: TransactionOrigin::External,
+            authority_ids: None,
+        })
+    }
+
+    /// Builds the production candidate stack: protocol and sidecar sources merged under lane
+    /// parking.
+    fn merged_parkable(
+        protocol: &PendingPool<Ordering>,
+        sidecar: &PendingPool<Ordering>,
+    ) -> Parkable {
+        let merged = MergeBestTransactions::new(
+            Box::new(protocol.best()),
+            Box::new(sidecar.best()),
+            Ordering::coinbase_tip(),
+            0,
+        );
+        ParkableBestPayloadTransactions::new(Box::new(ParkedBestTransactions::new(
+            merged,
+            Ordering::coinbase_tip(),
+            0,
+        )))
+    }
+
+    /// The flashblocks adapter as it was before resting transactions were parked by the
+    /// lane-parking iterator: every candidate reaches this adapter, which parks resting ones
+    /// itself after its committed and rejection checks. It is the reference the production
+    /// adapter must match.
+    struct PerYieldRestingTxs {
+        inner: Parkable,
+        committed: B256Set,
+        rejection_cache: RejectionCache,
+        current: Option<(TxHash, Address, u64)>,
+        resting: ParkedPredicateIndex<()>,
+        parked_resting: B256Set,
+        parked: u64,
+    }
+
+    impl PayloadTransactions for PerYieldRestingTxs {
+        type Transaction = Arc<ValidPoolTransaction<BasePooledTransaction>>;
+
+        fn next(&mut self, ctx: ()) -> Option<Self::Transaction> {
+            loop {
+                let pooled = self.inner.next(ctx)?;
+                let hash = *pooled.hash();
+                self.current = Some((hash, pooled.sender(), pooled.nonce()));
+                if self.committed.contains(&hash) {
+                    self.inner.mark_current_committed();
+                    self.current = None;
+                    continue;
+                }
+                if self.rejection_cache.is_rejected(&hash) {
+                    self.inner.mark_invalid(pooled.sender(), pooled.nonce());
+                    self.current = None;
+                    continue;
+                }
+                if self.is_resting(hash, pooled.transaction.validity_predicates()) {
+                    self.inner.park_current();
+                    self.parked_resting.insert(hash);
+                    self.current = None;
+                    self.parked += 1;
+                    continue;
+                }
+                return Some(pooled);
+            }
+        }
+
+        fn mark_invalid(&mut self, sender: Address, nonce: u64) {
+            self.inner.mark_invalid(sender, nonce);
+            self.current = None;
+        }
+    }
+
+    impl ParkablePayloadTransactions for PerYieldRestingTxs {
+        type Pooled = BasePooledTransaction;
+
+        fn park_current(&mut self) {
+            self.inner.park_current();
+            self.current = None;
+        }
+
+        fn mark_current_committed(&mut self) {
+            self.inner.mark_current_committed();
+            if let Some((hash, _, _)) = self.current.take() {
+                self.committed.insert(hash);
+            }
+        }
+
+        fn promote(&mut self, transaction_hash: TxHash) -> bool {
+            self.inner.promote(transaction_hash)
+        }
+
+        fn discard_parked(&mut self, transaction_hash: TxHash) -> bool {
+            self.inner.discard_parked(transaction_hash)
+        }
+    }
+
+    impl RestingPayloadTransactions for PerYieldRestingTxs {
+        fn rest(&mut self, transaction_hash: TxHash, predicate: &ValidityPredicate) {
+            self.resting.park(transaction_hash, (), predicate.clone());
+        }
+
+        fn record_committed_state(&mut self, state: &EvmState) {
+            for transaction_hash in self.resting.affected_by_state(state).affected_transactions {
+                self.resting.remove(transaction_hash);
+                if self.parked_resting.remove(&transaction_hash) {
+                    self.inner.promote(transaction_hash);
+                }
+            }
+        }
+
+        fn is_resting(&self, transaction_hash: TxHash, predicates: &[ValidityPredicate]) -> bool {
+            self.resting
+                .predicate(transaction_hash)
+                .is_some_and(|blocker| predicates.contains(blocker))
+        }
+
+        fn take_resting_stats(&mut self) -> RestingStats {
+            RestingStats { parked: std::mem::take(&mut self.parked), ..Default::default() }
+        }
+    }
+
+    /// The flashblock lifecycle `payload.rs` drives on top of the build loop.
+    trait FlashblockCandidates:
+        ParkablePayloadTransactions<Pooled = BasePooledTransaction> + RestingPayloadTransactions
+    {
+        fn refresh(&mut self, inner: Parkable);
+
+        fn finish_flashblock(&mut self, committed: &[TxHash], rejected: &[TxHash]);
+    }
+
+    impl FlashblockCandidates for PerYieldRestingTxs {
+        fn refresh(&mut self, inner: Parkable) {
+            self.inner = inner;
+            self.current = None;
+            self.parked_resting.clear();
+        }
+
+        fn finish_flashblock(&mut self, committed: &[TxHash], rejected: &[TxHash]) {
+            self.committed.extend(committed);
+            self.rejection_cache.mark_rejected(rejected);
+        }
+    }
+
+    impl FlashblockCandidates for BestFlashblocksTxs<BasePooledTransaction, Parkable> {
+        fn refresh(&mut self, inner: Parkable) {
+            self.refresh_iterator(inner);
+        }
+
+        fn finish_flashblock(&mut self, committed: &[TxHash], rejected: &[TxHash]) {
+            self.mark_committed(committed);
+            self.mark_rejected(rejected);
+        }
+    }
+
+    /// Transactions of the differential scenario, shared by both runs so that their arrival
+    /// timestamps, which break priority ties, are identical.
+    struct Scenario {
+        names: B256Map<&'static str>,
+        /// Balance a committed transaction writes.
+        writes: B256Map<(Address, u64)>,
+        /// Transactions whose execution fails once their predicates are satisfied.
+        failing: B256Set,
+        protocol: Vec<Arc<ValidPoolTransaction<BasePooledTransaction>>>,
+        sidecar: Vec<Arc<ValidPoolTransaction<BasePooledTransaction>>>,
+        /// Protocol transactions that arrive after the first commit of the second flashblock.
+        arrivals: Vec<Arc<ValidPoolTransaction<BasePooledTransaction>>>,
+    }
+
+    impl Scenario {
+        const WRITER_FLASHBLOCK: usize = 1;
+        const FLASHBLOCKS: usize = 3;
+
+        /// A resting protocol head `r0` with buffered descendants is woken mid-flashblock by the
+        /// sidecar writer `w`, while the merge holds the unrelated protocol head `u` behind the
+        /// sidecar head `s2`. `q` and the sidecar `z` keep resting, and `a` and the descendant
+        /// `r3` arrive live.
+        fn new(woken_head_fails: bool) -> Self {
+            let resting_head = validity_transaction(0, 0, 50, vec![balance_at_least(WATCHED, 1)]);
+            let writer = sidecar_transaction(10, 10, Vec::new());
+            let protocol = [
+                ("r0", Arc::clone(&resting_head)),
+                ("r1", transaction(0, 1, 45)),
+                ("r2", transaction(0, 2, 1)),
+                ("p0", transaction(1, 0, 20)),
+                ("p1", transaction(1, 1, 19)),
+                ("u", transaction(2, 0, 4)),
+                ("q", validity_transaction(3, 0, 2, vec![balance_at_least(UNRELATED, 1)])),
+            ];
+            let sidecar = [
+                ("w", Arc::clone(&writer)),
+                ("s2", sidecar_transaction(11, 8, Vec::new())),
+                ("z", sidecar_transaction(12, 7, vec![balance_at_least(UNRELATED, 1)])),
+                ("s", sidecar_transaction(13, 3, Vec::new())),
+            ];
+            let arrivals = [("a", transaction(4, 0, 30)), ("r3", transaction(0, 3, 40))];
+            let names = protocol
+                .iter()
+                .chain(&sidecar)
+                .chain(&arrivals)
+                .map(|(name, transaction)| (*transaction.hash(), *name))
+                .collect();
+            let failing = if woken_head_fails {
+                B256Set::from_iter([*resting_head.hash()])
+            } else {
+                B256Set::default()
+            };
+            Self {
+                names,
+                writes: B256Map::from_iter([(*writer.hash(), (WATCHED, 1))]),
+                failing,
+                protocol: protocol.into_iter().map(|(_, transaction)| transaction).collect(),
+                sidecar: sidecar.into_iter().map(|(_, transaction)| transaction).collect(),
+                arrivals: arrivals.into_iter().map(|(_, transaction)| transaction).collect(),
+            }
+        }
+
+        /// The first flashblock only sees the resting candidates and the head's descendants.
+        fn pools(&self, flashblock: usize) -> (PendingPool<Ordering>, PendingPool<Ordering>) {
+            if flashblock == 0 {
+                let resting = |transaction: &&Arc<ValidPoolTransaction<BasePooledTransaction>>| {
+                    !matches!(self.names[transaction.hash()], "p0" | "p1" | "u" | "w" | "s2" | "s")
+                };
+                let protocol: Vec<_> = self.protocol.iter().filter(resting).cloned().collect();
+                let sidecar: Vec<_> = self.sidecar.iter().filter(resting).cloned().collect();
+                return (pending_pool(&protocol), pending_pool(&sidecar));
+            }
+            (pending_pool(&self.protocol), pending_pool(&self.sidecar))
+        }
+
+        fn name(&self, transaction_hash: &TxHash) -> &'static str {
+            self.names[transaction_hash]
+        }
+
+        /// Plays the build loop and `payload.rs` against `candidates`, returning every
+        /// observable selection event.
+        fn run<C: FlashblockCandidates>(&self, new: impl FnOnce(Parkable) -> C) -> Vec<String> {
+            let mut balances: std::collections::HashMap<Address, u64> = Default::default();
+            let first =
+                |predicates: &[ValidityPredicate],
+                 balances: &std::collections::HashMap<Address, u64>| {
+                    predicates.iter().position(|predicate| match predicate {
+                        ValidityPredicate::Balance { address, value, .. } => {
+                            U256::from(balances.get(address).copied().unwrap_or_default()) < *value
+                        }
+                        _ => unreachable!("scenario uses balance predicates only"),
+                    })
+                };
+            let mut log = Vec::new();
+            let (mut protocol, mut sidecar) = self.pools(0);
+            let mut candidates = new(merged_parkable(&protocol, &sidecar));
+            for flashblock in 0..Self::FLASHBLOCKS {
+                if flashblock > 0 {
+                    (protocol, sidecar) = self.pools(flashblock);
+                    candidates.refresh(merged_parkable(&protocol, &sidecar));
+                }
+                log.push(format!("flashblock {flashblock}"));
+                let mut build_loop_parked = Vec::new();
+                let (mut committed, mut rejected) = (Vec::new(), Vec::new());
+                while let Some(candidate) = candidates.next(()) {
+                    let hash = *candidate.hash();
+                    let predicates = candidate.transaction.validity_predicates();
+                    if let Some(blocker) = first(predicates, &balances) {
+                        log.push(format!("park {}", self.name(&hash)));
+                        candidates.park_current();
+                        candidates.rest(hash, &predicates[blocker]);
+                        build_loop_parked.push(candidate);
+                        continue;
+                    }
+                    if self.failing.contains(&hash) {
+                        log.push(format!("reject {}", self.name(&hash)));
+                        candidates.mark_invalid(candidate.sender(), candidate.nonce());
+                        rejected.push(hash);
+                        continue;
+                    }
+                    log.push(format!("commit {}", self.name(&hash)));
+                    let written = self.writes.get(&hash).copied();
+                    let state = written.map_or_else(EvmState::default, |(address, value)| {
+                        balance_change(address, balances.get(&address).copied().unwrap_or(0), value)
+                    });
+                    candidates.record_committed_state(&state);
+                    if let Some((address, value)) = written {
+                        balances.insert(address, value);
+                    }
+                    candidates.mark_current_committed();
+                    committed.push(hash);
+                    if flashblock == Self::WRITER_FLASHBLOCK && committed.len() == 1 {
+                        for arrival in &self.arrivals {
+                            protocol.add_transaction(Arc::clone(arrival), 0);
+                        }
+                    }
+                    let Some((address, _)) = written else { continue };
+                    build_loop_parked.retain(|parked| {
+                        let parked_predicates = parked.transaction.validity_predicates();
+                        let watches = parked_predicates.iter().any(|predicate| {
+                            matches!(predicate, ValidityPredicate::Balance { address: watched, .. } if *watched == address)
+                        });
+                        if !watches {
+                            return true;
+                        }
+                        match first(parked_predicates, &balances) {
+                            Some(blocker) => {
+                                candidates.rest(*parked.hash(), &parked_predicates[blocker]);
+                                true
+                            }
+                            None => {
+                                let promoted = candidates.promote(*parked.hash());
+                                log.push(format!(
+                                    "promote {} {promoted}",
+                                    self.name(parked.hash())
+                                ));
+                                false
+                            }
+                        }
+                    });
+                }
+                log.push(format!("resting parked {}", candidates.take_resting_stats().parked));
+                candidates.finish_flashblock(&committed, &rejected);
+            }
+            log
+        }
+    }
+
+    /// Parking resting transactions inside the lane-parking iterator yields exactly the
+    /// selection of the adapter that parked each one on receipt, through the production merge
+    /// and lane-parking stack.
+    #[test]
+    fn resting_filter_matches_per_yield_parking() {
+        for woken_head_fails in [false, true] {
+            let scenario = Scenario::new(woken_head_fails);
+            let reference = scenario.run(|inner| PerYieldRestingTxs {
+                inner,
+                committed: B256Set::default(),
+                rejection_cache: test_rejection_cache(),
+                current: None,
+                resting: ParkedPredicateIndex::default(),
+                parked_resting: B256Set::default(),
+                parked: 0,
+            });
+            let filtered = scenario.run(|inner| {
+                BestFlashblocksTxs::new(inner, test_rejection_cache())
+                    .with_resting_predicate_mode(RestingPredicateMode::Enforce)
+            });
+
+            assert_eq!(filtered, reference, "woken head fails: {woken_head_fails}");
+            let woken = reference
+                .iter()
+                .position(|event| event == "commit w")
+                .expect("the writer commits in the second flashblock");
+            let outcome = if woken_head_fails { "reject r0" } else { "commit r0" };
+            assert_eq!(reference[woken + 1], outcome, "{reference:#?}");
+            assert!(reference.contains(&"resting parked 3".to_owned()), "{reference:#?}");
+        }
     }
 }

@@ -53,6 +53,20 @@ impl BestTransactionLane {
     }
 }
 
+/// Decides whether a transaction about to be yielded would be parked by its caller at once.
+///
+/// [`ParkedBestTransactions`] consults its filter at the moment it would yield a candidate. A
+/// matching candidate is parked exactly as if the caller had received it and called
+/// [`ParkableBestTransactions::park`], and the iterator moves on to its next candidate, so the
+/// yield sequence and parking state equal those of a caller that parks the candidate itself.
+pub trait ParkingFilter<T>: Send + Sync
+where
+    T: PoolTransaction,
+{
+    /// Returns whether `transaction` should be parked instead of yielded.
+    fn should_park(&self, transaction: &ValidPoolTransaction<T>) -> bool;
+}
+
 /// Extra lifecycle operations required to temporarily park best transactions.
 pub trait ParkableBestTransactions<T>:
     BestTransactions<Item = Arc<ValidPoolTransaction<T>>>
@@ -74,6 +88,9 @@ where
 
     /// Records that a yielded transaction committed and releases its lane successor.
     fn mark_committed(&mut self, transaction: &Arc<ValidPoolTransaction<T>>);
+
+    /// Installs a filter that parks matching candidates instead of yielding them.
+    fn set_parking_filter(&mut self, filter: Arc<dyn ParkingFilter<T>>);
 }
 
 /// A transaction pool that can create lane-aware parkable best iterators.
@@ -107,6 +124,7 @@ where
     parked: HashMap<TxHash, (Arc<ValidPoolTransaction<T>>, Option<BestTransactionLane>)>,
     ready: HashMap<TxHash, (Arc<ValidPoolTransaction<T>>, Option<BestTransactionLane>)>,
     ready_heap: BinaryHeap<(BestTransactionPriority<O::PriorityValue>, TxHash)>,
+    parking_filter: Option<Arc<dyn ParkingFilter<T>>>,
 }
 
 impl<T, I, O> std::fmt::Debug for ParkedBestTransactions<T, I, O>
@@ -120,6 +138,7 @@ where
             .field("lanes", &self.lanes.len())
             .field("parked", &self.parked.len())
             .field("ready", &self.ready.len())
+            .field("has_parking_filter", &self.parking_filter.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -141,6 +160,7 @@ where
             parked: HashMap::default(),
             ready: HashMap::default(),
             ready_heap: BinaryHeap::new(),
+            parking_filter: None,
         }
     }
 
@@ -236,6 +256,28 @@ where
         self.ready_heap.peek().map(|(priority, _)| priority)
     }
 
+    /// Takes the next candidate by priority, from either the ready set or the source head.
+    pub fn select_next(
+        &mut self,
+    ) -> Option<(Arc<ValidPoolTransaction<T>>, Option<BestTransactionLane>)> {
+        self.fill_source_head();
+
+        let ready_priority = self.ready_priority().cloned();
+        let source_priority = self.source_head.as_ref().map(|(source, _)| self.priority(source));
+        let take_ready = match (source_priority, ready_priority) {
+            (Some(source), Some(ready)) => ready >= source,
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (None, None) => return None,
+        };
+
+        Some(if take_ready {
+            self.pop_ready().expect("ready priority requires a ready transaction")
+        } else {
+            self.source_head.take().expect("source priority requires a source transaction")
+        })
+    }
+
     /// Pops the highest-priority non-stale ready transaction and its sequential lane.
     pub fn pop_ready(
         &mut self,
@@ -272,23 +314,15 @@ where
     type Item = Arc<ValidPoolTransaction<T>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.fill_source_head();
-
-        let ready_priority = self.ready_priority().cloned();
-        let source_priority = self.source_head.as_ref().map(|(source, _)| self.priority(source));
-        let take_ready = match (source_priority, ready_priority) {
-            (Some(source), Some(ready)) => ready >= source,
-            (None, Some(_)) => true,
-            (Some(_), None) => false,
-            (None, None) => return None,
-        };
-
-        let (transaction, lane) = if take_ready {
-            self.pop_ready().expect("ready priority requires a ready transaction")
-        } else {
-            self.source_head.take().expect("source priority requires a source transaction")
-        };
-        Some(self.record_yielded(transaction, lane))
+        loop {
+            let (transaction, lane) = self.select_next()?;
+            let transaction = self.record_yielded(transaction, lane);
+            if self.parking_filter.as_ref().is_some_and(|filter| filter.should_park(&transaction)) {
+                self.parked.insert(*transaction.hash(), (transaction, lane));
+                continue;
+            }
+            return Some(transaction);
+        }
     }
 }
 
@@ -352,6 +386,10 @@ where
         if let Some(lane) = BestTransactionLane::for_transaction(transaction) {
             self.release_lane(lane);
         }
+    }
+
+    fn set_parking_filter(&mut self, filter: Arc<dyn ParkingFilter<T>>) {
+        self.parking_filter = Some(filter);
     }
 }
 
@@ -581,5 +619,42 @@ mod tests {
         assert!(best.promote(*other_parked.hash()));
         assert_eq!(best.next().unwrap().hash(), other_parked.hash());
         assert!(best.next().is_none());
+    }
+
+    /// Parks a fixed set of transactions.
+    struct ParkHashes(Vec<TxHash>);
+
+    impl ParkingFilter<BasePooledTransaction> for ParkHashes {
+        fn should_park(&self, transaction: &ValidPoolTransaction<BasePooledTransaction>) -> bool {
+            self.0.contains(transaction.hash())
+        }
+    }
+
+    #[test]
+    fn filtered_transactions_are_parked_where_they_would_be_yielded() {
+        let parent_signer = PrivateKeySigner::random();
+        let other_signer = PrivateKeySigner::random();
+        let parent = transaction(&parent_signer, U256::ZERO, 0, 100);
+        let child = transaction(&parent_signer, U256::ZERO, 1, 90);
+        let other = transaction(&other_signer, U256::ZERO, 0, 50);
+        let inner = StaticBestTransactions::new(vec![
+            Arc::clone(&parent),
+            Arc::clone(&child),
+            Arc::clone(&other),
+        ]);
+        let mut best = ParkedBestTransactions::new(inner, BaseOrdering::coinbase_tip(), 0);
+        best.set_parking_filter(Arc::new(ParkHashes(vec![*parent.hash(), *child.hash()])));
+
+        // The parked parent keeps its lane occupied, so its child is buffered behind it.
+        assert_eq!(best.next().unwrap().hash(), other.hash());
+        best.mark_committed(&other);
+        assert!(best.next().is_none());
+        // A filtered transaction is parked when it leaves the ready set as well.
+        assert!(best.promote(*parent.hash()));
+        best.set_parking_filter(Arc::new(ParkHashes(vec![*child.hash()])));
+        assert_eq!(best.next().unwrap().hash(), parent.hash());
+        best.mark_committed(&parent);
+        assert!(best.next().is_none());
+        assert!(best.promote(*child.hash()));
     }
 }

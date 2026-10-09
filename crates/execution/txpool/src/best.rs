@@ -9,7 +9,7 @@ use reth_transaction_pool::{
 use crate::{BasePooledTx, BestTransactionPriority};
 
 /// Merges best-transaction iterators from the protocol pool and the 2D nonce sidecar.
-pub(crate) struct MergeBestTransactions<T: BasePooledTx, O>
+pub struct MergeBestTransactions<T: BasePooledTx, O>
 where
     O: TransactionOrdering<Transaction = T>,
 {
@@ -26,7 +26,7 @@ where
     O: TransactionOrdering<Transaction = T>,
 {
     /// Creates a merged iterator from the protocol pool and 2D nonce sidecar.
-    pub(crate) fn new(
+    pub fn new(
         protocol: Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<T>>>>,
         sidecar: Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<T>>>>,
         ordering: O,
