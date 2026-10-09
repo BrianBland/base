@@ -97,11 +97,8 @@ where
     /// Remove transaction from next iteration since it is already in the state
     pub fn mark_committed(&mut self, txs: &[TxHash]) {
         self.committed_transactions.extend(txs);
-        let mut state = self.resting.state();
-        if !state.resting.is_empty() {
-            for transaction_hash in txs {
-                state.resting.remove(*transaction_hash);
-            }
+        if self.resting_predicate_mode.is_enforced() {
+            self.resting.state().committed.extend(txs);
         }
     }
 
@@ -184,9 +181,8 @@ where
         self.inner.mark_current_committed();
         if let Some((transaction_hash, _, _)) = self.current_transaction.take() {
             self.committed_transactions.insert(transaction_hash);
-            let mut state = self.resting.state();
-            if !state.resting.is_empty() {
-                state.resting.remove(transaction_hash);
+            if self.resting_predicate_mode.is_enforced() {
+                self.resting.state().committed.insert(transaction_hash);
             }
         }
     }
@@ -827,6 +823,41 @@ mod tests {
         iterator.refresh_iterator(parkable(&pending_pool(&[original, Arc::clone(&child)])));
         assert_eq!(*iterator.next(()).unwrap().hash(), *child.hash());
         assert_eq!(iterator.take_resting_stats().parked, 0);
+    }
+
+    /// A committed hash stays in the resting index, so with 31 others resting under its stale
+    /// blocker that bucket is ordered, and a write that crosses no threshold wakes none of them.
+    #[test]
+    fn committed_hash_keeps_its_resting_bucket_ordered() {
+        let blocked = vec![balance_at_least(WATCHED, 2)];
+        let stale = validity_transaction(0, 0, 50, blocked.clone());
+        let replaced = validity_transaction(0, 0, 50, Vec::new());
+        let resting: Vec<_> =
+            (1..=31).map(|sender| validity_transaction(sender, 0, 20, blocked.clone())).collect();
+        let writer = transaction(40, 0, 5);
+        let mut iterator = resting_iterator(&pending_pool(&[stale]));
+        let first = iterator.next(()).unwrap();
+        park_unsatisfied(&mut iterator, &first);
+
+        let mut second = vec![Arc::clone(&replaced)];
+        second.extend(resting.iter().cloned());
+        iterator.refresh_iterator(parkable(&pending_pool(&second)));
+        assert_eq!(*iterator.next(()).unwrap().hash(), *replaced.hash());
+        iterator.mark_current_committed();
+        for _ in &resting {
+            let candidate = iterator.next(()).unwrap();
+            park_unsatisfied(&mut iterator, &candidate);
+        }
+
+        let mut third = resting.clone();
+        third.push(Arc::clone(&writer));
+        iterator.refresh_iterator(parkable(&pending_pool(&third)));
+        assert_eq!(*iterator.next(()).unwrap().hash(), *writer.hash());
+        iterator.record_committed_state(&balance_change(WATCHED, 0, 1));
+        iterator.mark_current_committed();
+
+        assert!(iterator.next(()).is_none());
+        assert_eq!(iterator.take_resting_stats().parked, 31);
     }
 
     #[test]

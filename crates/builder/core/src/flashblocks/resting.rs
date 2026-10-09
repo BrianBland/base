@@ -55,8 +55,13 @@ pub trait RestingPayloadTransactions {
 pub struct RestingState {
     /// Transactions resting in this block, indexed by the predicate last found unsatisfied.
     ///
-    /// A committed transaction never rests, so the filter need not consult the committed set.
+    /// Committed transactions stay indexed: bucket sizes decide whether a bucket wakes every
+    /// member on any change or only those whose threshold was crossed, so removing them would
+    /// change which other transactions wake.
     pub resting: ParkedPredicateIndex<()>,
+    /// Transactions committed in this block, which the filter never parks so that the
+    /// flashblocks adapter closes them as committed.
+    pub committed: B256Set,
     /// Resting transactions the filter parked in the current candidate iterator. Transactions
     /// the build loop parked are woken by its own predicate index instead.
     pub parked: B256Set,
@@ -126,7 +131,10 @@ where
         }
         let hash = *transaction.hash();
         let mut state = self.state.lock();
-        if !state.is_resting(hash, predicates) || self.rejection_cache.is_rejected(&hash) {
+        if state.committed.contains(&hash)
+            || !state.is_resting(hash, predicates)
+            || self.rejection_cache.is_rejected(&hash)
+        {
             return false;
         }
         state.parked.insert(hash);
