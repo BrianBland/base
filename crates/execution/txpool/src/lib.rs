@@ -75,6 +75,8 @@ pub use wire::{
 };
 
 mod two_d_nonce_pool;
+#[cfg(feature = "test-utils")]
+pub use two_d_nonce_pool::sidecar_best_transactions;
 
 mod metrics;
 pub use metrics::{GuardMetrics, ValidatorMetrics, ValidityPoolMetrics};

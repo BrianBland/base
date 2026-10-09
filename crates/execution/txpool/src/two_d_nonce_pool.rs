@@ -516,6 +516,36 @@ impl<T: BasePooledTx> TwoDNoncePool<T> {
     }
 }
 
+/// Returns the best-transaction snapshot the production pool serves for a sidecar holding exactly
+/// `transactions`, every channel starting at nonce zero.
+///
+/// Lets tests and benchmarks build the production candidate stack without a full pool.
+#[cfg(feature = "test-utils")]
+pub fn sidecar_best_transactions<T, O>(
+    transactions: impl IntoIterator<Item = Arc<ValidPoolTransaction<T>>>,
+    ordering: O,
+    base_fee: u64,
+) -> Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<T>>>>
+where
+    T: BasePooledTx + 'static,
+    O: TransactionOrdering<Transaction = T> + 'static,
+{
+    let mut pool = TwoDNoncePool::new(PriceBumpConfig::default());
+    for transaction in transactions {
+        let transaction = ValidPoolTransaction {
+            transaction: transaction.transaction.clone(),
+            transaction_id: transaction.transaction_id,
+            propagate: transaction.propagate,
+            timestamp: transaction.timestamp,
+            origin: transaction.origin,
+            authority_ids: transaction.authority_ids.clone(),
+        };
+        pool.insert_validated(transaction, 0)
+            .expect("sidecar test transactions are valid channel or nonce-free transactions");
+    }
+    Box::new(pool.best_transactions(ordering, base_fee))
+}
+
 /// Snapshot iterator over the current best transactions of the EIP-8130 sidecar.
 ///
 /// Each finite channel contributes its contiguous head and each nonce-free

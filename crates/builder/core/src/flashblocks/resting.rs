@@ -55,13 +55,8 @@ pub trait RestingPayloadTransactions {
 pub struct RestingState {
     /// Transactions resting in this block, indexed by the predicate last found unsatisfied.
     ///
-    /// Committed transactions stay indexed: bucket sizes decide whether a bucket wakes every
-    /// member on any change or only those whose threshold was crossed, so removing them would
-    /// change which other transactions wake.
+    /// A committed transaction never rests, so the filter need not consult the committed set.
     pub resting: ParkedPredicateIndex<()>,
-    /// Transactions committed in this block, which the filter never parks so that the
-    /// flashblocks adapter closes them as committed.
-    pub committed: B256Set,
     /// Resting transactions the filter parked in the current candidate iterator. Transactions
     /// the build loop parked are woken by its own predicate index instead.
     pub parked: B256Set,
@@ -69,6 +64,9 @@ pub struct RestingState {
     pub stats: RestingStats,
     /// When the filter first parked a transaction during the current `next` call.
     pub first_park: Option<Instant>,
+    /// Every resting park in order, so tests can compare park sequences.
+    #[cfg(test)]
+    pub park_sequence: Vec<TxHash>,
 }
 
 impl RestingState {
@@ -107,6 +105,47 @@ impl RestingFilter {
         self.state.lock()
     }
 
+    /// Records `transaction` as parked by this filter if it rests, without consulting the
+    /// rejection cache.
+    ///
+    /// The flashblocks adapter calls this after its own rejection-cache miss for a candidate the
+    /// filter let through. The filter only lets a resting candidate through when the cache holds
+    /// it, so this parks exactly the candidates whose cache entry expired or was evicted in
+    /// between, as the adapter's resting check did before the filter existed.
+    pub fn park_if_resting_after_cache_miss<T: BasePooledTx>(
+        &self,
+        transaction: &ValidPoolTransaction<T>,
+    ) -> bool {
+        self.park_if_resting(transaction, |_| false)
+    }
+
+    /// Records `transaction` as parked by this filter if it rests under an unchanged predicate
+    /// and is not `rejected`.
+    fn park_if_resting<T: BasePooledTx>(
+        &self,
+        transaction: &ValidPoolTransaction<T>,
+        rejected: impl FnOnce(&TxHash) -> bool,
+    ) -> bool {
+        let predicates = transaction.transaction.validity_predicates();
+        if predicates.is_empty() {
+            return false;
+        }
+        let hash = *transaction.hash();
+        let mut state = self.state.lock();
+        if !state.is_resting(hash, predicates) || rejected(&hash) {
+            return false;
+        }
+        state.parked.insert(hash);
+        #[cfg(test)]
+        state.park_sequence.push(hash);
+        state.stats.parked += 1;
+        if state.first_park.is_none() {
+            state.first_park = Some(Instant::now());
+            self.parked_during_next.store(true, Ordering::Relaxed);
+        }
+        true
+    }
+
     /// Ends a `next` call, adding the time since its first resting park to the stats.
     pub fn finish_next(&self) {
         if !self.parked_during_next.load(Ordering::Relaxed) {
@@ -125,24 +164,6 @@ where
     T: BasePooledTx,
 {
     fn should_park(&self, transaction: &ValidPoolTransaction<T>) -> bool {
-        let predicates = transaction.transaction.validity_predicates();
-        if predicates.is_empty() {
-            return false;
-        }
-        let hash = *transaction.hash();
-        let mut state = self.state.lock();
-        if state.committed.contains(&hash)
-            || !state.is_resting(hash, predicates)
-            || self.rejection_cache.is_rejected(&hash)
-        {
-            return false;
-        }
-        state.parked.insert(hash);
-        state.stats.parked += 1;
-        if state.first_park.is_none() {
-            state.first_park = Some(Instant::now());
-            self.parked_during_next.store(true, Ordering::Relaxed);
-        }
-        true
+        self.park_if_resting(transaction, |hash| self.rejection_cache.is_rejected(hash))
     }
 }

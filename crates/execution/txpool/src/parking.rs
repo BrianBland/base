@@ -273,7 +273,7 @@ where
             let lane = BestTransactionLane::for_transaction(candidate);
             let parks = lane.is_none_or(|lane| !lanes.contains_key(&lane))
                 && ready_top.is_none_or(|ready| {
-                    BestTransactionPriority::new(ordering, candidate, *base_fee) > *ready
+                    *ready < BestTransactionPriority::new(ordering, candidate, *base_fee)
                 })
                 && filter.should_park(candidate);
             if parks {

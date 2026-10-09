@@ -209,6 +209,7 @@ test-utils = [
 	"base-bundles/test-utils",
 	"base-common-chains/test-utils",
 	"base-execution-eip8130/test-utils",
+	"base-execution-txpool/test-utils",
 	"base-execution-rpc/client",
 	"base-node-core/test-utils",
 	"base-node-runner/test-utils",
