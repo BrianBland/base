@@ -268,8 +268,11 @@ mod tests {
     use reth_payload_util::PayloadTransactions;
     use reth_primitives_traits::Recovered;
     use reth_transaction_pool::{
-        BestTransactions, TransactionOrigin, ValidPoolTransaction,
-        error::InvalidPoolTransactionError, identifier::TransactionId, pool::PendingPool,
+        BestTransactions, BestTransactionsAttributes, BlockInfo, PoolConfig, TransactionOrigin,
+        ValidPoolTransaction,
+        error::InvalidPoolTransactionError,
+        identifier::TransactionId,
+        pool::{PendingPool, txpool::TxPool},
     };
     use revm::state::{Account, EvmState};
 
@@ -1018,23 +1021,17 @@ mod tests {
     /// block's attributes and the production 2D nonce sidecar snapshot, merged under lane
     /// parking, recording what lane parking claims from the protocol source into `claims`.
     ///
-    /// Like the production pool, the protocol snapshot is the plain one when the attributes'
-    /// base fee is the pool's pending base fee and the fee-checked one when it is higher. A
-    /// lower base fee would unlock transactions from the base-fee subpool, which a lone pending
-    /// pool cannot model.
+    /// The protocol snapshot comes from the pool's attribute path, so a base fee above the
+    /// pool's pending base fee yields the fee-checked snapshot and one below it unlocks
+    /// transactions from the base-fee subpool under new submission ids.
     fn merged_parkable(
-        protocol: &PendingPool<Ordering>,
+        protocol: &TxPool<Ordering>,
         block: &Flashblock,
         claims: &Arc<Mutex<Vec<TxHash>>>,
     ) -> Parkable {
         let base_fee = block.base_fee;
-        let snapshot: Box<dyn BestTransactions<Item = Tx>> = match base_fee
-            .cmp(&block.pending_base_fee())
-        {
-            std::cmp::Ordering::Equal => Box::new(protocol.best()),
-            std::cmp::Ordering::Greater => Box::new(protocol.best_with_higher_base_fee(base_fee)),
-            std::cmp::Ordering::Less => unreachable!("scenarios never lower the base fee"),
-        };
+        let snapshot =
+            protocol.best_with_attributes(BestTransactionsAttributes::new(base_fee, None));
         let protocol = ClaimRecorder { inner: snapshot, claims: Arc::clone(claims) };
         let merged = MergeBestTransactions::new(
             Box::new(protocol),
@@ -1238,15 +1235,14 @@ mod tests {
         }
     }
 
-    /// A protocol transaction delivered to the live pool during a flashblock.
+    /// A protocol transaction delivered to the live pool during a flashblock, replacing the
+    /// pooled transaction at its nonce if it outbids it as the pool requires.
     struct Arrival {
         flashblock: usize,
         /// Delivered once the flashblock has committed this many transactions, or right after the
         /// iterator refresh for zero.
         after_commits: usize,
         transaction: Tx,
-        /// Replaces the pooled transaction with the same id instead of adding a new one.
-        replaces: bool,
     }
 
     /// The pool contents and fees one flashblock is built from.
@@ -1255,9 +1251,9 @@ mod tests {
         protocol: Vec<Tx>,
         sidecar: Vec<Tx>,
         base_fee: u64,
-        /// The base fee the protocol pool last priced its pending set at, when it lags the
-        /// attributes' `base_fee`.
-        lagging_pending_base_fee: Option<u64>,
+        /// The base fee the protocol pool last priced its pending set at, when it differs from
+        /// the attributes' `base_fee`.
+        pool_pending_base_fee: Option<u64>,
         /// Transactions the shared rejection cache learns about at the end of the flashblock, as
         /// if a concurrent payload job rejected them.
         rejected_elsewhere: Vec<TxHash>,
@@ -1265,7 +1261,7 @@ mod tests {
 
     impl Flashblock {
         fn pending_base_fee(&self) -> u64 {
-            self.lagging_pending_base_fee.unwrap_or(self.base_fee)
+            self.pool_pending_base_fee.unwrap_or(self.base_fee)
         }
     }
 
@@ -1350,11 +1346,10 @@ mod tests {
             self
         }
 
-        /// Leaves the protocol pool of `flashblock` priced at `pending_base_fee`, below the
+        /// Leaves the protocol pool of `flashblock` priced at `pending_base_fee` instead of the
         /// attributes' base fee.
-        fn lagging_pending_base_fee(mut self, flashblock: usize, pending_base_fee: u64) -> Self {
-            assert!(pending_base_fee < self.flashblocks[flashblock].base_fee);
-            self.flashblocks[flashblock].lagging_pending_base_fee = Some(pending_base_fee);
+        fn pool_pending_base_fee(mut self, flashblock: usize, pending_base_fee: u64) -> Self {
+            self.flashblocks[flashblock].pool_pending_base_fee = Some(pending_base_fee);
             self
         }
 
@@ -1372,19 +1367,7 @@ mod tests {
             transaction: Tx,
         ) -> Self {
             let transaction = self.register(name, transaction);
-            self.arrivals.push(Arrival { flashblock, after_commits, transaction, replaces: false });
-            self
-        }
-
-        fn replace(
-            mut self,
-            flashblock: usize,
-            after_commits: usize,
-            name: &str,
-            transaction: Tx,
-        ) -> Self {
-            let transaction = self.register(name, transaction);
-            self.arrivals.push(Arrival { flashblock, after_commits, transaction, replaces: true });
+            self.arrivals.push(Arrival { flashblock, after_commits, transaction });
             self
         }
 
@@ -1392,24 +1375,60 @@ mod tests {
             &self.names[transaction_hash]
         }
 
-        fn build_protocol_pool(&self, flashblock: usize) -> PendingPool<Ordering> {
+        /// Builds the production protocol pool of `flashblock`, its senders at on-chain nonce
+        /// zero with unlimited balances, so each transaction lands in the subpool its fees and
+        /// nonce select.
+        fn build_protocol_pool(&self, flashblock: usize) -> TxPool<Ordering> {
             let block = &self.flashblocks[flashblock];
-            pending_pool_at(&block.protocol, block.pending_base_fee())
-        }
-
-        fn deliver(&self, protocol: &mut PendingPool<Ordering>, flashblock: usize, commits: usize) {
-            let base_fee = self.flashblocks[flashblock].pending_base_fee();
-            for arrival in &self.arrivals {
-                if arrival.flashblock != flashblock || arrival.after_commits != commits {
-                    continue;
-                }
-                let transaction = Arc::clone(&arrival.transaction);
-                if arrival.replaces {
-                    protocol.replace_transaction(transaction, base_fee);
-                } else {
-                    protocol.add_transaction(transaction, base_fee);
+            let config = PoolConfig { minimal_protocol_basefee: 0, ..Default::default() };
+            let mut pool = TxPool::new(Ordering::coinbase_tip(), config);
+            pool.set_block_info(BlockInfo {
+                last_seen_block_hash: Default::default(),
+                last_seen_block_number: 0,
+                block_gas_limit: 30_000_000,
+                pending_basefee: block.pending_base_fee(),
+                pending_blob_fee: None,
+            });
+            for transaction in &block.protocol {
+                if let Err(error) = Self::add_to(&mut pool, transaction) {
+                    panic!("the pool rejected {}: {error:?}", self.name(transaction.hash()));
                 }
             }
+            pool
+        }
+
+        /// Delivers the arrivals due after `commits` commits, logging those the pool rejects,
+        /// such as replacements that do not outbid the pooled transaction.
+        fn deliver(
+            &self,
+            protocol: &mut TxPool<Ordering>,
+            flashblock: usize,
+            commits: usize,
+            log: &mut Vec<String>,
+        ) {
+            for arrival in &self.arrivals {
+                if arrival.flashblock == flashblock
+                    && arrival.after_commits == commits
+                    && Self::add_to(protocol, &arrival.transaction).is_err()
+                {
+                    log.push(format!("pool rejected {}", self.name(arrival.transaction.hash())));
+                }
+            }
+        }
+
+        fn add_to(
+            pool: &mut TxPool<Ordering>,
+            transaction: &Tx,
+        ) -> reth_transaction_pool::error::PoolResult<()> {
+            let transaction_copy = ValidPoolTransaction {
+                transaction: transaction.transaction.clone(),
+                transaction_id: transaction.transaction_id,
+                propagate: transaction.propagate,
+                timestamp: transaction.timestamp,
+                origin: transaction.origin,
+                authority_ids: transaction.authority_ids.clone(),
+            };
+            pool.add_validated_transaction(transaction_copy, 0)
         }
 
         /// Plays the build loop and `payload.rs` against `candidates`, returning every
@@ -1424,6 +1443,8 @@ mod tests {
             new: impl FnOnce(Parkable) -> C,
         ) -> (Vec<String>, Vec<String>) {
             let mut balances: std::collections::HashMap<Address, u64> = Default::default();
+            let mut next_nonces: std::collections::HashMap<(Address, Option<U256>), u64> =
+                Default::default();
             let first =
                 |predicates: &[ValidityPredicate],
                  balances: &std::collections::HashMap<Address, u64>| {
@@ -1446,7 +1467,7 @@ mod tests {
                     candidates.refresh(merged_parkable(&protocol, block, &claims));
                 }
                 log.push(format!("flashblock {flashblock}"));
-                self.deliver(&mut protocol, flashblock, 0);
+                self.deliver(&mut protocol, flashblock, 0, &mut log);
                 let mut build_loop_parked = ParkedPredicateIndex::<Tx>::new(self.ordered_threshold);
                 let (mut committed, mut rejected) = (Vec::new(), Vec::new());
                 loop {
@@ -1467,6 +1488,25 @@ mod tests {
                             predicates[blocker].clone(),
                         );
                         continue;
+                    }
+                    let nonce_lane =
+                        candidate.transaction.eip8130_replay_id().is_none().then(|| {
+                            (candidate.sender(), candidate.transaction.eip8130_nonce_channel_key())
+                        });
+                    let expected_nonce =
+                        nonce_lane.map(|lane| next_nonces.get(&lane).copied().unwrap_or_default());
+                    match expected_nonce.map(|expected| candidate.nonce().cmp(&expected)) {
+                        Some(std::cmp::Ordering::Less) => {
+                            log.push(format!("nonce too low {}", self.name(&hash)));
+                            candidates.mark_current_committed();
+                            continue;
+                        }
+                        Some(std::cmp::Ordering::Greater) => {
+                            log.push(format!("nonce too high {}", self.name(&hash)));
+                            candidates.mark_invalid(candidate.sender(), candidate.nonce());
+                            continue;
+                        }
+                        Some(std::cmp::Ordering::Equal) | None => {}
                     }
                     if self.failing.contains(&hash) {
                         log.push(format!("reject {}", self.name(&hash)));
@@ -1496,8 +1536,11 @@ mod tests {
                         balances.insert(address, value);
                     }
                     candidates.mark_current_committed();
+                    if let Some(lane) = nonce_lane {
+                        next_nonces.insert(lane, candidate.nonce() + 1);
+                    }
                     committed.push(hash);
-                    self.deliver(&mut protocol, flashblock, committed.len());
+                    self.deliver(&mut protocol, flashblock, committed.len(), &mut log);
                     for parked_hash in affected {
                         let Some(parked) = build_loop_parked.transaction(parked_hash).cloned()
                         else {
@@ -1643,7 +1686,10 @@ mod tests {
 
     /// Review P2: a different-hash replacement `r'` of the claimed `r` arrives live and is
     /// stashed. The wake still promotes the original `r`, which the lane-parking iterator
-    /// kept.
+    /// kept. Once `r` commits, `r'` meets a consumed nonce at the refresh: it is closed without
+    /// executing, so `q`, resting until `r'` writes, stays resting, while `r`'s successor and
+    /// unrelated candidates are still selected. If `r` failed instead, `r'` executes and wakes
+    /// `q`.
     #[test]
     fn replacement_of_a_claimed_transaction_does_not_erase_it() {
         for fails in [false, true] {
@@ -1651,13 +1697,17 @@ mod tests {
                 vec![
                     ("r", validity_transaction(0, 0, 30, vec![balance_at_least(WATCHED, 1)])),
                     ("x", transaction(1, 0, 20)),
+                    ("q", validity_transaction(2, 0, 5, vec![balance_at_least(UNRELATED, 1)])),
+                    ("successor", transaction(0, 1, 25)),
+                    ("z", transaction(3, 0, 3)),
                 ],
                 vec![("w", sidecar_transaction(10, 10, Vec::new()))],
             )
-            .only_first(&["r"])
+            .only_first(&["r", "q"])
+            .protocol_pool(1, &["r", "x", "q"])
             .write("w", WATCHED, 1)
             .fail_if(fails, "r")
-            .replace(
+            .arrive(
                 1,
                 1,
                 "r'",
@@ -1665,11 +1715,12 @@ mod tests {
                     0,
                     0,
                     40,
-                    141,
+                    150,
                     vec![balance_at_least(WATCHED, 1)],
                 ),
-            );
-            let scenario = scenario.protocol_pool(2, &["r'", "x"]);
+            )
+            .write("r'", UNRELATED, 1)
+            .protocol_pool(2, &["r'", "x", "q", "successor", "z"]);
             let (log, claims) = scenario.assert_parity();
             assert_eq!(claims, ["1:r"], "{log:#?}");
             let outcome = if fails { "reject r" } else { "commit r" };
@@ -1677,6 +1728,16 @@ mod tests {
                 &log,
                 &["flashblock 1", "commit x", "commit w", outcome, "flashblock 2"],
             );
+            let last = log.iter().position(|event| event == "flashblock 2").expect("flashblock 2");
+            let replacement = if fails { "commit r'" } else { "nonce too low r'" };
+            let resting = if fails { "commit q" } else { "rest q" };
+            assert_in_order(&log[last..], &[replacement, "commit successor", resting, "commit z"]);
+            if !fails {
+                assert!(
+                    log[last..].iter().all(|event| event != "commit r'" && event != "commit q"),
+                    "{log:#?}"
+                );
+            }
         }
     }
 
@@ -1785,27 +1846,45 @@ mod tests {
         }
     }
 
-    /// The resting `r1` is popped while its lane is occupied by the build-loop-parked `r0`, so
-    /// it is buffered rather than claimed; once `r0` commits it is released and parked from the
-    /// ready set. When `r0` fails the lane is invalidated with `r1` in it.
+    /// The resting `r1` is popped while its lane is occupied by the build-loop-parked `r0'`, a
+    /// replacement of the committed `r0`, so it is buffered rather than claimed. Once `r0'` is
+    /// woken and closed at its consumed nonce, `r1` is released and parked from the ready set.
     #[test]
     fn resting_descendant_in_an_occupied_lane_is_not_claimed() {
-        for fails in [false, true] {
-            let (log, claims) = Scenario::new(
-                vec![
-                    ("r0", validity_transaction(0, 0, 30, vec![balance_at_least(WATCHED, 1)])),
-                    ("r1", validity_transaction(0, 1, 40, vec![balance_at_least(UNRELATED, 1)])),
-                    ("p", transaction(1, 0, 20)),
-                ],
-                vec![("w", sidecar_transaction(10, 10, Vec::new()))],
-            )
-            .only_first(&["r1"])
-            .write("w", WATCHED, 1)
-            .fail_if(fails, "r0")
-            .assert_parity();
-            assert!(!claims.contains(&"1:r1".to_owned()), "{log:#?}");
-            assert_in_order(&log, &["flashblock 0", "park r1", "flashblock 1", "park r0"]);
-        }
+        let replacement =
+            validity_transaction_with_max_fee(0, 0, 60, 200, vec![balance_at_least(WATCHED, 1)]);
+        let mut scenario = Scenario::new(
+            vec![
+                ("r0", transaction(0, 0, 50)),
+                ("r1", validity_transaction(0, 1, 40, vec![balance_at_least(UNRELATED, 1)])),
+                ("p", transaction(1, 0, 20)),
+                ("r0'", replacement),
+            ],
+            vec![("w", sidecar_transaction(10, 10, Vec::new()))],
+        )
+        .only_first(&["r0", "r1"])
+        .protocol_pool(1, &["r0'", "r1", "p"])
+        .write("w", WATCHED, 1);
+        scenario.flashblocks.truncate(2);
+
+        let (log, claims) = scenario.assert_parity();
+
+        assert!(!claims.contains(&"1:r1".to_owned()), "{log:#?}");
+        assert_in_order(
+            &log,
+            &[
+                "flashblock 0",
+                "commit r0",
+                "park r1",
+                "flashblock 1",
+                "park r0'",
+                "commit p",
+                "commit w",
+                "promote r0' true",
+                "nonce too low r0'",
+                "rest r1",
+            ],
+        );
     }
 
     /// At a base fee the resting `r` cannot pay, the merge marks it invalid together with its
@@ -2233,7 +2312,7 @@ mod tests {
         )
         .only_first(&["resting"])
         .base_fee(1, 3)
-        .lagging_pending_base_fee(1, 0);
+        .pool_pending_base_fee(1, 0);
 
         let (log, _) = scenario.assert_parity();
 
@@ -2243,6 +2322,50 @@ mod tests {
         assert!(
             log[second..third].iter().all(|event| !event.starts_with("commit cheap")),
             "{log:#?}"
+        );
+    }
+
+    /// When the attributes' base fee is below the protocol pool's pending base fee, the
+    /// production snapshot unlocks base-fee subpool transactions under new submission ids, so an
+    /// unlocked head follows a pending transaction of equal priority, around a resting
+    /// transaction woken by a write and a live arrival. The head's descendant sits in the queued
+    /// subpool behind its parked ancestor, which the snapshot does not unlock, so it waits for a
+    /// pool priced at a base fee it pays.
+    #[test]
+    fn resting_filter_matches_per_yield_parking_over_transactions_unlocked_by_a_lower_base_fee() {
+        let scenario = Scenario::new(
+            vec![
+                ("resting", validity_transaction(0, 0, 30, vec![balance_at_least(WATCHED, 1)])),
+                ("unlocked", validity_transaction_with_max_fee(1, 0, 2, 7, Vec::new())),
+                ("unlocked_child", validity_transaction_with_max_fee(1, 1, 2, 7, Vec::new())),
+                ("writer", transaction(2, 0, 3)),
+                ("pending_tie", transaction(4, 0, 2)),
+            ],
+            vec![],
+        )
+        .only_first(&["resting"])
+        .base_fee(1, 5)
+        .pool_pending_base_fee(1, 10)
+        .write("writer", WATCHED, 1)
+        .arrive(1, 1, "arrival", transaction(3, 0, 1));
+
+        let (log, claims) = scenario.assert_parity();
+
+        assert_eq!(claims, ["1:resting"], "{log:#?}");
+        assert_in_order(
+            &log,
+            &[
+                "park resting",
+                "flashblock 1",
+                "rest resting",
+                "commit writer",
+                "commit resting",
+                "commit pending_tie",
+                "commit unlocked",
+                "commit arrival",
+                "flashblock 2",
+                "commit unlocked_child",
+            ],
         );
     }
 
@@ -2341,11 +2464,10 @@ mod tests {
         }
         for flashblock in 1..scenario.flashblocks.len() {
             if rng.chance(20) {
-                let base_fee = 1 + rng.below(4);
-                scenario = scenario.base_fee(flashblock, base_fee);
-                if rng.chance(50) {
-                    scenario = scenario.lagging_pending_base_fee(flashblock, rng.below(base_fee));
-                }
+                scenario = scenario.base_fee(flashblock, 1 + rng.below(4));
+            }
+            if rng.chance(30) {
+                scenario = scenario.pool_pending_base_fee(flashblock, rng.below(7));
             }
             if rng.chance(20) {
                 let name = &names[rng.below(names.len() as u64) as usize];
@@ -2373,8 +2495,16 @@ mod tests {
                 _ => {
                     let sender = rng.below(senders);
                     let nonce = rng.below(original_chains[sender as usize]);
-                    let arrival = tx(&mut rng, sender, nonce);
-                    scenario.replace(flashblock, after_commits, &name, arrival)
+                    // Outbids the original and any earlier replacement by the pool's price bump.
+                    let priority = 20 + 10 * index as u128;
+                    let arrival = validity_transaction_with_max_fee(
+                        sender,
+                        nonce,
+                        priority,
+                        10 * priority,
+                        predicates(&mut rng),
+                    );
+                    scenario.arrive(flashblock, after_commits, &name, arrival)
                 }
             };
         }
