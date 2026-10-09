@@ -227,9 +227,15 @@ where
     /// the source only exposes other lanes after these transactions are pulled and buffered. The
     /// `Invalid` arm is defensive because terminal invalidation is already forwarded to `inner`,
     /// whose [`BestTransactions`] contract excludes the invalid transaction's descendants.
+    ///
+    /// With a parking filter installed, the source is asked to skip the candidates this iterator
+    /// would select, yield and park within the same `next` call, so they are parked right where
+    /// the source pops them; see [`Self::pull_source`].
     pub fn fill_source_head(&mut self) {
+        let ready_top =
+            if self.parking_filter.is_some() { self.ready_priority().cloned() } else { None };
         while self.source_head.is_none() {
-            let Some(transaction) = self.inner.next() else {
+            let Some(transaction) = self.pull_source(ready_top.as_ref()) else {
                 return;
             };
             let Some(lane) = BestTransactionLane::for_transaction(&transaction) else {
@@ -246,6 +252,36 @@ where
             }
             self.source_head = Some((transaction, Some(lane)));
         }
+    }
+
+    /// Pulls the next source transaction, parking on the way every candidate the filter claims
+    /// that would also win selection against `ready_top`.
+    ///
+    /// Such a candidate would become the source head of a vacant lane, beat the ready set, be
+    /// recorded as yielded and be parked by the filter before this iterator pulls again, with
+    /// nothing in between that could change the outcome. Parking it inside the source pull
+    /// performs those same steps at the same point of the source's sequence.
+    fn pull_source(
+        &mut self,
+        ready_top: Option<&BestTransactionPriority<O::PriorityValue>>,
+    ) -> Option<Arc<ValidPoolTransaction<T>>> {
+        let Self { inner, ordering, base_fee, lanes, parked, parking_filter, .. } = self;
+        let Some(filter) = parking_filter else {
+            return inner.next();
+        };
+        inner.next_skipping(&mut |candidate| {
+            let lane = BestTransactionLane::for_transaction(candidate);
+            let parks = lane.is_none_or(|lane| !lanes.contains_key(&lane))
+                && ready_top.is_none_or(|ready| {
+                    BestTransactionPriority::new(ordering, candidate, *base_fee) > *ready
+                })
+                && filter.should_park(candidate);
+            if parks {
+                occupy_lane(lanes, lane);
+                parked.insert(*candidate.hash(), (Arc::clone(candidate), lane));
+            }
+            parks
+        })
     }
 
     /// Removes stale heap entries and returns the highest-priority ready key.
@@ -296,12 +332,18 @@ where
         transaction: Arc<ValidPoolTransaction<T>>,
         lane: Option<BestTransactionLane>,
     ) -> Arc<ValidPoolTransaction<T>> {
-        if let Some(lane) = lane {
-            self.lanes
-                .entry(lane)
-                .or_insert_with(|| BestTransactionLaneState::Occupied(VecDeque::new()));
-        }
+        occupy_lane(&mut self.lanes, lane);
         transaction
+    }
+}
+
+/// Marks a yielded transaction's sequential lane occupied, so the lane buffers its descendants.
+fn occupy_lane<T: PoolTransaction>(
+    lanes: &mut HashMap<BestTransactionLane, BestTransactionLaneState<T>>,
+    lane: Option<BestTransactionLane>,
+) {
+    if let Some(lane) = lane {
+        lanes.entry(lane).or_insert_with(|| BestTransactionLaneState::Occupied(VecDeque::new()));
     }
 }
 

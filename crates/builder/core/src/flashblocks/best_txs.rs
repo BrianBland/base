@@ -253,10 +253,12 @@ mod tests {
         BaseOrdering, BasePooledTransaction, BasePooledTx, MergeBestTransactions,
         ParkedBestTransactions, ValidityOperator, ValidityPredicate,
     };
+    use parking_lot::Mutex;
     use reth_payload_util::PayloadTransactions;
     use reth_primitives_traits::Recovered;
     use reth_transaction_pool::{
-        TransactionOrigin, ValidPoolTransaction, identifier::TransactionId, pool::PendingPool,
+        BestTransactions, TransactionOrigin, ValidPoolTransaction,
+        error::InvalidPoolTransactionError, identifier::TransactionId, pool::PendingPool,
     };
     use revm::state::{Account, EvmState};
 
@@ -267,6 +269,7 @@ mod tests {
 
     type Ordering = BaseOrdering<BasePooledTransaction>;
     type Parkable = ParkableBestPayloadTransactions<BasePooledTransaction>;
+    type Tx = Arc<ValidPoolTransaction<BasePooledTransaction>>;
 
     const WATCHED: Address = Address::repeat_byte(0xaa);
     const UNRELATED: Address = Address::repeat_byte(0xbb);
@@ -293,11 +296,27 @@ mod tests {
         priority_fee: u128,
         predicates: Vec<ValidityPredicate>,
     ) -> Arc<ValidPoolTransaction<BasePooledTransaction>> {
+        validity_transaction_with_max_fee(
+            sender,
+            nonce,
+            priority_fee,
+            priority_fee + 100,
+            predicates,
+        )
+    }
+
+    fn validity_transaction_with_max_fee(
+        sender: u64,
+        nonce: u64,
+        priority_fee: u128,
+        max_fee_per_gas: u128,
+        predicates: Vec<ValidityPredicate>,
+    ) -> Arc<ValidPoolTransaction<BasePooledTransaction>> {
         let tx = TxEip1559 {
             chain_id: 1,
             nonce,
             gas_limit: 21_000,
-            max_fee_per_gas: priority_fee + 100,
+            max_fee_per_gas,
             max_priority_fee_per_gas: priority_fee,
             to: TxKind::Call(Address::ZERO),
             // Distinguishes otherwise identical transactions from different senders, which share
@@ -325,9 +344,16 @@ mod tests {
     fn pending_pool(
         transactions: &[Arc<ValidPoolTransaction<BasePooledTransaction>>],
     ) -> PendingPool<Ordering> {
+        pending_pool_at(transactions, 0)
+    }
+
+    fn pending_pool_at(
+        transactions: &[Arc<ValidPoolTransaction<BasePooledTransaction>>],
+        base_fee: u64,
+    ) -> PendingPool<Ordering> {
         let mut pool = PendingPool::new(Ordering::coinbase_tip());
         for transaction in transactions {
-            pool.add_transaction(Arc::clone(transaction), 0);
+            pool.add_transaction(Arc::clone(transaction), base_fee);
         }
         pool
     }
@@ -953,21 +979,25 @@ mod tests {
     }
 
     /// Builds the production candidate stack: protocol and sidecar sources merged under lane
-    /// parking.
+    /// parking, recording what lane parking claims from the protocol source into `claims`.
     fn merged_parkable(
         protocol: &PendingPool<Ordering>,
         sidecar: &PendingPool<Ordering>,
+        base_fee: u64,
+        claims: &Arc<Mutex<Vec<TxHash>>>,
     ) -> Parkable {
+        let protocol =
+            ClaimRecorder { inner: Box::new(protocol.best()), claims: Arc::clone(claims) };
         let merged = MergeBestTransactions::new(
-            Box::new(protocol.best()),
+            Box::new(protocol),
             Box::new(sidecar.best()),
             Ordering::coinbase_tip(),
-            0,
+            base_fee,
         );
         ParkableBestPayloadTransactions::new(Box::new(ParkedBestTransactions::new(
             merged,
             Ordering::coinbase_tip(),
-            0,
+            base_fee,
         )))
     }
 
@@ -1102,88 +1132,211 @@ mod tests {
         }
     }
 
-    /// Transactions of the differential scenario, shared by both runs so that their arrival
+    /// Records the protocol transactions the lane-parking iterator claims from its source
+    /// through [`BestTransactions::next_skipping`], so tests can tell which path a resting
+    /// transaction took.
+    struct ClaimRecorder {
+        inner: Box<dyn BestTransactions<Item = Tx>>,
+        claims: Arc<Mutex<Vec<TxHash>>>,
+    }
+
+    impl Iterator for ClaimRecorder {
+        type Item = Tx;
+
+        fn next(&mut self) -> Option<Tx> {
+            self.inner.next()
+        }
+    }
+
+    impl BestTransactions for ClaimRecorder {
+        fn next_skipping(&mut self, skip: &mut dyn FnMut(&Tx) -> bool) -> Option<Tx> {
+            let claims = &self.claims;
+            self.inner.next_skipping(&mut |transaction| {
+                let claimed = skip(transaction);
+                if claimed {
+                    claims.lock().push(*transaction.hash());
+                }
+                claimed
+            })
+        }
+
+        fn mark_invalid(&mut self, transaction: &Tx, kind: InvalidPoolTransactionError) {
+            self.inner.mark_invalid(transaction, kind);
+        }
+
+        fn no_updates(&mut self) {
+            self.inner.no_updates();
+        }
+
+        fn set_skip_blobs(&mut self, skip_blobs: bool) {
+            self.inner.set_skip_blobs(skip_blobs);
+        }
+    }
+
+    /// A protocol transaction delivered to the live pool during a flashblock.
+    struct Arrival {
+        flashblock: usize,
+        /// Delivered once the flashblock has committed this many transactions, or right after the
+        /// iterator refresh for zero.
+        after_commits: usize,
+        transaction: Tx,
+        /// Replaces the pooled transaction with the same id instead of adding a new one.
+        replaces: bool,
+    }
+
+    /// The pool contents and fees one flashblock is built from.
+    #[derive(Clone, Default)]
+    struct Flashblock {
+        protocol: Vec<Tx>,
+        sidecar: Vec<Tx>,
+        base_fee: u64,
+        /// Transactions the shared rejection cache learns about at the end of the flashblock, as
+        /// if a concurrent payload job rejected them.
+        rejected_elsewhere: Vec<TxHash>,
+    }
+
+    /// A differential scenario: transactions shared by both runs, so that their arrival
     /// timestamps, which break priority ties, are identical.
     struct Scenario {
-        names: B256Map<&'static str>,
+        names: B256Map<String>,
+        by_name: std::collections::HashMap<String, Tx>,
         /// Balance a committed transaction writes.
         writes: B256Map<(Address, u64)>,
         /// Transactions whose execution fails once their predicates are satisfied.
         failing: B256Set,
-        protocol: Vec<Arc<ValidPoolTransaction<BasePooledTransaction>>>,
-        sidecar: Vec<Arc<ValidPoolTransaction<BasePooledTransaction>>>,
-        /// Protocol transactions that arrive after the first commit of the second flashblock.
-        arrivals: Vec<Arc<ValidPoolTransaction<BasePooledTransaction>>>,
+        flashblocks: Vec<Flashblock>,
+        arrivals: Vec<Arrival>,
     }
 
     impl Scenario {
-        const WRITER_FLASHBLOCK: usize = 1;
-        const FLASHBLOCKS: usize = 3;
-
-        /// A resting protocol head `r0` with buffered descendants is woken mid-flashblock by the
-        /// sidecar writer `w`, while the merge holds the unrelated protocol head `u` behind the
-        /// sidecar head `s2`. `q` and the sidecar `z` keep resting, and `a` and the descendant
-        /// `r3` arrive live.
-        fn new(woken_head_fails: bool) -> Self {
-            let resting_head = validity_transaction(0, 0, 50, vec![balance_at_least(WATCHED, 1)]);
-            let writer = sidecar_transaction(10, 10, Vec::new());
-            let protocol = [
-                ("r0", Arc::clone(&resting_head)),
-                ("r1", transaction(0, 1, 45)),
-                ("r2", transaction(0, 2, 1)),
-                ("p0", transaction(1, 0, 20)),
-                ("p1", transaction(1, 1, 19)),
-                ("u", transaction(2, 0, 4)),
-                ("q", validity_transaction(3, 0, 2, vec![balance_at_least(UNRELATED, 1)])),
-            ];
-            let sidecar = [
-                ("w", Arc::clone(&writer)),
-                ("s2", sidecar_transaction(11, 8, Vec::new())),
-                ("z", sidecar_transaction(12, 7, vec![balance_at_least(UNRELATED, 1)])),
-                ("s", sidecar_transaction(13, 3, Vec::new())),
-            ];
-            let arrivals = [("a", transaction(4, 0, 30)), ("r3", transaction(0, 3, 40))];
-            let names = protocol
-                .iter()
-                .chain(&sidecar)
-                .chain(&arrivals)
-                .map(|(name, transaction)| (*transaction.hash(), *name))
-                .collect();
-            let failing = if woken_head_fails {
-                B256Set::from_iter([*resting_head.hash()])
-            } else {
-                B256Set::default()
+        /// Three flashblocks that all see every listed transaction, at a zero base fee.
+        fn new(protocol: Vec<(&str, Tx)>, sidecar: Vec<(&str, Tx)>) -> Self {
+            let mut scenario = Self {
+                names: B256Map::default(),
+                by_name: Default::default(),
+                writes: B256Map::default(),
+                failing: B256Set::default(),
+                flashblocks: Vec::new(),
+                arrivals: Vec::new(),
             };
-            Self {
-                names,
-                writes: B256Map::from_iter([(*writer.hash(), (WATCHED, 1))]),
-                failing,
-                protocol: protocol.into_iter().map(|(_, transaction)| transaction).collect(),
-                sidecar: sidecar.into_iter().map(|(_, transaction)| transaction).collect(),
-                arrivals: arrivals.into_iter().map(|(_, transaction)| transaction).collect(),
-            }
+            let protocol: Vec<_> =
+                protocol.into_iter().map(|(name, tx)| scenario.register(name, tx)).collect();
+            let sidecar: Vec<_> =
+                sidecar.into_iter().map(|(name, tx)| scenario.register(name, tx)).collect();
+            let flashblock = Flashblock { protocol, sidecar, ..Default::default() };
+            scenario.flashblocks = vec![flashblock; 3];
+            scenario
         }
 
-        /// The first flashblock only sees the resting candidates and the head's descendants.
+        fn register(&mut self, name: &str, transaction: Tx) -> Tx {
+            self.names.insert(*transaction.hash(), name.to_owned());
+            self.by_name.insert(name.to_owned(), Arc::clone(&transaction));
+            transaction
+        }
+
+        fn tx(&self, name: &str) -> Tx {
+            Arc::clone(&self.by_name[name])
+        }
+
+        /// Restricts the first flashblock to `names`, so they rest before the others appear.
+        fn only_first(mut self, names: &[&str]) -> Self {
+            let keep = |tx: &Tx| names.contains(&self.names[tx.hash()].as_str());
+            let first = &self.flashblocks[0];
+            let protocol = first.protocol.iter().filter(|tx| keep(tx)).cloned().collect();
+            let sidecar = first.sidecar.iter().filter(|tx| keep(tx)).cloned().collect();
+            self.flashblocks[0].protocol = protocol;
+            self.flashblocks[0].sidecar = sidecar;
+            self
+        }
+
+        /// Sets the protocol pool of `flashblock` to `names`, in submission order.
+        fn protocol_pool(mut self, flashblock: usize, names: &[&str]) -> Self {
+            self.flashblocks[flashblock].protocol =
+                names.iter().map(|name| self.tx(name)).collect();
+            self
+        }
+
+        fn write(mut self, name: &str, address: Address, value: u64) -> Self {
+            self.writes.insert(*self.by_name[name].hash(), (address, value));
+            self
+        }
+
+        fn fail_if(mut self, fails: bool, name: &str) -> Self {
+            if fails {
+                self.failing.insert(*self.by_name[name].hash());
+            }
+            self
+        }
+
+        fn base_fee(mut self, flashblock: usize, base_fee: u64) -> Self {
+            self.flashblocks[flashblock].base_fee = base_fee;
+            self
+        }
+
+        fn rejected_elsewhere(mut self, flashblock: usize, name: &str) -> Self {
+            let hash = *self.by_name[name].hash();
+            self.flashblocks[flashblock].rejected_elsewhere.push(hash);
+            self
+        }
+
+        fn arrive(
+            mut self,
+            flashblock: usize,
+            after_commits: usize,
+            name: &str,
+            transaction: Tx,
+        ) -> Self {
+            let transaction = self.register(name, transaction);
+            self.arrivals.push(Arrival { flashblock, after_commits, transaction, replaces: false });
+            self
+        }
+
+        fn replace(
+            mut self,
+            flashblock: usize,
+            after_commits: usize,
+            name: &str,
+            transaction: Tx,
+        ) -> Self {
+            let transaction = self.register(name, transaction);
+            self.arrivals.push(Arrival { flashblock, after_commits, transaction, replaces: true });
+            self
+        }
+
+        fn name(&self, transaction_hash: &TxHash) -> &str {
+            &self.names[transaction_hash]
+        }
+
         fn pools(&self, flashblock: usize) -> (PendingPool<Ordering>, PendingPool<Ordering>) {
-            if flashblock == 0 {
-                let resting = |transaction: &&Arc<ValidPoolTransaction<BasePooledTransaction>>| {
-                    !matches!(self.names[transaction.hash()], "p0" | "p1" | "u" | "w" | "s2" | "s")
-                };
-                let protocol: Vec<_> = self.protocol.iter().filter(resting).cloned().collect();
-                let sidecar: Vec<_> = self.sidecar.iter().filter(resting).cloned().collect();
-                return (pending_pool(&protocol), pending_pool(&sidecar));
-            }
-            (pending_pool(&self.protocol), pending_pool(&self.sidecar))
+            let block = &self.flashblocks[flashblock];
+            (
+                pending_pool_at(&block.protocol, block.base_fee),
+                pending_pool_at(&block.sidecar, block.base_fee),
+            )
         }
 
-        fn name(&self, transaction_hash: &TxHash) -> &'static str {
-            self.names[transaction_hash]
+        fn deliver(&self, protocol: &mut PendingPool<Ordering>, flashblock: usize, commits: usize) {
+            let base_fee = self.flashblocks[flashblock].base_fee;
+            for arrival in &self.arrivals {
+                if arrival.flashblock != flashblock || arrival.after_commits != commits {
+                    continue;
+                }
+                let transaction = Arc::clone(&arrival.transaction);
+                if arrival.replaces {
+                    protocol.replace_transaction(transaction, base_fee);
+                } else {
+                    protocol.add_transaction(transaction, base_fee);
+                }
+            }
         }
 
         /// Plays the build loop and `payload.rs` against `candidates`, returning every
-        /// observable selection event.
-        fn run<C: FlashblockCandidates>(&self, new: impl FnOnce(Parkable) -> C) -> Vec<String> {
+        /// observable selection event and the transactions claimed from the protocol source, as
+        /// `flashblock:name`.
+        fn run<C: FlashblockCandidates>(
+            &self,
+            new: impl FnOnce(Parkable) -> C,
+        ) -> (Vec<String>, Vec<String>) {
             let mut balances: std::collections::HashMap<Address, u64> = Default::default();
             let first =
                 |predicates: &[ValidityPredicate],
@@ -1195,15 +1348,20 @@ mod tests {
                         _ => unreachable!("scenario uses balance predicates only"),
                     })
                 };
+            let claims = Arc::new(Mutex::new(Vec::new()));
+            let mut claimed = Vec::new();
             let mut log = Vec::new();
             let (mut protocol, mut sidecar) = self.pools(0);
-            let mut candidates = new(merged_parkable(&protocol, &sidecar));
-            for flashblock in 0..Self::FLASHBLOCKS {
+            let base_fee = self.flashblocks[0].base_fee;
+            let mut candidates = new(merged_parkable(&protocol, &sidecar, base_fee, &claims));
+            for flashblock in 0..self.flashblocks.len() {
                 if flashblock > 0 {
                     (protocol, sidecar) = self.pools(flashblock);
-                    candidates.refresh(merged_parkable(&protocol, &sidecar));
+                    let base_fee = self.flashblocks[flashblock].base_fee;
+                    candidates.refresh(merged_parkable(&protocol, &sidecar, base_fee, &claims));
                 }
                 log.push(format!("flashblock {flashblock}"));
+                self.deliver(&mut protocol, flashblock, 0);
                 let mut build_loop_parked = Vec::new();
                 let (mut committed, mut rejected) = (Vec::new(), Vec::new());
                 while let Some(candidate) = candidates.next(()) {
@@ -1233,11 +1391,7 @@ mod tests {
                     }
                     candidates.mark_current_committed();
                     committed.push(hash);
-                    if flashblock == Self::WRITER_FLASHBLOCK && committed.len() == 1 {
-                        for arrival in &self.arrivals {
-                            protocol.add_transaction(Arc::clone(arrival), 0);
-                        }
-                    }
+                    self.deliver(&mut protocol, flashblock, committed.len());
                     let Some((address, _)) = written else { continue };
                     build_loop_parked.retain(|parked| {
                         let parked_predicates = parked.transaction.validity_predicates();
@@ -1264,20 +1418,22 @@ mod tests {
                     });
                 }
                 log.push(format!("resting parked {}", candidates.take_resting_stats().parked));
+                rejected.extend(&self.flashblocks[flashblock].rejected_elsewhere);
                 candidates.finish_flashblock(&committed, &rejected);
+                claimed.extend(
+                    claims
+                        .lock()
+                        .drain(..)
+                        .map(|hash| format!("{flashblock}:{}", self.name(&hash))),
+                );
             }
-            log
+            (log, claimed)
         }
-    }
 
-    /// Parking resting transactions inside the lane-parking iterator yields exactly the
-    /// selection of the adapter that parked each one on receipt, through the production merge
-    /// and lane-parking stack.
-    #[test]
-    fn resting_filter_matches_per_yield_parking() {
-        for woken_head_fails in [false, true] {
-            let scenario = Scenario::new(woken_head_fails);
-            let reference = scenario.run(|inner| PerYieldRestingTxs {
+        /// Asserts that the production adapter selects exactly what the per-yield reference
+        /// selects, and returns the shared log with the production run's claims.
+        fn assert_parity(&self) -> (Vec<String>, Vec<String>) {
+            let (reference, reference_claims) = self.run(|inner| PerYieldRestingTxs {
                 inner,
                 committed: B256Set::default(),
                 rejection_cache: test_rejection_cache(),
@@ -1286,19 +1442,526 @@ mod tests {
                 parked_resting: B256Set::default(),
                 parked: 0,
             });
-            let filtered = scenario.run(|inner| {
+            assert!(reference_claims.is_empty(), "the reference installs no parking filter");
+            let (filtered, claims) = self.run(|inner| {
                 BestFlashblocksTxs::new(inner, test_rejection_cache())
                     .with_resting_predicate_mode(RestingPredicateMode::Enforce)
             });
+            assert_eq!(filtered, reference, "claims: {claims:?}");
+            (reference, claims)
+        }
+    }
 
-            assert_eq!(filtered, reference, "woken head fails: {woken_head_fails}");
-            let woken = reference
+    /// Asserts that `events` occur in `log` in this order, not necessarily adjacently.
+    fn assert_in_order(log: &[String], events: &[&str]) {
+        let mut remaining = log.iter();
+        for event in events {
+            assert!(
+                remaining.any(|logged| logged == event),
+                "missing {event:?} in order: {log:#?}"
+            );
+        }
+    }
+
+    /// A resting protocol head `r0` with buffered descendants is woken mid-flashblock by the
+    /// sidecar writer `w`, while the merge holds the unrelated protocol head `u` behind the
+    /// sidecar head `s2`. `q` and the sidecar `z` keep resting, and `a` and the descendant `r3`
+    /// arrive live.
+    fn wake_mid_flashblock(woken_head_fails: bool) -> Scenario {
+        Scenario::new(
+            vec![
+                ("r0", validity_transaction(0, 0, 50, vec![balance_at_least(WATCHED, 1)])),
+                ("r1", transaction(0, 1, 45)),
+                ("r2", transaction(0, 2, 1)),
+                ("p0", transaction(1, 0, 20)),
+                ("p1", transaction(1, 1, 19)),
+                ("u", transaction(2, 0, 4)),
+                ("q", validity_transaction(3, 0, 2, vec![balance_at_least(UNRELATED, 1)])),
+            ],
+            vec![
+                ("w", sidecar_transaction(10, 10, Vec::new())),
+                ("s2", sidecar_transaction(11, 8, Vec::new())),
+                ("z", sidecar_transaction(12, 7, vec![balance_at_least(UNRELATED, 1)])),
+                ("s", sidecar_transaction(13, 3, Vec::new())),
+            ],
+        )
+        .only_first(&["r0", "r1", "r2", "q", "z"])
+        .write("w", WATCHED, 1)
+        .fail_if(woken_head_fails, "r0")
+        .arrive(1, 1, "a", transaction(4, 0, 30))
+        .arrive(1, 1, "r3", transaction(0, 3, 40))
+    }
+
+    /// Parking resting transactions inside the lane-parking iterator yields exactly the
+    /// selection of the adapter that parked each one on receipt, through the production merge
+    /// and lane-parking stack.
+    #[test]
+    fn resting_filter_matches_per_yield_parking() {
+        for woken_head_fails in [false, true] {
+            let (log, claims) = wake_mid_flashblock(woken_head_fails).assert_parity();
+            let woken = log
                 .iter()
                 .position(|event| event == "commit w")
                 .expect("the writer commits in the second flashblock");
             let outcome = if woken_head_fails { "reject r0" } else { "commit r0" };
-            assert_eq!(reference[woken + 1], outcome, "{reference:#?}");
-            assert!(reference.contains(&"resting parked 3".to_owned()), "{reference:#?}");
+            assert_eq!(log[woken + 1], outcome, "{log:#?}");
+            assert!(log.contains(&"resting parked 3".to_owned()), "{log:#?}");
+            assert!(claims.contains(&"1:r0".to_owned()), "r0 is parked where it is popped");
+            assert!(!claims.iter().any(|claim| claim.ends_with(":z")), "sidecar is never claimed");
         }
+    }
+
+    /// Review P1: a claimed resting head is woken, promoted and rejected while the merge holds
+    /// the protocol head `u` behind the sidecar head `s2`. The merge drops `u` exactly as it
+    /// does for the reference, which never hands `r` to the merge at another time.
+    #[test]
+    fn claimed_head_rejected_after_wake_drops_the_merge_head_as_before() {
+        for fails in [false, true] {
+            let (log, claims) = Scenario::new(
+                vec![
+                    ("r", validity_transaction(0, 0, 30, vec![balance_at_least(WATCHED, 1)])),
+                    ("u", transaction(1, 0, 4)),
+                    ("p", transaction(2, 0, 2)),
+                ],
+                vec![
+                    ("w", sidecar_transaction(10, 10, Vec::new())),
+                    ("s2", sidecar_transaction(11, 8, Vec::new())),
+                    ("s", sidecar_transaction(12, 3, Vec::new())),
+                ],
+            )
+            .only_first(&["r"])
+            .write("w", WATCHED, 1)
+            .fail_if(fails, "r")
+            .assert_parity();
+            assert_eq!(claims, ["1:r"], "{log:#?}");
+            let outcome = if fails { "reject r" } else { "commit r" };
+            assert_in_order(&log, &["flashblock 1", "commit w", outcome, "commit s2"]);
+        }
+    }
+
+    /// Review P2: a different-hash replacement `r'` of the claimed `r` arrives live and is
+    /// stashed. The wake still promotes the original `r`, which the lane-parking iterator
+    /// kept.
+    #[test]
+    fn replacement_of_a_claimed_transaction_does_not_erase_it() {
+        for fails in [false, true] {
+            let scenario = Scenario::new(
+                vec![
+                    ("r", validity_transaction(0, 0, 30, vec![balance_at_least(WATCHED, 1)])),
+                    ("x", transaction(1, 0, 20)),
+                ],
+                vec![("w", sidecar_transaction(10, 10, Vec::new()))],
+            )
+            .only_first(&["r"])
+            .write("w", WATCHED, 1)
+            .fail_if(fails, "r")
+            .replace(
+                1,
+                1,
+                "r'",
+                validity_transaction_with_max_fee(
+                    0,
+                    0,
+                    40,
+                    141,
+                    vec![balance_at_least(WATCHED, 1)],
+                ),
+            );
+            let scenario = scenario.protocol_pool(2, &["r'", "x"]);
+            let (log, claims) = scenario.assert_parity();
+            assert_eq!(claims, ["1:r"], "{log:#?}");
+            let outcome = if fails { "reject r" } else { "commit r" };
+            assert_in_order(
+                &log,
+                &["flashblock 1", "commit x", "commit w", outcome, "flashblock 2"],
+            );
+        }
+    }
+
+    /// Review P2: a live descendant of the claimed `r` arrives after a lower-priority pop. When
+    /// it outranks that pop it is stashed and waits for the refresh; otherwise the source
+    /// unlocks it and the lane buffers it behind `r` until `r` resolves.
+    #[test]
+    fn live_descendant_of_a_claimed_transaction_keeps_its_natural_path() {
+        for (child_priority, fails) in [(25, false), (25, true), (15, false), (15, true)] {
+            let (log, claims) = Scenario::new(
+                vec![
+                    ("r", validity_transaction(0, 0, 30, vec![balance_at_least(WATCHED, 1)])),
+                    ("x", transaction(1, 0, 20)),
+                ],
+                vec![("w", sidecar_transaction(10, 5, Vec::new()))],
+            )
+            .only_first(&["r"])
+            .write("w", WATCHED, 1)
+            .fail_if(fails, "r")
+            .arrive(1, 1, "c", transaction(0, 1, child_priority))
+            .assert_parity();
+            assert_eq!(claims, ["1:r"], "{log:#?}");
+            let fb1 = log.iter().position(|event| event == "flashblock 1").unwrap();
+            let fb2 = log.iter().position(|event| event == "flashblock 2").unwrap();
+            let child_in_fb1 = log[fb1..fb2].contains(&"commit c".to_owned());
+            assert_eq!(child_in_fb1, child_priority < 20 && !fails, "{log:#?}");
+        }
+    }
+
+    /// Review P2: the descendant `c` of the claimed `r` ties `y` in priority, with `y` submitted
+    /// first and `c` created first. `c` reaches the lane through its own source pop after `y`,
+    /// as for the reference, instead of being buffered early and winning the timestamp tie.
+    #[test]
+    fn descendant_of_a_claimed_transaction_keeps_its_tie_break() {
+        let c = transaction(0, 1, 4);
+        let y = transaction(1, 0, 4);
+        let (log, claims) = Scenario::new(
+            vec![
+                ("r", validity_transaction(0, 0, 30, vec![balance_at_least(WATCHED, 1)])),
+                ("y", y),
+                ("c", c),
+            ],
+            vec![("w", sidecar_transaction(10, 10, Vec::new()))],
+        )
+        .only_first(&["r", "c"])
+        .write("w", WATCHED, 1)
+        .assert_parity();
+        assert_eq!(claims, ["1:r"], "{log:#?}");
+        assert_in_order(&log, &["flashblock 1", "commit w", "commit r", "commit y", "commit c"]);
+    }
+
+    /// Review gap 1: a promoted ready entry `x` outranks the resting `r`, so `r` is not claimed
+    /// but becomes the held source head; `x` commits and wakes `r` inside that window, and `r`
+    /// is yielded at its natural position ahead of its priority twin `y`.
+    #[test]
+    fn resting_head_behind_a_ready_entry_sees_a_wake_in_its_window() {
+        for fails in [false, true] {
+            let (log, claims) = Scenario::new(
+                vec![
+                    ("x", validity_transaction(0, 0, 40, vec![balance_at_least(WATCHED, 1)])),
+                    ("p", transaction(1, 0, 35)),
+                    ("r", validity_transaction(2, 0, 30, vec![balance_at_least(UNRELATED, 1)])),
+                    // An always satisfied predicate gives `y` the same pool priority as `r`.
+                    ("y", validity_transaction(3, 0, 30, vec![balance_at_least(UNRELATED, 0)])),
+                    ("l", transaction(4, 0, 1)),
+                ],
+                Vec::new(),
+            )
+            .only_first(&["r"])
+            .write("p", WATCHED, 1)
+            .write("x", UNRELATED, 1)
+            .fail_if(fails, "r")
+            .assert_parity();
+            assert!(claims.is_empty(), "{log:#?}");
+            let outcome = if fails { "reject r" } else { "commit r" };
+            assert_in_order(
+                &log,
+                &["flashblock 1", "park x", "commit p", "promote x true", "commit x", outcome],
+            );
+            assert_in_order(&log, &[outcome, "commit y", "commit l"]);
+        }
+    }
+
+    /// The sidecar head `s` outranks the resting `r`, so the merge would return `s` first and
+    /// `r` is not claimed; `s` commits and wakes `r`, which is then yielded from the merge.
+    #[test]
+    fn resting_head_behind_the_sidecar_head_is_not_claimed() {
+        for fails in [false, true] {
+            let (log, claims) = Scenario::new(
+                vec![
+                    ("r", validity_transaction(0, 0, 5, vec![balance_at_least(WATCHED, 1)])),
+                    ("p", transaction(1, 0, 2)),
+                ],
+                vec![
+                    ("s", sidecar_transaction(10, 10, Vec::new())),
+                    ("t", sidecar_transaction(11, 3, Vec::new())),
+                ],
+            )
+            .only_first(&["r"])
+            .write("s", WATCHED, 1)
+            .fail_if(fails, "r")
+            .assert_parity();
+            assert!(claims.is_empty(), "{log:#?}");
+            let outcome = if fails { "reject r" } else { "commit r" };
+            assert_in_order(&log, &["flashblock 1", "commit s", outcome, "commit t", "commit p"]);
+        }
+    }
+
+    /// The resting `r1` is popped while its lane is occupied by the build-loop-parked `r0`, so
+    /// it is buffered rather than claimed; once `r0` commits it is released and parked from the
+    /// ready set. When `r0` fails the lane is invalidated with `r1` in it.
+    #[test]
+    fn resting_descendant_in_an_occupied_lane_is_not_claimed() {
+        for fails in [false, true] {
+            let (log, claims) = Scenario::new(
+                vec![
+                    ("r0", validity_transaction(0, 0, 30, vec![balance_at_least(WATCHED, 1)])),
+                    ("r1", validity_transaction(0, 1, 40, vec![balance_at_least(UNRELATED, 1)])),
+                    ("p", transaction(1, 0, 20)),
+                ],
+                vec![("w", sidecar_transaction(10, 10, Vec::new()))],
+            )
+            .only_first(&["r1"])
+            .write("w", WATCHED, 1)
+            .fail_if(fails, "r0")
+            .assert_parity();
+            assert!(!claims.contains(&"1:r1".to_owned()), "{log:#?}");
+            assert_in_order(&log, &["flashblock 0", "park r1", "flashblock 1", "park r0"]);
+        }
+    }
+
+    /// At a base fee the resting `r` cannot pay, the merge marks it invalid together with its
+    /// descendant instead of the filter parking it, so it does not count as resting parked.
+    #[test]
+    fn underpriced_resting_transaction_is_invalidated_not_claimed() {
+        let (log, claims) = Scenario::new(
+            vec![
+                (
+                    "r",
+                    validity_transaction_with_max_fee(
+                        0,
+                        0,
+                        30,
+                        40,
+                        vec![balance_at_least(WATCHED, 1)],
+                    ),
+                ),
+                ("rc", transaction(0, 1, 25)),
+                ("p", transaction(1, 0, 20)),
+            ],
+            Vec::new(),
+        )
+        .only_first(&["r"])
+        .base_fee(1, 50)
+        .base_fee(2, 50)
+        .assert_parity();
+        assert!(claims.is_empty(), "{log:#?}");
+        assert!(!log.iter().any(|event| event == "commit r" || event == "commit rc"), "{log:#?}");
+    }
+
+    /// A resting transaction another job rejected falls through the filter to the adapter's
+    /// rejection path, and a committed resting transaction re-added later takes the committed
+    /// path.
+    #[test]
+    fn rejected_or_committed_resting_transactions_are_not_claimed() {
+        let (log, claims) = Scenario::new(
+            vec![
+                ("r", validity_transaction(0, 0, 30, vec![balance_at_least(WATCHED, 1)])),
+                ("k", validity_transaction(1, 0, 25, vec![balance_at_least(UNRELATED, 1)])),
+                ("x", transaction(2, 0, 2)),
+            ],
+            vec![("w", sidecar_transaction(10, 10, Vec::new()))],
+        )
+        .only_first(&["r", "k", "x"])
+        .write("x", UNRELATED, 1)
+        .rejected_elsewhere(0, "r")
+        .assert_parity();
+        assert!(!claims.iter().any(|claim| claim.ends_with(":r")), "{log:#?}");
+        assert_in_order(&log, &["flashblock 0", "park r", "park k", "commit x", "promote k true"]);
+        assert!(!log.iter().any(|event| event == "commit r"), "{log:#?}");
+    }
+
+    /// A claimed resting head's higher-priority descendant, already in the snapshot, is
+    /// buffered behind it and released once the head commits.
+    #[test]
+    fn snapshot_descendant_of_a_claimed_head_waits_for_it() {
+        for fails in [false, true] {
+            let (log, claims) = Scenario::new(
+                vec![
+                    ("r0", validity_transaction(0, 0, 30, vec![balance_at_least(WATCHED, 1)])),
+                    ("r1", transaction(0, 1, 45)),
+                    ("p", transaction(1, 0, 20)),
+                ],
+                vec![("w", sidecar_transaction(10, 10, Vec::new()))],
+            )
+            .only_first(&["r0"])
+            .write("w", WATCHED, 1)
+            .fail_if(fails, "r0")
+            .assert_parity();
+            assert_eq!(claims, ["1:r0"], "{log:#?}");
+            if fails {
+                assert!(!log.iter().any(|event| event == "commit r1"), "{log:#?}");
+            } else {
+                assert_in_order(&log, &["flashblock 1", "commit w", "commit r0", "commit r1"]);
+            }
+        }
+    }
+
+    /// More live updates than one source round admits are queued when `r` is claimed. The
+    /// first round is processed against the previous pop's priority and the rest against
+    /// `r`'s, so updates between the two are stashed exactly as when `r` is yielded.
+    #[test]
+    fn claimed_transaction_bounds_the_next_update_round() {
+        for fails in [false, true] {
+            let mut scenario = Scenario::new(
+                vec![
+                    ("x", transaction(0, 0, 40)),
+                    ("r", validity_transaction(1, 0, 30, vec![balance_at_least(WATCHED, 1)])),
+                ],
+                vec![("w", sidecar_transaction(10, 5, Vec::new()))],
+            )
+            .only_first(&["r"])
+            .write("w", WATCHED, 1)
+            .fail_if(fails, "r");
+            let first_round = (41..49).chain(20..28).map(|priority| ("a", priority));
+            let second_round = [35, 33, 25, 38].map(|priority| ("b", priority));
+            for (index, (round, priority)) in first_round.chain(second_round).enumerate() {
+                let sender = 100 + index as u64;
+                let name = format!("{round}{priority}");
+                scenario = scenario.arrive(1, 1, &name, transaction(sender, 0, priority));
+            }
+            let (log, claims) = scenario.assert_parity();
+            assert_eq!(claims, ["1:r"], "{log:#?}");
+            let fb2 = log.iter().position(|event| event == "flashblock 2").unwrap();
+            for stashed in ["b33", "b35", "b38", "a41"] {
+                let committed = format!("commit {stashed}");
+                assert!(!log[..fb2].contains(&committed), "{stashed} must be stashed: {log:#?}");
+            }
+            assert!(log[..fb2].contains(&"commit b25".to_owned()), "{log:#?}");
+        }
+    }
+
+    /// Resting sidecar transactions are never claimed; the lane-parking iterator parks them when
+    /// it would yield them.
+    #[test]
+    fn resting_sidecar_transaction_is_parked_on_yield() {
+        let (log, claims) = Scenario::new(
+            vec![("p", transaction(0, 0, 2))],
+            vec![
+                ("z", sidecar_transaction(10, 7, vec![balance_at_least(WATCHED, 1)])),
+                ("w", sidecar_transaction(11, 5, Vec::new())),
+            ],
+        )
+        .only_first(&["z"])
+        .write("w", WATCHED, 1)
+        .assert_parity();
+        assert!(claims.is_empty(), "{log:#?}");
+        assert_in_order(&log, &["flashblock 1", "commit w", "commit z"]);
+    }
+
+    /// A deterministic xorshift generator, so failures reproduce from their seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % bound
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.below(100) < percent
+        }
+    }
+
+    /// A random scenario over protocol chains and sidecar transactions with random predicates,
+    /// writes, failures, live heads, descendants and replacements, rejections by other jobs and
+    /// base fees.
+    fn random_scenario(seed: u64) -> Scenario {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let watched = [WATCHED, UNRELATED, Address::repeat_byte(0xcc)];
+        let tx = |rng: &mut Rng, sender: u64, nonce: u64, sidecar: bool| {
+            let priority = 1 + rng.below(8) as u128;
+            let predicates = if rng.chance(40) {
+                vec![balance_at_least(watched[rng.below(3) as usize], 1)]
+            } else {
+                Vec::new()
+            };
+            if sidecar {
+                sidecar_transaction(sender, priority, predicates)
+            } else {
+                let max_fee = priority + rng.below(5) as u128;
+                validity_transaction_with_max_fee(sender, nonce, priority, max_fee, predicates)
+            }
+        };
+        let mut protocol = Vec::new();
+        let mut chains = Vec::new();
+        let mut original_chains = Vec::new();
+        let senders = 3 + rng.below(4);
+        for sender in 0..senders {
+            let length = 1 + rng.below(3);
+            for nonce in 0..length {
+                protocol.push((format!("p{sender}.{nonce}"), tx(&mut rng, sender, nonce, false)));
+            }
+            chains.push(length);
+            original_chains.push(length);
+        }
+        let sidecar: Vec<_> = (0..rng.below(4))
+            .map(|index| (format!("s{index}"), tx(&mut rng, 50 + index, 0, true)))
+            .collect();
+        let names: Vec<String> =
+            protocol.iter().chain(&sidecar).map(|(name, _)| name.clone()).collect();
+        let mut scenario = Scenario::new(
+            protocol.iter().map(|(name, tx)| (name.as_str(), Arc::clone(tx))).collect(),
+            sidecar.iter().map(|(name, tx)| (name.as_str(), Arc::clone(tx))).collect(),
+        );
+        if rng.chance(50) {
+            scenario.flashblocks.push(scenario.flashblocks[0].clone());
+        }
+        let first: Vec<&str> =
+            names.iter().filter(|_| rng.chance(60)).map(String::as_str).collect();
+        scenario = scenario.only_first(&first);
+        let mut value = 0;
+        for name in &names {
+            if rng.chance(25) {
+                value += 1;
+                scenario = scenario.write(name, watched[rng.below(3) as usize], value);
+            }
+            let fails = rng.chance(12);
+            scenario = scenario.fail_if(fails, name);
+        }
+        for flashblock in 1..scenario.flashblocks.len() {
+            if rng.chance(20) {
+                scenario = scenario.base_fee(flashblock, 1 + rng.below(4));
+            }
+            if rng.chance(20) {
+                let name = &names[rng.below(names.len() as u64) as usize];
+                scenario = scenario.rejected_elsewhere(flashblock - 1, name);
+            }
+        }
+        let mut next_sender = 100;
+        for index in 0..rng.below(7) {
+            let flashblock = rng.below(scenario.flashblocks.len() as u64) as usize;
+            let after_commits = rng.below(4) as usize;
+            let name = format!("a{index}");
+            scenario = match rng.below(3) {
+                0 => {
+                    next_sender += 1;
+                    let arrival = tx(&mut rng, next_sender, 0, false);
+                    scenario.arrive(flashblock, after_commits, &name, arrival)
+                }
+                1 => {
+                    let sender = rng.below(senders);
+                    let nonce = chains[sender as usize];
+                    chains[sender as usize] += 1;
+                    let arrival = tx(&mut rng, sender, nonce, false);
+                    scenario.arrive(flashblock, after_commits, &name, arrival)
+                }
+                _ => {
+                    let sender = rng.below(senders);
+                    let nonce = rng.below(original_chains[sender as usize]);
+                    let arrival = tx(&mut rng, sender, nonce, false);
+                    scenario.replace(flashblock, after_commits, &name, arrival)
+                }
+            };
+        }
+        scenario
+    }
+
+    /// Random scenarios select identically under the production adapter and the per-yield
+    /// reference.
+    #[test]
+    fn resting_filter_matches_per_yield_parking_on_random_scenarios() {
+        let mut claimed = 0;
+        for seed in 0..1_500 {
+            let scenario = random_scenario(seed);
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scenario.assert_parity()));
+            match result {
+                Ok((_, claims)) => claimed += claims.len(),
+                Err(panic) => {
+                    eprintln!("seed {seed} failed");
+                    std::panic::resume_unwind(panic);
+                }
+            }
+        }
+        assert!(claimed > 500, "random scenarios must exercise claiming: {claimed}");
     }
 }
