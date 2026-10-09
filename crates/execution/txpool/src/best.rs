@@ -8,7 +8,16 @@ use reth_transaction_pool::{
 
 use crate::{BasePooledTx, BestTransactionPriority};
 
+/// A caller's claim on the transaction a [`BestTransactions::next_skipping`] call would return.
+type Skip<'a, T> = &'a mut dyn FnMut(&Arc<ValidPoolTransaction<T>>) -> bool;
+
 /// Merges best-transaction iterators from the protocol pool and the 2D nonce sidecar.
+///
+/// [`BestTransactions::next_skipping`] relies on the sidecar iterator being a static snapshot,
+/// which the 2D nonce pool's best iterator is: it pulls the sidecar head before the protocol head
+/// so a protocol candidate can be offered to `skip` exactly when it would win the merge, which
+/// is only equivalent to pulling the protocol first while sidecar pulls cannot observe protocol
+/// pulls.
 pub struct MergeBestTransactions<T: BasePooledTx, O>
 where
     O: TransactionOrdering<Transaction = T>,
@@ -78,12 +87,40 @@ where
     type Item = Arc<ValidPoolTransaction<T>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.next_unskipped(None)
+    }
+}
+
+impl<T: BasePooledTx, O> MergeBestTransactions<T, O>
+where
+    O: TransactionOrdering<Transaction = T>,
+{
+    /// Returns the next payable transaction, offering `skip` each protocol transaction exactly
+    /// when it would be returned.
+    ///
+    /// Sidecar transactions are never offered: they are returned as by [`Iterator::next`].
+    fn next_unskipped(
+        &mut self,
+        mut skip: Option<Skip<'_, T>>,
+    ) -> Option<Arc<ValidPoolTransaction<T>>> {
         loop {
-            if self.next_protocol.is_none() {
-                self.next_protocol = self.protocol.next();
-            }
-            if self.next_sidecar.is_none() {
-                self.next_sidecar = self.sidecar.next();
+            match skip.as_deref_mut() {
+                None => {
+                    if self.next_protocol.is_none() {
+                        self.next_protocol = self.protocol.next();
+                    }
+                    if self.next_sidecar.is_none() {
+                        self.next_sidecar = self.sidecar.next();
+                    }
+                }
+                Some(skip) => {
+                    if self.next_sidecar.is_none() {
+                        self.next_sidecar = self.sidecar.next();
+                    }
+                    if self.next_protocol.is_none() {
+                        self.next_protocol = self.next_protocol_unskipped(skip);
+                    }
+                }
             }
 
             let transaction = self.pop_best()?;
@@ -94,12 +131,35 @@ where
             self.mark_invalid(&transaction, InvalidPoolTransactionError::Underpriced);
         }
     }
+
+    /// Pulls the next protocol head, offering `skip` the candidates that would beat the held
+    /// sidecar head and pay the base fee, which are those the merge would return next.
+    fn next_protocol_unskipped(
+        &mut self,
+        skip: Skip<'_, T>,
+    ) -> Option<Arc<ValidPoolTransaction<T>>> {
+        let Self { protocol, ordering, base_fee, next_sidecar, .. } = self;
+        let base_fee = *base_fee;
+        let sidecar_priority = next_sidecar
+            .as_ref()
+            .map(|sidecar| BestTransactionPriority::new(ordering, sidecar, base_fee));
+        protocol.next_skipping(&mut |candidate| {
+            sidecar_priority.as_ref().is_none_or(|sidecar| {
+                BestTransactionPriority::new(ordering, candidate, base_fee) >= *sidecar
+            }) && candidate.effective_tip_per_gas(base_fee).is_some()
+                && skip(candidate)
+        })
+    }
 }
 
 impl<T: BasePooledTx, O> BestTransactions for MergeBestTransactions<T, O>
 where
     O: TransactionOrdering<Transaction = T>,
 {
+    fn next_skipping(&mut self, skip: &mut dyn FnMut(&Self::Item) -> bool) -> Option<Self::Item> {
+        self.next_unskipped(Some(skip))
+    }
+
     fn mark_invalid(&mut self, transaction: &Self::Item, kind: InvalidPoolTransactionError) {
         if transaction.transaction.is_eip8130_sidecar_transaction() {
             self.next_sidecar = None;
