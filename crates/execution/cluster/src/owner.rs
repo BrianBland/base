@@ -498,16 +498,21 @@ impl<TX: DbTx + Sync> OwnerStore<TX> {
     }
 
     /// Bytecodes never change, so the newest snapshot answers any `P`; absence is trusted only
-    /// once the owner has persisted up to `P`.
+    /// once the owner has persisted up to `P`. A refusal advertises the newest persistence point
+    /// as the highest servable block, so an asker ahead of it retries until the owner persists.
     fn bytecode(&self, snapshot: SnapshotId, key: &[u8]) -> Result<Response, StoreError> {
         let retained = self.retained.read();
-        let unavailable = || ReadError::SnapshotUnavailable { servable: retained.servable() };
-        let newest = retained.newest_point().ok_or_else(unavailable)?;
+        let Some(newest) = retained.newest_point() else {
+            return Err(ReadError::SnapshotUnavailable { servable: None }.into());
+        };
         let value = newest.tx.get::<RawTable<tables::Bytecodes>>(RawKey::from_vec(key.to_vec()))?;
         match value {
             Some(value) => Ok(Response::Value(Some(value.into_value()))),
             None if newest.block.number >= snapshot.number => Ok(Response::Value(None)),
-            None => Err(unavailable().into()),
+            None => Err(ReadError::SnapshotUnavailable {
+                servable: Some(ServableRange { lowest: 0, highest: newest.block.number }),
+            }
+            .into()),
         }
     }
 

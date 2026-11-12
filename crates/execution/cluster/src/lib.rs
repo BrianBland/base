@@ -19,6 +19,9 @@ pub use snapshot::ReadSnapshot;
 mod node;
 pub use node::{BlockHashLookup, ClusterNode, ClusterStartError, CommitRefusal};
 
+mod stats;
+pub use stats::{RemoteReadCounts, RemoteReadKind, RemoteReadStats};
+
 mod placement;
 pub use placement::{KeyPlacement, NodeId, Shard, ShardMap, ShardedTable};
 

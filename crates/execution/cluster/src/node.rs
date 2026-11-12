@@ -10,7 +10,6 @@ use std::{
 
 use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
-use metrics::Counter;
 use parking_lot::Mutex;
 use reth_db::{
     Database, DatabaseEnv, DatabaseError,
@@ -25,8 +24,8 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 
 use crate::{
-    ClientOptions, Cluster, ClusterClient, KeyPlacement, OwnerServer, OwnerStore, Shard,
-    ShardedTable,
+    ClientOptions, Cluster, ClusterClient, KeyPlacement, OwnerServer, OwnerStore, RemoteReadCounts,
+    RemoteReadStats, Shard, ShardedTable,
 };
 
 /// Returns the hash of the canonical block with the given number, when known.
@@ -38,6 +37,9 @@ pub enum ClusterStartError {
     /// The owner server could not be started.
     #[error("failed to start the cluster owner server: {0}")]
     Server(#[from] io::Error),
+    /// The thread logging remote reads could not be started.
+    #[error("failed to start the cluster read stats logger: {0}")]
+    StatsLogger(io::Error),
     /// The database could not be read.
     #[error("failed to read the database: {0}")]
     Database(#[from] DatabaseError),
@@ -92,8 +94,7 @@ pub struct ClusterNode {
     committed_finish: Mutex<u64>,
     /// Block of the last persistence point registered.
     registered_point: Mutex<Option<u64>>,
-    remote_reads: Counter,
-    remote_read_failures: Counter,
+    remote_reads: Arc<RemoteReadStats>,
 }
 
 impl fmt::Debug for ClusterNode {
@@ -123,6 +124,10 @@ impl ClusterNode {
         let retention = cluster.config().retention_blocks;
         let owner_store = Arc::new(OwnerStore::new(Arc::clone(&cluster), retention));
         let server = OwnerServer::spawn(listener, Arc::clone(&owner_store))?;
+        let remote_reads = Arc::new(RemoteReadStats::default());
+        remote_reads
+            .spawn_logger(RemoteReadStats::LOG_INTERVAL)
+            .map_err(ClusterStartError::StatsLogger)?;
         let owned = Shard::all().filter(|shard| cluster.owns(*shard)).count();
         info!(
             node_id = cluster.node_id().0,
@@ -140,8 +145,7 @@ impl ClusterNode {
             block_hashes: OnceLock::new(),
             committed_finish: Mutex::new(finish),
             registered_point: Mutex::new(None),
-            remote_reads: metrics::counter!("base_cluster_remote_reads"),
-            remote_read_failures: metrics::counter!("base_cluster_remote_read_failures"),
+            remote_reads,
         })
     }
 
@@ -173,12 +177,14 @@ impl ClusterNode {
         })
     }
 
-    /// Counts one remote read, and a failure when `failed`.
-    pub fn record_remote_read(&self, failed: bool) {
-        self.remote_reads.increment(1);
-        if failed {
-            self.remote_read_failures.increment(1);
-        }
+    /// The counters of this node's remote reads.
+    pub const fn remote_read_stats(&self) -> &Arc<RemoteReadStats> {
+        &self.remote_reads
+    }
+
+    /// This node's remote reads since it started.
+    pub fn remote_reads(&self) -> RemoteReadCounts {
+        self.remote_reads.counts()
     }
 
     /// Installs the block-hash lookup persistence points are registered with. Only the first

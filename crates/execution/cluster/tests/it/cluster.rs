@@ -9,10 +9,10 @@ use std::{
     time::Duration,
 };
 
-use alloy_primitives::{B256, keccak256};
+use alloy_primitives::{B256, U256, keccak256};
 use base_execution_cluster::{
     BlockUpdates, ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, NodeConfig, NodeId,
-    Shard, ShardedTable,
+    ReadSnapshot, Shard, ShardedTable,
 };
 use rand::{Rng, rngs::StdRng};
 use reth_chainspec::MAINNET;
@@ -34,7 +34,7 @@ use reth_provider::{
 };
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_trie::{
-    BranchNodeCompact, Nibbles, PackedStoredNibbles,
+    BranchNodeCompact, HashedPostStateSorted, HashedStorageSorted, Nibbles, PackedStoredNibbles,
     hashed_cursor::{HashedCursor, HashedCursorFactory},
     trie_cursor::{TrieCursor, TrieCursorFactory},
 };
@@ -633,4 +633,98 @@ fn reads_no_live_path_needs_are_errors_on_sharded_tables() {
     // Tables that are not sharded read MDBX as before.
     let mut checkpoints = tx.cursor_read::<tables::StageCheckpoints>().unwrap();
     assert!(checkpoints.last().unwrap().is_some());
+}
+
+/// More entries than two remote pages hold, so a walk continues across page boundaries.
+const PAST_TWO_PAGES: usize = 2 * ReadSnapshot::PAGE_LEN as usize + 8;
+
+/// One shard with [`PAST_TWO_PAGES`] accounts, the first of which has [`PAST_TWO_PAGES`] slots.
+fn crowded_shard_block(shard: Shard, rng: &mut StdRng) -> Block {
+    let accounts: BTreeMap<B256, Option<Account>> = (0..PAST_TWO_PAGES)
+        .map(|nonce| {
+            let mut address = B256::from(rng.random::<[u8; 32]>());
+            address.0[0] = shard.0;
+            (address, Some(Account { nonce: nonce as u64, ..Default::default() }))
+        })
+        .collect();
+    let busy = *accounts.keys().next().unwrap();
+    let slots: BTreeMap<B256, U256> = (0..PAST_TWO_PAGES)
+        .map(|_| (B256::from(rng.random::<[u8; 32]>()), U256::from(rng.random_range(1..u64::MAX))))
+        .collect();
+    let storage = HashedStorageSorted { storage_slots: slots.into_iter().collect() };
+    Block {
+        number: 0,
+        updates: BlockUpdates {
+            hashed_state: Arc::new(HashedPostStateSorted::new(
+                accounts.into_iter().collect(),
+                std::iter::once((busy, storage)).collect(),
+            )),
+            trie_updates: Arc::default(),
+        },
+        codes: Vec::new(),
+    }
+}
+
+#[test]
+fn remote_walks_continue_across_pages() {
+    let shard = Shard(0x42);
+    let block = crowded_shard_block(shard, &mut rng(10));
+    let reference = factory();
+    persist(reference.provider_rw().unwrap(), std::slice::from_ref(&block));
+    let expected = TableDump::read(&reference);
+
+    let mut listeners: Vec<_> =
+        (0..NODES).map(|_| Some(TcpListener::bind("127.0.0.1:0").unwrap())).collect();
+    let addresses: Vec<_> =
+        listeners.iter().map(|l| l.as_ref().unwrap().local_addr().unwrap()).collect();
+    let mut start_node = |id: u64| {
+        let dir = TempDir::new().unwrap();
+        let env = populated_env(dir.path(), std::slice::from_ref(&block));
+        let listener = listeners[id as usize - 1].take().unwrap();
+        let db =
+            ClusteredDatabase::clustered(env, cluster_view(id, &addresses), listener, options())
+                .unwrap();
+        let node = db.cluster().unwrap();
+        node.shed().unwrap();
+        assert!(node.install_block_hashes(Box::new(|number| Some(block_hash(0, number)))));
+        assert!(node.register_persistence_point().unwrap().is_some());
+        (db, dir)
+    };
+    let owner = cluster_view(NODES, &addresses).owners(shard)[0];
+    let (_owner, _owner_dir) = start_node(owner.0);
+    // Node 5 stores nothing, so it reads every sharded key from an owner.
+    let (reader, _reader_dir) = start_node(NODES);
+    drop(listeners);
+
+    let tx = reader.tx().unwrap();
+    let mut accounts = tx.cursor_read::<RawTable<tables::HashedAccounts>>().unwrap();
+    let mut first_key = vec![0; 32];
+    first_key[0] = shard.0;
+    let mut entry = accounts.seek(RawKey::from_vec(first_key)).unwrap();
+    let mut walked = Vec::new();
+    while let Some((key, value)) = entry {
+        walked.push((key.into_key(), value.into_value()));
+        if walked.len() == PAST_TWO_PAGES {
+            break;
+        }
+        entry = accounts.next().unwrap();
+    }
+    let want: Vec<_> = expected.hashed_accounts.into_iter().collect();
+    assert_eq!(want.len(), PAST_TWO_PAGES);
+    assert_eq!(walked, want, "accounts of a remote shard");
+
+    let (busy, slots) = expected.hashed_storages.into_iter().next().unwrap();
+    assert_eq!(slots.len(), PAST_TWO_PAGES);
+    let mut storages = tx.cursor_dup_read::<RawDupSort<tables::HashedStorages>>().unwrap();
+    let walked: Vec<_> = storages
+        .walk_dup(Some(RawKey::from_vec(busy)), None)
+        .unwrap()
+        .map(|entry| entry.unwrap().1.into_value())
+        .collect();
+    assert_eq!(walked, slots, "duplicates of a remote key");
+
+    let counts = reader.cluster().unwrap().remote_reads();
+    assert!(counts.seeks >= 3, "{counts:?}");
+    assert!(counts.duplicate_seeks >= 3, "{counts:?}");
+    assert_eq!(counts.failures, 0, "{counts:?}");
 }

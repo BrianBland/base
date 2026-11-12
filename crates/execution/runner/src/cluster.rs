@@ -17,28 +17,36 @@ impl ClusterFeed {
     /// Installs `provider`'s block hashes on `node`, registers the initial persistence point,
     /// and returns the task that feeds every canonical block to `node`'s owner store. Subscribes
     /// before returning, so no block notified after this call is missed.
+    ///
+    /// The provider owns the clustered database, which owns `node`, so the installed lookup
+    /// references the provider only weakly and the task keeps it alive: dropping the task and the
+    /// node's other handles releases the node, its owner server and its held snapshots.
     pub fn start<P>(
         node: Arc<ClusterNode>,
         provider: P,
     ) -> eyre::Result<impl Future<Output = ()> + Send + 'static>
     where
-        P: BlockHashReader + CanonStateSubscriptions + Clone + 'static,
+        P: BlockHashReader + CanonStateSubscriptions + 'static,
     {
         let notifications = provider.subscribe_to_canonical_state();
+        let provider = Arc::new(provider);
+        let lookup = Arc::downgrade(&provider);
         node.install_block_hashes(Box::new(move |number| {
-            provider.block_hash(number).ok().flatten()
+            lookup.upgrade()?.block_hash(number).ok().flatten()
         }));
         let point = node.register_persistence_point()?;
         info!(
             persisted_tip = ?point.map(|block| block.number),
             "cluster owner store following canonical blocks"
         );
-        Ok(Self::follow(node, notifications))
+        Ok(Self::follow(node, notifications, provider))
     }
 
-    async fn follow<N: NodePrimitives>(
+    /// Feeds `node` until the notifications close, holding `_provider` for the node's lookup.
+    async fn follow<N: NodePrimitives, P>(
         node: Arc<ClusterNode>,
         mut notifications: tokio::sync::broadcast::Receiver<CanonStateNotification<N>>,
+        _provider: Arc<P>,
     ) {
         loop {
             match notifications.recv().await {
@@ -72,5 +80,81 @@ impl ClusterFeed {
                 }),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+
+    use alloy_primitives::{B256, BlockNumber};
+    use base_common_consensus::BasePrimitives;
+    use base_execution_cluster::{
+        ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, NodeConfig, NodeId,
+    };
+    use reth_db::test_utils::create_test_rw_db;
+    use reth_provider::{CanonStateNotifications, ProviderResult};
+    use tokio::sync::broadcast;
+
+    use super::*;
+
+    /// A provider that, like the node's real one, owns the clustered database.
+    #[derive(Clone)]
+    struct DatabaseOwningProvider {
+        _database: ClusteredDatabase,
+        canonical: broadcast::Sender<CanonStateNotification<BasePrimitives>>,
+    }
+
+    impl BlockHashReader for DatabaseOwningProvider {
+        fn block_hash(&self, _number: BlockNumber) -> ProviderResult<Option<B256>> {
+            Ok(Some(B256::ZERO))
+        }
+
+        fn canonical_hashes_range(
+            &self,
+            _start: BlockNumber,
+            _end: BlockNumber,
+        ) -> ProviderResult<Vec<B256>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl CanonStateSubscriptions for DatabaseOwningProvider {
+        type Primitives = BasePrimitives;
+
+        fn subscribe_to_canonical_state(&self) -> CanonStateNotifications<BasePrimitives> {
+            self.canonical.subscribe()
+        }
+    }
+
+    #[test]
+    fn dropping_the_node_and_its_feed_releases_the_owner_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let cluster = Cluster::new(ClusterConfig {
+            node_id: NodeId(1),
+            replication: 1,
+            retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
+            nodes: vec![NodeConfig { id: NodeId(1), address, storage: true }],
+        })
+        .unwrap();
+        let env = Arc::try_unwrap(create_test_rw_db()).unwrap().into_inner_db();
+        let database = ClusteredDatabase::clustered(
+            env,
+            Arc::new(cluster),
+            listener,
+            ClientOptions::default(),
+        )
+        .unwrap();
+        let node = Arc::clone(database.cluster().unwrap());
+        let provider =
+            DatabaseOwningProvider { _database: database, canonical: broadcast::channel(1).0 };
+
+        let feed = ClusterFeed::start(Arc::clone(&node), provider).unwrap();
+        assert_eq!(node.block_hash(0), Some(B256::ZERO));
+
+        drop(feed);
+        drop(node);
+        assert!(TcpListener::bind(address).is_ok(), "the owner server still holds its address");
     }
 }

@@ -144,17 +144,27 @@ A clustered node refuses to start unless:
 
 - `--engine.num-state-masking-blocks` is 0 (Base's default). With masking, the state tables lag
   the `Finish` checkpoint and `P` no longer identifies their contents.
-- State roots are computed for every block, so every canonical block carries trie updates.
+- State roots are computed for every block, so every canonical block carries trie updates
+  (`--debug.skip-state-root` is refused: skipped blocks carry empty trie updates, which an owner
+  cannot tell from real ones).
 - The datadir is initialised: genesis is written (a `Finish` checkpoint exists).
 
 A node is clustered when started with `--cluster.config <FILE>` (`base rpc` and the `node`
 command); without it the database is a pass-through to MDBX. At startup a clustered node checks
-the requirements above, opens the clustered database, starts its owner server on its configured
+the requirements above before opening anything, opens the clustered database, starts its owner server on its configured
 address, launches, and sheds in the background. Once its provider exists it installs the
 block-hash lookup, registers the initial persistence point, and feeds every canonical block
 (including reorgs) to its owner store, with updates `None` when a notification lacks them. It
 logs the shards it owns and shed progress, and counts remote reads and failures in the metrics
-`base_cluster_remote_reads` and `base_cluster_remote_read_failures`.
+`base_cluster_remote_reads` and `base_cluster_remote_read_failures`. Every 10 seconds in which
+any remote read happened it logs `cluster remote reads` with the reads of each kind (`gets`,
+`seeks`, `duplicate_seeks`), the `failures`, and the total time spent in them (`elapsed`) since
+the previous line; `ClusterNode::remote_reads` returns the same counts since start.
+
+The block-hash lookup holds the provider only weakly; the feed task holds it strongly. The
+provider owns the clustered database, which owns the node, so a strong lookup would keep the
+node, its owner listener and its held snapshots alive forever. Once the feed task stops (at
+shutdown) the lookup knows no block and no further persistence point is registered.
 
 
 ## Owner side
@@ -206,7 +216,9 @@ serve), `WrongFork`, `NotOwner`, `Unsupported`. Iterating across keys of a dupli
 - An owner may return fewer than `limit` entries without setting the end flag; the asker seeks
   again from after the last entry.
 - `Bytecodes`: an owner that lacks the code and has not persisted up to `P` refuses with
-  `SnapshotUnavailable` instead of answering absent.
+  `SnapshotUnavailable` instead of answering absent. The range it advertises ends at its newest
+  persistence point, not at its newest retained block, so the asker sees it as behind and
+  retries until the owner persists the code.
 - Each message is a 4-byte big-endian length followed by the bincode (standard configuration)
   encoding of the request, or of the response-or-error. An owner that fails internally (a
   database error) closes the connection, and the asker treats it like an unreachable owner.
@@ -250,8 +262,8 @@ scale-down sheds it.
 - One network round trip per remote seek until read-ahead batching is tuned. A walk asks every
   shard it crosses that this node does not own, even an empty one.
 - An owner answers a bytecode only once it has persisted it, so reading code from a block this
-  node persisted before every owner of the code's shard did fails once the client's retry budget
-  runs out.
+  node persisted before every owner of the code's shard did waits for an owner to persist it,
+  and fails if none does within the client's retry budget (2 s by default).
 - `entries` (table statistics) of a sharded table counts local rows only.
 - Shedding frees pages inside MDBX but does not shrink the file without a compacting copy.
 

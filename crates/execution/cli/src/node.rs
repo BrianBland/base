@@ -387,6 +387,10 @@ impl ExecutionNodeRuntimeConfig {
             masking == 0,
             "a clustered node requires --engine.num-state-masking-blocks 0, got {masking}"
         );
+        eyre::ensure!(
+            !self.node_config.debug.skip_state_root,
+            "a clustered node computes every state root; remove --debug.skip-state-root"
+        );
         let finish = env.tx()?.get::<tables::StageCheckpoints>(StageId::Finish.to_string())?;
         eyre::ensure!(
             finish.is_some(),
@@ -666,6 +670,11 @@ mod tests {
             .unwrap();
         tx.commit().unwrap();
         drop(pass_through);
+
+        let mut skipping_state_roots = runtime.clone();
+        skipping_state_roots.node_config.debug.skip_state_root = true;
+        let skipped = skipping_state_roots.open_database().unwrap_err();
+        assert!(skipped.to_string().contains("skip-state-root"), "{skipped}");
 
         let clustered = runtime.open_database().unwrap();
         assert!(clustered.cluster().is_some());

@@ -471,6 +471,8 @@ fn serves_bytecodes_from_the_newest_snapshot_and_refuses_absence_when_behind() {
     assert_eq!(get(missing_hash, 10).unwrap(), Response::Value(None));
     assert!(matches!(
         get(missing_hash, 11),
-        Err(StoreError::Refused(ReadError::SnapshotUnavailable { .. }))
+        Err(StoreError::Refused(ReadError::SnapshotUnavailable {
+            servable: Some(ServableRange { highest: 10, .. })
+        }))
     ));
 }

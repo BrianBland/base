@@ -9,16 +9,16 @@ use std::{
 use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use base_execution_cluster::{
-    ClientError, ClientOptions, Cluster, ClusterClient, ClusterConfig, Frame, NodeConfig, NodeId,
-    OwnerFailure, OwnerServer, OwnerStore, Query, ReadError, ReadResult, Request, Response,
-    ServableRange, Shard, ShardedTable, SnapshotId, StoreError,
+    BlockUpdates, ClientError, ClientOptions, Cluster, ClusterClient, ClusterConfig, Frame,
+    NodeConfig, NodeId, OwnerFailure, OwnerServer, OwnerStore, Query, ReadError, ReadResult,
+    Request, Response, ServableRange, Shard, ShardedTable, SnapshotId, StoreError,
 };
 use reth_db_api::{tables, transaction::DbTxMut};
 use reth_primitives_traits::Bytecode;
 
 use crate::common::{
-    KeyUniverse, TableDump, TestFactory, TestTx, block_hash, factory, random_updates, rng,
-    snapshot, write,
+    KeyUniverse, TableDump, TestFactory, TestTx, block_hash, canonical, factory, random_updates,
+    rng, snapshot, write,
 };
 
 /// Storage nodes 1 and 2 at the given addresses and a stateless node 3, seen from `node_id`.
@@ -230,6 +230,54 @@ fn client_retries_while_every_owner_is_behind() {
     let tip = SnapshotId { number: 0, hash: Some(block_hash(0, 0)) };
     assert_eq!(client.get(tip, ShardedTable::HashedAccounts, &[0x42; 32]).unwrap(), None);
     catch_up.join().unwrap();
+}
+
+#[test]
+fn client_waits_for_an_owner_to_persist_requested_code() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client_view = cluster_of(3, 2, listener.local_addr().unwrap(), closed_port());
+    let owner_view = Arc::new(
+        Cluster::new(ClusterConfig { node_id: NodeId(1), ..client_view.config().clone() }).unwrap(),
+    );
+    let shard = Shard::all().find(|shard| owner_view.owns(*shard)).unwrap();
+    let mut code_hash = B256::repeat_byte(0x66);
+    code_hash.0[0] = shard.0;
+
+    let (store, _server) = serve(&owner_view, listener);
+    let db = factory();
+    store.register_persistence_point(BlockNumHash::new(99, block_hash(0, 99)), snapshot(&db));
+    for number in [100, 101] {
+        let empty = BlockUpdates { hashed_state: Arc::default(), trie_updates: Arc::default() };
+        store.insert_block(canonical(
+            number,
+            block_hash(0, number),
+            block_hash(0, number - 1),
+            &empty,
+        ));
+    }
+
+    let persist_code = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let provider = db.provider_rw().unwrap();
+            provider
+                .tx_ref()
+                .put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(vec![0x60, 0x00].into()))
+                .unwrap();
+            provider.commit().unwrap();
+            store.register_persistence_point(
+                BlockNumHash::new(100, block_hash(0, 100)),
+                snapshot(&db),
+            );
+        })
+    };
+    let options = ClientOptions { retry_for: Duration::from_secs(10), ..Default::default() };
+    let client = ClusterClient::new(client_view, options);
+    let tip = SnapshotId { number: 100, hash: Some(block_hash(0, 100)) };
+    let code = client.get(tip, ShardedTable::Bytecodes, code_hash.as_slice()).unwrap();
+    assert!(code.is_some());
+    persist_code.join().unwrap();
 }
 
 #[test]

@@ -1,11 +1,17 @@
 //! The snapshot a read-only transaction of a clustered database reads at, and its remote reads.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 use alloy_primitives::B256;
 use reth_db::DatabaseError;
 
-use crate::{ClientError, ClusterNode, DuplicateValues, ShardEntries, ShardedTable, SnapshotId};
+use crate::{
+    ClientError, ClusterNode, DuplicateValues, RemoteReadKind, ShardEntries, ShardedTable,
+    SnapshotId,
+};
 
 /// The persisted tip `P` of one read-only transaction, and reads of other nodes' shards as of
 /// it. Shared by the transaction and its cursors.
@@ -44,10 +50,13 @@ impl ReadSnapshot {
     fn remote<R>(
         &self,
         table: ShardedTable,
+        kind: RemoteReadKind,
         read: impl FnOnce(SnapshotId) -> Result<R, ClientError>,
     ) -> Result<R, DatabaseError> {
-        let result = read(self.id());
-        self.node.record_remote_read(result.is_err());
+        let snapshot = self.id();
+        let started = Instant::now();
+        let result = read(snapshot);
+        self.node.remote_read_stats().record(kind, started.elapsed(), result.is_err());
         result.map_err(|error| {
             DatabaseError::Other(format!(
                 "cluster read of {table:?} at block {} failed: {error}",
@@ -58,12 +67,14 @@ impl ReadSnapshot {
 
     /// The encoded value of `key` in `table` at `P`, read from an owner.
     pub fn get(&self, table: ShardedTable, key: &[u8]) -> Result<Option<Vec<u8>>, DatabaseError> {
-        self.remote(table, |snapshot| self.node.client().get(snapshot, table, key))
+        self.remote(table, RemoteReadKind::Get, |snapshot| {
+            self.node.client().get(snapshot, table, key)
+        })
     }
 
     /// A page of `key`'s shard with keys `>= key` at `P`, read from an owner.
     pub fn seek_ge(&self, table: ShardedTable, key: &[u8]) -> Result<ShardEntries, DatabaseError> {
-        self.remote(table, |snapshot| {
+        self.remote(table, RemoteReadKind::Seek, |snapshot| {
             self.node.client().seek_ge(snapshot, table, key, Self::PAGE_LEN)
         })
     }
@@ -86,7 +97,7 @@ impl ReadSnapshot {
         subkey: &[u8],
         limit: u32,
     ) -> Result<DuplicateValues, DatabaseError> {
-        self.remote(table, |snapshot| {
+        self.remote(table, RemoteReadKind::DuplicateSeek, |snapshot| {
             self.node.client().seek_dup_ge(snapshot, table, key, subkey, limit)
         })
     }
