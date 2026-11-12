@@ -15,8 +15,8 @@ pub mod chainspec;
 pub mod commands;
 mod node;
 pub use node::{
-    ExecutionNodeArgs, ExecutionNodeConfigArgs, ExecutionNodeLaunchConfig,
-    ExecutionNodeRuntimeConfig,
+    BaseNodeCommand, ClusterArgs, ExecutionNodeArgs, ExecutionNodeConfigArgs,
+    ExecutionNodeLaunchConfig, ExecutionNodeRuntimeConfig,
 };
 /// Standard Base execution-node runner wiring.
 mod standard_node;
@@ -198,7 +198,7 @@ mod tests {
 
         match cmd.command {
             Commands::Node(command) => {
-                assert_eq!(command.chain.as_ref(), &BaseChainSpec::mainnet());
+                assert_eq!(command.node.chain.as_ref(), &BaseChainSpec::mainnet());
             }
             _ => panic!("unexpected command"),
         }

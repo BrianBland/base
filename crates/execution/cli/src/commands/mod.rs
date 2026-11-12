@@ -5,12 +5,10 @@ use std::{fmt, sync::Arc};
 use base_execution_chainspec::BaseChainSpec;
 use clap::Subcommand;
 use reth_cli_commands::{
-    config_cmd, db, dump_genesis, init_cmd,
-    node::{self, NoArgs},
-    prune, re_execute, stage,
+    config_cmd, db, dump_genesis, init_cmd, node::NoArgs, prune, re_execute, stage,
 };
 
-use crate::chainspec::BaseChainSpecParser;
+use crate::{BaseNodeCommand, chainspec::BaseChainSpecParser};
 
 pub mod base_proofs;
 pub mod download;
@@ -29,7 +27,7 @@ pub mod test_vectors;
 pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Start the node
     #[command(name = "node")]
-    Node(Box<node::NodeCommand<BaseChainSpecParser, Ext>>),
+    Node(Box<BaseNodeCommand<Ext>>),
     /// Initialize the database from a genesis file.
     #[command(name = "init")]
     Init(init_cmd::InitCommand<BaseChainSpecParser>),
@@ -75,7 +73,7 @@ impl<Ext: clap::Args + fmt::Debug> Commands<Ext> {
     /// Returns the underlying chain being used for commands
     pub fn chain_spec(&self) -> Option<&Arc<BaseChainSpec>> {
         match self {
-            Self::Node(cmd) => cmd.chain_spec(),
+            Self::Node(cmd) => cmd.node.chain_spec(),
             Self::Init(cmd) => cmd.chain_spec(),
             Self::InitState(cmd) => cmd.chain_spec(),
             Self::DumpGenesis(cmd) => cmd.chain_spec(),
@@ -97,7 +95,7 @@ impl<Ext: clap::Args + fmt::Debug> Commands<Ext> {
     pub fn debug_namespace_enabled(&self) -> bool {
         match self {
             Self::Node(cmd) => {
-                cmd.rpc.is_namespace_enabled(reth_rpc_server_types::RethRpcModule::Debug)
+                cmd.node.rpc.is_namespace_enabled(reth_rpc_server_types::RethRpcModule::Debug)
             }
             _ => false,
         }

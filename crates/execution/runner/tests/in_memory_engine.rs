@@ -4,7 +4,7 @@
 //! through [`EngineEndpoint::InMemory`].
 
 use std::{
-    net::SocketAddr,
+    net::{SocketAddr, TcpListener},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -24,7 +24,10 @@ use base_common_rpc_types_engine::{BasePayloadAttributes, PayloadReady};
 use base_consensus_engine::{EngineClient, EngineClientBuilder, EngineEndpoint, InMemoryTransport};
 use base_consensus_providers::L1_RPC_TIMEOUT;
 use base_execution_chainspec::BaseChainSpec;
-use base_execution_cluster::ClusteredDatabase;
+use base_execution_cluster::{
+    Cluster, ClusterConfig, ClusterNode, ClusteredDatabase, NodeConfig as ClusterNodeConfig,
+    NodeId, Query, Request, Response, ShardedTable, SnapshotId,
+};
 use base_node_core::args::RollupArgs;
 use base_node_runner::{
     BaseNodeRunner,
@@ -43,10 +46,25 @@ use reth_node_core::{
 use reth_tasks::Runtime;
 use serde_json::json;
 
+/// The node's state database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Storage {
+    /// MDBX behind a pass-through database.
+    PassThrough,
+    /// A clustered database whose cluster is this node alone, so it owns every shard.
+    OneNodeCluster,
+}
+
 /// Seals one block through the in-memory Engine API and reads it back over both transports.
 #[tokio::test(flavor = "multi_thread")]
 async fn in_memory_engine_seals_one_block() -> Result<()> {
     seal_one_block(false, true).await
+}
+
+/// A clustered node boots, seals a block, persists it, and serves peers reads as of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn clustered_node_seals_one_block() -> Result<()> {
+    seal_one_block_on(Storage::OneNodeCluster, false, true).await
 }
 
 /// A CL can retrieve a complete Denim payload as soon as its ready hint arrives.
@@ -68,6 +86,10 @@ async fn replay_payload_does_not_signal_ready() -> Result<()> {
 }
 
 async fn seal_one_block(denim: bool, no_tx_pool: bool) -> Result<()> {
+    seal_one_block_on(Storage::PassThrough, denim, no_tx_pool).await
+}
+
+async fn seal_one_block_on(storage: Storage, denim: bool, no_tx_pool: bool) -> Result<()> {
     base_node_runner::test_utils::init_silenced_tracing();
 
     let mut genesis = build_test_genesis();
@@ -95,14 +117,28 @@ async fn seal_one_block(denim: bool, no_tx_pool: bool) -> Result<()> {
         datadir: MaybePlatformPath::<DataDirPath>::from(data_path.clone()),
         ..Default::default()
     });
-    let db = ClusteredDatabase::new(
-        init_db(
-            node_config.datadir().db(),
-            DatabaseArguments::new(ClientVersion::default())
-                .with_geometry_max_size(Some(100 * 1024 * 1024)),
-        )
-        .wrap_err("Failed to create test database")?,
-    );
+    let env = init_db(
+        node_config.datadir().db(),
+        DatabaseArguments::new(ClientVersion::default())
+            .with_geometry_max_size(Some(100 * 1024 * 1024)),
+    )
+    .wrap_err("Failed to create test database")?;
+    let db = match storage {
+        Storage::PassThrough => ClusteredDatabase::new(env),
+        Storage::OneNodeCluster => {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let node =
+                ClusterNodeConfig { id: NodeId(1), address: listener.local_addr()?, storage: true };
+            let cluster = Cluster::new(ClusterConfig {
+                node_id: NodeId(1),
+                replication: 1,
+                retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
+                nodes: vec![node],
+            })?;
+            ClusteredDatabase::clustered(env, Arc::new(cluster), listener, Default::default())?
+        }
+    };
+    let cluster = db.cluster().cloned();
 
     let runtime = Runtime::test();
     let mut launched = BaseNodeRunner::new(RollupArgs::default())
@@ -224,6 +260,9 @@ async fn seal_one_block(denim: bool, no_tx_pool: bool) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    if let Some(node) = &cluster {
+        wait_until_served(node, hash).await?;
+    }
 
     // Consensus resets on `INVALID_FORK_CHOICE_STATE_ERROR`, so the typed path must surface
     // handler errors exactly as a JSON-RPC client would see them.
@@ -253,6 +292,27 @@ async fn seal_one_block(denim: bool, no_tx_pool: bool) -> Result<()> {
     drop(runtime);
     let _ = std::fs::remove_dir_all(data_path);
     Ok(())
+}
+
+/// Waits until the owner store answers reads as of block 1: a state read, and a bytecode read,
+/// which an owner answers only from a persistence point at or above the block.
+async fn wait_until_served(node: &ClusterNode, hash: B256) -> Result<()> {
+    let snapshot = SnapshotId { number: 1, hash: Some(hash) };
+    let read = |table, key: Vec<u8>| {
+        node.owner_store().read(&Request { snapshot, table, query: Query::Get { key } })
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = read(ShardedTable::HashedAccounts, vec![0x42; 32]);
+        let code = read(ShardedTable::Bytecodes, vec![0x42; 32]);
+        if matches!((&state, &code), (Ok(Response::Value(_)), Ok(Response::Value(None)))) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(eyre!("owner store does not serve block 1: {state:?}, {code:?}"));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Error response code, message, and data.

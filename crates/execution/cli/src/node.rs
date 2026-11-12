@@ -1,15 +1,20 @@
 //! Chainless execution-node arguments and launch helpers.
 
-use std::{net::Ipv4Addr, path::PathBuf, sync::Arc};
+use std::{
+    net::{Ipv4Addr, TcpListener},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use base_execution_chainspec::BaseChainSpec;
-use base_execution_cluster::ClusteredDatabase;
+use base_execution_cluster::{ClientOptions, Cluster, ClusteredDatabase};
 use base_node_runner::{BaseNodeBuilder, LaunchedBaseNode};
 use base_upgrade_signal::UpgradeSignalStartupMode;
 use clap::{Args, value_parser};
 use reth_cli_commands::node::NodeCommand;
 use reth_cli_runner::CliContext;
-use reth_db::init_db;
+use reth_db::{DatabaseEnv, init_db};
+use reth_db_api::{Database, tables, transaction::DbTx};
 use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
@@ -20,6 +25,7 @@ use reth_node_core::{
     version,
 };
 use reth_rpc_server_types::{LenientRpcModuleValidator, RpcModuleValidator};
+use reth_stages_types::StageId;
 use tracing::info;
 
 use crate::{
@@ -29,6 +35,28 @@ use crate::{
 
 const DEFAULT_BASE_MAX_INBOUND_EL_PEERS: usize = 80;
 const DEFAULT_BASE_MAX_OUTBOUND_EL_PEERS: usize = 80;
+
+/// Clustered Base arguments: whether this node keeps only its shards of the state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct ClusterArgs {
+    /// Cluster configuration file (TOML). When set, this node stores only its shards of the
+    /// state (clustered Base, experimental) and reads the rest from its peers. Requires an
+    /// initialised datadir and `--engine.num-state-masking-blocks 0`.
+    #[arg(long = "cluster.config", value_name = "FILE")]
+    pub cluster_config: Option<PathBuf>,
+}
+
+/// Reth's `node` command with Base's own node arguments.
+#[derive(Debug, Args)]
+pub struct BaseNodeCommand<Ext: clap::Args + std::fmt::Debug> {
+    /// Reth's node arguments.
+    #[command(flatten)]
+    pub node: NodeCommand<BaseChainSpecParser, Ext>,
+
+    /// Clustered Base arguments.
+    #[command(flatten)]
+    pub cluster: ClusterArgs,
+}
 
 /// Chainless execution-node arguments shared by embedded Base commands.
 #[derive(Debug, Clone, Args)]
@@ -101,6 +129,10 @@ pub struct ExecutionNodeConfigArgs {
     /// All storage related arguments with --storage prefix.
     #[command(flatten, next_help_heading = "Storage")]
     pub storage: StorageArgs,
+
+    /// Clustered Base arguments.
+    #[command(flatten, next_help_heading = "Cluster")]
+    pub cluster: ClusterArgs,
 }
 
 impl ExecutionNodeConfigArgs {
@@ -123,6 +155,7 @@ impl ExecutionNodeConfigArgs {
             era,
             static_files,
             storage,
+            cluster,
         } = self;
 
         let mut node_config = NodeConfig {
@@ -153,6 +186,7 @@ impl ExecutionNodeConfigArgs {
             node_config,
             with_unused_ports,
             upgrade_signal_startup: UpgradeSignalStartupMode::ReadAndApply,
+            cluster,
         }
     }
 }
@@ -188,6 +222,7 @@ impl ExecutionNodeArgs {
                 .with_shadow_indexer(self.shadow_indexer),
             with_unused_ports: runtime.with_unused_ports,
             upgrade_signal_startup: runtime.upgrade_signal_startup,
+            cluster: runtime.cluster,
         }
     }
 }
@@ -201,6 +236,8 @@ pub struct ExecutionNodeRuntimeConfig {
     pub with_unused_ports: bool,
     /// Whether this launch should perform its own upgrade-signal startup read.
     pub upgrade_signal_startup: UpgradeSignalStartupMode,
+    /// Clustered Base arguments.
+    pub cluster: ClusterArgs,
 }
 
 impl ExecutionNodeRuntimeConfig {
@@ -208,12 +245,11 @@ impl ExecutionNodeRuntimeConfig {
     ///
     /// Base launches the `node` command itself rather than through
     /// [`NodeCommand::execute`], which opens the database as a bare MDBX environment.
-    pub fn from_node_command<Ext>(
-        command: NodeCommand<BaseChainSpecParser, Ext>,
-    ) -> eyre::Result<(Self, Ext)>
+    pub fn from_node_command<Ext>(command: BaseNodeCommand<Ext>) -> eyre::Result<(Self, Ext)>
     where
         Ext: clap::Args + std::fmt::Debug,
     {
+        let BaseNodeCommand { node, cluster } = command;
         let NodeCommand {
             datadir,
             config,
@@ -235,7 +271,7 @@ impl ExecutionNodeRuntimeConfig {
             storage,
             jit,
             ext,
-        } = command;
+        } = node;
         engine.validate()?;
 
         let node_config = NodeConfig {
@@ -262,6 +298,7 @@ impl ExecutionNodeRuntimeConfig {
             node_config,
             with_unused_ports,
             upgrade_signal_startup: UpgradeSignalStartupMode::ReadAndApply,
+            cluster,
         };
         Ok((runtime, ext))
     }
@@ -321,17 +358,51 @@ impl ExecutionNodeRuntimeConfig {
             self.node_config = self.node_config.with_unused_ports();
         }
 
-        let data_dir = self.node_config.datadir();
-        let db_path = data_dir.db();
-        info!(target: "reth::cli", path = ?db_path, "Opening database");
-        let database = init_db(db_path, self.node_config.db.database_args())?
-            .with_metrics_if(self.node_config.db.metrics_enabled());
-
+        let database = self.open_database()?;
         let builder = NodeBuilder::new(self.node_config)
-            .with_database(ClusteredDatabase::new(database))
+            .with_database(database)
             .with_launch_context(ctx.task_executor);
 
         Ok(builder)
+    }
+
+    /// Opens the node's database: clustered when a cluster config is set, otherwise a
+    /// pass-through to MDBX.
+    pub fn open_database(&self) -> eyre::Result<ClusteredDatabase> {
+        let db_path = self.node_config.datadir().db();
+        info!(target: "reth::cli", path = ?db_path, "Opening database");
+        let env = init_db(db_path, self.node_config.db.database_args())?
+            .with_metrics_if(self.node_config.db.metrics_enabled());
+        match &self.cluster.cluster_config {
+            None => Ok(ClusteredDatabase::new(env)),
+            Some(config) => self.open_clustered(env, config),
+        }
+    }
+
+    /// Checks the clustered node's operating requirements, starts its owner server, and sheds
+    /// in the background.
+    fn open_clustered(&self, env: DatabaseEnv, config: &Path) -> eyre::Result<ClusteredDatabase> {
+        let masking = self.node_config.engine.num_state_masking_blocks;
+        eyre::ensure!(
+            masking == 0,
+            "a clustered node requires --engine.num-state-masking-blocks 0, got {masking}"
+        );
+        let finish = env.tx()?.get::<tables::StageCheckpoints>(StageId::Finish.to_string())?;
+        eyre::ensure!(
+            finish.is_some(),
+            "a clustered node requires an initialised datadir; run `init` without a cluster config"
+        );
+        let cluster = Arc::new(Cluster::load(config)?);
+        let address = cluster
+            .address(cluster.node_id())
+            .ok_or_else(|| eyre::eyre!("cluster config does not list this node"))?;
+        let listener = TcpListener::bind(address)?;
+        let database =
+            ClusteredDatabase::clustered(env, cluster, listener, ClientOptions::default())?;
+        if let Some(node) = database.cluster() {
+            node.spawn_shed()?;
+        }
+        Ok(database)
     }
 
     /// Converts the runtime config into a reth node builder with the default RPC validator.
@@ -351,14 +422,22 @@ pub struct ExecutionNodeLaunchConfig {
     pub with_unused_ports: bool,
     /// Whether this launch should perform its own upgrade-signal startup read.
     pub upgrade_signal_startup: UpgradeSignalStartupMode,
+    /// Clustered Base arguments.
+    pub cluster: ClusterArgs,
 }
 
 impl ExecutionNodeLaunchConfig {
     /// Converts this standard launch config into the shared runtime config plus standard args.
     pub fn into_runtime_config(self) -> (ExecutionNodeRuntimeConfig, StandardNodeArgs) {
-        let Self { node_config, standard, with_unused_ports, upgrade_signal_startup } = self;
+        let Self { node_config, standard, with_unused_ports, upgrade_signal_startup, cluster } =
+            self;
         (
-            ExecutionNodeRuntimeConfig { node_config, with_unused_ports, upgrade_signal_startup },
+            ExecutionNodeRuntimeConfig {
+                node_config,
+                with_unused_ports,
+                upgrade_signal_startup,
+                cluster,
+            },
             standard,
         )
     }
@@ -406,6 +485,8 @@ impl ExecutionNodeLaunchConfig {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use reth_cli_commands::node::NoArgs;
+    use reth_db_api::transaction::DbTxMut;
 
     use super::*;
 
@@ -526,6 +607,68 @@ mod tests {
 
         assert_eq!(runtime.node_config.network.max_inbound_peers, Some(12));
         assert_eq!(runtime.node_config.network.max_outbound_peers, Some(34));
+    }
+
+    /// A runtime config over a fresh datadir in `dir` with a one-node cluster config.
+    fn clustered_runtime(dir: &Path, masking_blocks: &str) -> ExecutionNodeRuntimeConfig {
+        let config = dir.join("cluster.toml");
+        std::fs::write(
+            &config,
+            "node_id = 1\nreplication = 1\n[[nodes]]\nid = 1\naddress = \"127.0.0.1:0\"\n",
+        )
+        .unwrap();
+        let datadir = dir.join("data");
+        let args = CommandParser::<ExecutionNodeArgs>::parse_from([
+            "reth",
+            "--datadir",
+            datadir.to_str().unwrap(),
+            "--engine.num-state-masking-blocks",
+            masking_blocks,
+            "--cluster.config",
+            config.to_str().unwrap(),
+        ])
+        .args;
+        args.into_launch_config(Arc::new(BaseChainSpec::devnet())).into_runtime_config().0
+    }
+
+    #[test]
+    fn node_command_takes_a_cluster_config() {
+        let command = CommandParser::<BaseNodeCommand<NoArgs>>::parse_from([
+            "reth",
+            "--chain",
+            "base",
+            "--cluster.config",
+            "/etc/base/cluster.toml",
+        ])
+        .args;
+        let (runtime, _) = ExecutionNodeRuntimeConfig::from_node_command(command).unwrap();
+        assert_eq!(runtime.cluster.cluster_config, Some(PathBuf::from("/etc/base/cluster.toml")));
+    }
+
+    #[test]
+    fn clustered_database_requires_its_operating_requirements() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let masked = clustered_runtime(dir.path(), "1").open_database().unwrap_err();
+        assert!(masked.to_string().contains("num-state-masking-blocks"), "{masked}");
+
+        let runtime = clustered_runtime(dir.path(), "0");
+        let uninitialised = runtime.open_database().unwrap_err();
+        assert!(uninitialised.to_string().contains("initialised datadir"), "{uninitialised}");
+
+        let pass_through =
+            ExecutionNodeRuntimeConfig { cluster: ClusterArgs::default(), ..runtime.clone() }
+                .open_database()
+                .unwrap();
+        assert!(pass_through.cluster().is_none());
+        let tx = pass_through.tx_mut().unwrap();
+        tx.put::<tables::StageCheckpoints>(StageId::Finish.to_string(), Default::default())
+            .unwrap();
+        tx.commit().unwrap();
+        drop(pass_through);
+
+        let clustered = runtime.open_database().unwrap();
+        assert!(clustered.cluster().is_some());
     }
 
     #[test]

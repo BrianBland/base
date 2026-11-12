@@ -15,13 +15,13 @@ use base_execution_payload_builder::{
 use base_node_core::{BaseEngineApiBuilder, args::RollupArgs};
 use eyre::{Result, eyre};
 use jsonrpsee::RpcModule;
-use reth_node_builder::{Node, NodeHandle, NodeHandleFor};
+use reth_node_builder::{FullNodeComponents, Node, NodeHandle, NodeHandleFor};
 use reth_provider::providers::BlockchainProvider;
 use tokio::sync::broadcast;
 use tracing::info;
 
 use crate::{
-    BaseNodeBuilder, BaseNodeExtension, FromExtensionConfig, NodeHooks,
+    BaseNodeBuilder, BaseNodeExtension, ClusterFeed, FromExtensionConfig, NodeHooks,
     node::BaseNode,
     service::{DefaultPayloadServiceBuilder, PayloadServiceBuilder},
 };
@@ -210,8 +210,15 @@ impl<SB: PayloadServiceBuilder> BaseNodeRunner<SB> {
         let builder = builder
             .with_types_and_provider::<BaseNode, BlockchainProvider<_>>()
             .with_components(components)
-            .with_add_ons(add_ons)
-            .on_component_initialized(move |_ctx| Ok(()));
+            .with_add_ons(add_ons);
+        let cluster = builder.db().cluster().cloned();
+        let builder = builder.on_component_initialized(move |ctx| {
+            if let Some(node) = cluster {
+                let feed = ClusterFeed::start(node, ctx.provider().clone())?;
+                ctx.task_executor().spawn_critical_task("cluster-owner-feed", feed);
+            }
+            Ok(())
+        });
 
         let hooks = extensions.into_iter().fold(NodeHooks::new(), |hooks, ext| ext.apply(hooks));
         let hooks = started_callbacks

@@ -16,6 +16,9 @@ pub use extension::{BaseNodeExtension, FromExtensionConfig};
 mod runner;
 pub use runner::{BaseNodeRunner, LaunchedBaseNode};
 
+mod cluster;
+pub use cluster::ClusterFeed;
+
 mod service;
 pub use service::{DefaultPayloadServiceBuilder, PayloadServiceBuilder};
 
