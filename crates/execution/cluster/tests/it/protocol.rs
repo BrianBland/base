@@ -34,7 +34,15 @@ fn cluster_of(
         node(2, owner_2, true),
         node(3, "127.0.0.1:1".parse().unwrap(), false),
     ];
-    Arc::new(Cluster::new(ClusterConfig { node_id: NodeId(node_id), replication, nodes }).unwrap())
+    Arc::new(
+        Cluster::new(ClusterConfig {
+            node_id: NodeId(node_id),
+            replication,
+            retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
+            nodes,
+        })
+        .unwrap(),
+    )
 }
 
 fn closed_port() -> SocketAddr {

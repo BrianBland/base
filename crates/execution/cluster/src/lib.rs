@@ -5,10 +5,19 @@ mod database;
 pub use database::ClusteredDatabase;
 
 mod tx;
-pub use tx::ClusteredTx;
+pub use tx::{ClusteredTx, TxSharding};
 
 mod cursor;
-pub use cursor::ClusteredCursor;
+pub use cursor::{ClusteredCursor, CursorSharding};
+
+mod reads;
+pub use reads::{CursorPosition, FoundEntry, ShardedReads};
+
+mod snapshot;
+pub use snapshot::ReadSnapshot;
+
+mod node;
+pub use node::{BlockHashLookup, ClusterNode, ClusterStartError, CommitRefusal};
 
 mod placement;
 pub use placement::{KeyPlacement, NodeId, Shard, ShardMap, ShardedTable};

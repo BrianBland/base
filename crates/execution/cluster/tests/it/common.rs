@@ -67,7 +67,13 @@ pub(crate) fn cluster(node_id: u64) -> Arc<Cluster> {
         })
         .collect();
     Arc::new(
-        Cluster::new(ClusterConfig { node_id: NodeId(node_id), replication: 2, nodes }).unwrap(),
+        Cluster::new(ClusterConfig {
+            node_id: NodeId(node_id),
+            replication: 2,
+            retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
+            nodes,
+        })
+        .unwrap(),
     )
 }
 
@@ -271,21 +277,27 @@ pub(crate) struct TableDump {
     pub(crate) accounts_trie: BTreeMap<Vec<u8>, Vec<u8>>,
     pub(crate) hashed_storages: BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
     pub(crate) storages_trie: BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    pub(crate) bytecodes: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 impl TableDump {
     pub(crate) fn read(factory: &TestFactory) -> Self {
-        let tx = snapshot(factory);
+        Self::read_tx(&snapshot(factory))
+    }
+
+    /// The sharded tables as `tx` sees them.
+    pub(crate) fn read_tx(tx: &impl DbTx) -> Self {
         Self {
-            hashed_accounts: walk::<tables::HashedAccounts>(&tx).into_iter().collect(),
-            accounts_trie: walk::<tables::PackedAccountsTrie>(&tx).into_iter().collect(),
-            hashed_storages: group(walk::<tables::HashedStorages>(&tx)),
-            storages_trie: group(walk::<tables::PackedStoragesTrie>(&tx)),
+            hashed_accounts: walk::<tables::HashedAccounts>(tx).into_iter().collect(),
+            accounts_trie: walk::<tables::PackedAccountsTrie>(tx).into_iter().collect(),
+            hashed_storages: group(walk::<tables::HashedStorages>(tx)),
+            storages_trie: group(walk::<tables::PackedStoragesTrie>(tx)),
+            bytecodes: walk::<tables::Bytecodes>(tx).into_iter().collect(),
         }
     }
 }
 
-fn walk<T: Table>(tx: &TestTx) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn walk<T: Table>(tx: &impl DbTx) -> Vec<(Vec<u8>, Vec<u8>)> {
     tx.cursor_read::<RawTable<T>>()
         .unwrap()
         .walk(None)

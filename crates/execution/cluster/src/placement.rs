@@ -1,6 +1,7 @@
 //! Shards, sharded tables, and rendezvous placement of shards on storage nodes.
 
 use alloy_primitives::keccak256;
+use reth_db_api::{table::Table, tables};
 use serde::{Deserialize, Serialize};
 
 /// Identifier of a cluster node, unique within the cluster.
@@ -81,6 +82,84 @@ impl ShardedTable {
                 })
             }
         }
+    }
+
+    /// The sharded table stored under MDBX table `name`, if any. Every view of a table (typed,
+    /// packed, raw) shares the MDBX table name, so all of them are recognised.
+    pub fn from_table_name(name: &str) -> Option<Self> {
+        [
+            (tables::HashedAccounts::NAME, Self::HashedAccounts),
+            (tables::HashedStorages::NAME, Self::HashedStorages),
+            (tables::PackedAccountsTrie::NAME, Self::AccountsTrie),
+            (tables::PackedStoragesTrie::NAME, Self::StoragesTrie),
+            (tables::Bytecodes::NAME, Self::Bytecodes),
+        ]
+        .into_iter()
+        .find_map(|(table_name, table)| (table_name == name).then_some(table))
+    }
+
+    /// Whether the table stores several values per key, ordered by a subkey.
+    pub const fn is_duplicate(self) -> bool {
+        matches!(self, Self::HashedStorages | Self::StoragesTrie)
+    }
+
+    /// Length of an encoded key.
+    pub const fn key_len(self) -> usize {
+        match self {
+            Self::AccountsTrie => Self::PACKED_PATH_LEN,
+            Self::HashedAccounts | Self::HashedStorages | Self::StoragesTrie | Self::Bytecodes => {
+                Self::HASH_KEY_LEN
+            }
+        }
+    }
+
+    /// Length of the encoded subkey that starts every value of a duplicate-key table, and 0 for
+    /// other tables.
+    pub const fn subkey_len(self) -> usize {
+        match self {
+            Self::HashedStorages => Self::HASH_KEY_LEN,
+            Self::StoragesTrie => Self::PACKED_PATH_LEN,
+            Self::HashedAccounts | Self::AccountsTrie | Self::Bytecodes => 0,
+        }
+    }
+
+    /// The smallest encoded subkey: every duplicate of a key sorts at or after it.
+    pub fn first_subkey(self) -> Vec<u8> {
+        vec![0; self.subkey_len()]
+    }
+
+    /// The smallest encoded key of the table.
+    pub fn first_key(self) -> Vec<u8> {
+        vec![0; self.key_len()]
+    }
+
+    /// The smallest encoded key of `shard` that is stored only by the shard's owners. For
+    /// `AccountsTrie` this is the two-nibble path of the shard byte.
+    pub fn shard_floor(self, shard: Shard) -> Vec<u8> {
+        let mut key = vec![0; self.key_len()];
+        key[0] = shard.0;
+        if self == Self::AccountsTrie {
+            key[Self::PACKED_PATH_LEN - 1] = Self::SHARDED_PATH_MIN_NIBBLES;
+        }
+        key
+    }
+
+    /// The replicated keys inside `shard`'s byte range, ascending; all sort before
+    /// [`Self::shard_floor`]. Only `AccountsTrie` has any: the root in shard `0x00` and the
+    /// one-nibble path `n` in shard `n0`.
+    pub fn replicated_keys(self, shard: Shard) -> Vec<Vec<u8>> {
+        if self != Self::AccountsTrie {
+            return Vec::new();
+        }
+        let path = |nibbles: u8| {
+            let mut key = vec![0; Self::PACKED_PATH_LEN];
+            key[0] = shard.0;
+            key[Self::PACKED_PATH_LEN - 1] = nibbles;
+            key
+        };
+        let root = (shard.0 == 0).then(|| path(0));
+        let one_nibble = (shard.0 & 0x0f == 0).then(|| path(1));
+        root.into_iter().chain(one_nibble).collect()
     }
 
     /// Returns the nibble count of an encoded packed trie path, or `None` when `path` is not the
@@ -164,6 +243,40 @@ mod tests {
         assert_eq!(table.placement(&packed_path(0xa3, 1)), None, "padding nibble must be zero");
         assert_eq!(table.placement(&packed_path(0xa0, 0)), None, "padding byte must be zero");
         assert_eq!(table.placement(&[0xa3; 32]), None);
+    }
+
+    #[test]
+    fn recognises_every_view_of_a_sharded_table() {
+        assert_eq!(
+            ShardedTable::from_table_name(tables::AccountsTrie::NAME),
+            Some(ShardedTable::AccountsTrie)
+        );
+        assert_eq!(
+            ShardedTable::from_table_name(
+                <tables::RawTable<tables::HashedStorages> as Table>::NAME
+            ),
+            Some(ShardedTable::HashedStorages)
+        );
+        assert_eq!(ShardedTable::from_table_name(tables::PlainAccountState::NAME), None);
+    }
+
+    #[test]
+    fn replicated_trie_keys_sort_before_the_shard_floor() {
+        let table = ShardedTable::AccountsTrie;
+        for shard in Shard::all() {
+            let floor = table.shard_floor(shard);
+            assert_eq!(table.placement(&floor), Some(KeyPlacement::Shard(shard)));
+            let replicated = table.replicated_keys(shard);
+            assert_eq!(
+                replicated.len(),
+                usize::from(shard.0 == 0) + usize::from(shard.0 % 16 == 0)
+            );
+            for key in replicated {
+                assert_eq!(table.placement(&key), Some(KeyPlacement::Replicated));
+                assert_eq!(key[0], shard.0);
+                assert!(key < floor);
+            }
+        }
     }
 
     #[test]

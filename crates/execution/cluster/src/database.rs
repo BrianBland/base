@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{net::TcpListener, path::PathBuf, sync::Arc};
 
 use metrics::Label;
 use reth_db::{
@@ -7,24 +7,44 @@ use reth_db::{
     mdbx::{RO, RW},
 };
 
-use crate::ClusteredTx;
+use crate::{
+    ClientOptions, Cluster, ClusterNode, ClusterStartError, ClusteredTx, ReadSnapshot, TxSharding,
+};
 
 /// The node's state database: the MDBX [`DatabaseEnv`] behind the sharding layer.
 ///
 /// Every transaction it opens is a [`ClusteredTx`], whose cursors are [`ClusteredCursor`]s, so
-/// each read and write passes through this crate before reaching MDBX. Today every operation is
-/// forwarded unchanged, so behaviour is identical to the wrapped [`DatabaseEnv`].
+/// each read and write passes through this crate before reaching MDBX. A pass-through database
+/// forwards every operation unchanged; a clustered one follows the crate's read and write rules.
 ///
 /// [`ClusteredCursor`]: crate::ClusteredCursor
 #[derive(Debug, Clone)]
 pub struct ClusteredDatabase {
     inner: DatabaseEnv,
+    cluster: Option<Arc<ClusterNode>>,
 }
 
 impl ClusteredDatabase {
-    /// Wraps an opened MDBX environment.
+    /// Wraps an opened MDBX environment as a pass-through database.
     pub const fn new(inner: DatabaseEnv) -> Self {
-        Self { inner }
+        Self { inner, cluster: None }
+    }
+
+    /// Wraps an opened MDBX environment as a node of `cluster`, serving this node's shards to
+    /// peers on `listener`.
+    pub fn clustered(
+        inner: DatabaseEnv,
+        cluster: Arc<Cluster>,
+        listener: TcpListener,
+        options: ClientOptions,
+    ) -> Result<Self, ClusterStartError> {
+        let node = ClusterNode::start(inner.clone(), cluster, listener, options)?;
+        Ok(Self { inner, cluster: Some(Arc::new(node)) })
+    }
+
+    /// This node's side of the cluster, or `None` for a pass-through database.
+    pub const fn cluster(&self) -> Option<&Arc<ClusterNode>> {
+        self.cluster.as_ref()
     }
 }
 
@@ -33,11 +53,23 @@ impl Database for ClusteredDatabase {
     type TXMut = ClusteredTx<RW>;
 
     fn tx(&self) -> Result<Self::TX, DatabaseError> {
-        self.inner.tx().map(ClusteredTx::new)
+        let tx = self.inner.tx()?;
+        let sharding = match &self.cluster {
+            None => TxSharding::PassThrough,
+            Some(node) => {
+                let tip = ClusterNode::finish_checkpoint(&tx)?;
+                TxSharding::Reads(Arc::new(ReadSnapshot::new(Arc::clone(node), tip)))
+            }
+        };
+        Ok(ClusteredTx::new(tx, sharding))
     }
 
     fn tx_mut(&self) -> Result<Self::TXMut, DatabaseError> {
-        self.inner.tx_mut().map(ClusteredTx::new)
+        let sharding = self
+            .cluster
+            .as_ref()
+            .map_or(TxSharding::PassThrough, |node| TxSharding::Writes(Arc::clone(node)));
+        Ok(ClusteredTx::new(self.inner.tx_mut()?, sharding))
     }
 
     fn path(&self) -> PathBuf {

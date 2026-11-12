@@ -15,6 +15,7 @@ workspace = true
 # reth
 reth-trie.workspace = true
 reth-db-api.workspace = true
+reth-stages-types.workspace = true
 reth-trie-db.workspace = true
 reth-primitives-traits.workspace = true
 reth-db = { workspace = true, features = ["mdbx"] }
@@ -37,5 +38,7 @@ parking_lot.workspace = true
 [dev-dependencies]
 rand.workspace = true
 tempfile.workspace = true
+reth-tasks.workspace = true
+reth-chainspec.workspace = true
 reth-db = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true, features = ["test-utils"] }

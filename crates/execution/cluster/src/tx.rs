@@ -1,11 +1,26 @@
+use std::sync::Arc;
+
 use reth_db::{
     DatabaseError,
     mdbx::{RW, TransactionKind, tx::Tx},
-    table::{DupSort, Encode, Table, TableImporter},
+    table::{Decompress, DupSort, Encode, IntoVec, Table, TableImporter},
     transaction::{DbTx, DbTxMut},
 };
 
-use crate::ClusteredCursor;
+use crate::{
+    ClusterNode, ClusteredCursor, CursorSharding, ReadSnapshot, ShardedReads, ShardedTable,
+};
+
+/// What a [`ClusteredTx`] does beyond forwarding to MDBX.
+#[derive(Debug, Clone)]
+pub enum TxSharding {
+    /// Forward everything: the database is a pass-through.
+    PassThrough,
+    /// A read-only transaction of a clustered database, reading at a snapshot.
+    Reads(Arc<ReadSnapshot>),
+    /// A read-write transaction of a clustered database.
+    Writes(Arc<ClusterNode>),
+}
 
 /// A [`ClusteredDatabase`](crate::ClusteredDatabase) transaction, read-only (`RO`) or read-write
 /// (`RW`).
@@ -15,12 +30,45 @@ use crate::ClusteredCursor;
 #[derive(Debug)]
 pub struct ClusteredTx<K: TransactionKind> {
     inner: Tx<K>,
+    sharding: TxSharding,
 }
 
 impl<K: TransactionKind> ClusteredTx<K> {
     /// Wraps an MDBX transaction.
-    pub const fn new(inner: Tx<K>) -> Self {
-        Self { inner }
+    pub const fn new(inner: Tx<K>, sharding: TxSharding) -> Self {
+        Self { inner, sharding }
+    }
+
+    fn cursor_sharding<T: Table>(&self) -> CursorSharding {
+        let Some(table) = ShardedTable::from_table_name(T::NAME) else {
+            return CursorSharding::PassThrough;
+        };
+        match &self.sharding {
+            TxSharding::PassThrough => CursorSharding::PassThrough,
+            TxSharding::Reads(snapshot) => {
+                CursorSharding::Reads(ShardedReads::new(Arc::clone(snapshot), table))
+            }
+            TxSharding::Writes(node) => CursorSharding::Writes { node: Arc::clone(node), table },
+        }
+    }
+
+    /// Reads the encoded `key` of a sharded table from an owner when this transaction reads at a
+    /// snapshot and this node does not hold the key; `None` means "read local MDBX".
+    fn remote_value<T: Table>(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<Option<T::Value>>, DatabaseError> {
+        let TxSharding::Reads(snapshot) = &self.sharding else { return Ok(None) };
+        let Some(table) = ShardedTable::from_table_name(T::NAME) else { return Ok(None) };
+        if snapshot.node().holds(table, key)? {
+            return Ok(None);
+        }
+        let value = snapshot.value(table, key)?;
+        Ok(Some(value.map(|value| T::Value::decompress(&value)).transpose()?))
+    }
+
+    fn accepts_write<T: Table>(&self, key: &T::Key) -> Result<bool, DatabaseError> {
+        self.cursor_sharding::<T>().accepts_write::<T>(key)
     }
 }
 
@@ -29,6 +77,11 @@ impl<K: TransactionKind> DbTx for ClusteredTx<K> {
     type DupCursor<T: DupSort> = ClusteredCursor<K, T>;
 
     fn get<T: Table>(&self, key: T::Key) -> Result<Option<T::Value>, DatabaseError> {
+        if matches!(self.sharding, TxSharding::Reads(_))
+            && let Some(value) = self.remote_value::<T>(&key.clone().encode().into_vec())?
+        {
+            return Ok(value);
+        }
         self.inner.get::<T>(key)
     }
 
@@ -36,11 +89,17 @@ impl<K: TransactionKind> DbTx for ClusteredTx<K> {
         &self,
         key: &<T::Key as Encode>::Encoded,
     ) -> Result<Option<T::Value>, DatabaseError> {
+        if let Some(value) = self.remote_value::<T>(key.as_ref())? {
+            return Ok(value);
+        }
         self.inner.get_by_encoded_key::<T>(key)
     }
 
     fn commit(self) -> Result<(), DatabaseError> {
-        self.inner.commit()
+        match self.sharding {
+            TxSharding::Writes(node) => node.commit(self.inner),
+            TxSharding::PassThrough | TxSharding::Reads(_) => self.inner.commit(),
+        }
     }
 
     fn abort(self) {
@@ -48,11 +107,13 @@ impl<K: TransactionKind> DbTx for ClusteredTx<K> {
     }
 
     fn cursor_read<T: Table>(&self) -> Result<Self::Cursor<T>, DatabaseError> {
-        self.inner.cursor_read::<T>().map(ClusteredCursor::new)
+        let sharding = self.cursor_sharding::<T>();
+        self.inner.cursor_read::<T>().map(|cursor| ClusteredCursor::new(cursor, sharding))
     }
 
     fn cursor_dup_read<T: DupSort>(&self) -> Result<Self::DupCursor<T>, DatabaseError> {
-        self.inner.cursor_dup_read::<T>().map(ClusteredCursor::new)
+        let sharding = self.cursor_sharding::<T>();
+        self.inner.cursor_dup_read::<T>().map(|cursor| ClusteredCursor::new(cursor, sharding))
     }
 
     fn entries<T: Table>(&self) -> Result<usize, DatabaseError> {
@@ -74,10 +135,16 @@ impl DbTxMut for ClusteredTx<RW> {
     type DupCursorMut<T: DupSort> = ClusteredCursor<RW, T>;
 
     fn put<T: Table>(&self, key: T::Key, value: T::Value) -> Result<(), DatabaseError> {
+        if !self.accepts_write::<T>(&key)? {
+            return Ok(());
+        }
         DbTxMut::put::<T>(&self.inner, key, value)
     }
 
     fn append<T: Table>(&self, key: T::Key, value: T::Value) -> Result<(), DatabaseError> {
+        if !self.accepts_write::<T>(&key)? {
+            return Ok(());
+        }
         DbTxMut::append::<T>(&self.inner, key, value)
     }
 
@@ -94,11 +161,13 @@ impl DbTxMut for ClusteredTx<RW> {
     }
 
     fn cursor_write<T: Table>(&self) -> Result<Self::CursorMut<T>, DatabaseError> {
-        self.inner.cursor_write::<T>().map(ClusteredCursor::new)
+        let sharding = self.cursor_sharding::<T>();
+        self.inner.cursor_write::<T>().map(|cursor| ClusteredCursor::new(cursor, sharding))
     }
 
     fn cursor_dup_write<T: DupSort>(&self) -> Result<Self::DupCursorMut<T>, DatabaseError> {
-        self.inner.cursor_dup_write::<T>().map(ClusteredCursor::new)
+        let sharding = self.cursor_sharding::<T>();
+        self.inner.cursor_dup_write::<T>().map(|cursor| ClusteredCursor::new(cursor, sharding))
     }
 }
 

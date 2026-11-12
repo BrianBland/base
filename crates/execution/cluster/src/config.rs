@@ -33,6 +33,9 @@ pub struct ClusterConfig {
     /// Number of storage nodes that own each shard (`R`).
     #[serde(default = "ClusterConfig::default_replication")]
     pub replication: usize,
+    /// Number of most recent blocks an owner can serve reads as of (`W`).
+    #[serde(default = "ClusterConfig::default_retention_blocks")]
+    pub retention_blocks: u64,
     /// Every node of the cluster, including this one.
     pub nodes: Vec<NodeConfig>,
 }
@@ -41,8 +44,15 @@ impl ClusterConfig {
     /// Default replication factor: one owner of each shard may be down.
     pub const DEFAULT_REPLICATION: usize = 2;
 
+    /// Smallest and default retention window `W`: Base's persistence backpressure threshold.
+    pub const MIN_RETENTION_BLOCKS: u64 = 160;
+
     const fn default_replication() -> usize {
         Self::DEFAULT_REPLICATION
+    }
+
+    const fn default_retention_blocks() -> u64 {
+        Self::MIN_RETENTION_BLOCKS
     }
 }
 
@@ -69,6 +79,9 @@ pub enum ConfigError {
         /// Number of storage nodes.
         storage_nodes: usize,
     },
+    /// The retention window is below [`ClusterConfig::MIN_RETENTION_BLOCKS`].
+    #[error("retention_blocks {0} is below the minimum {min}", min = ClusterConfig::MIN_RETENTION_BLOCKS)]
+    RetentionTooShort(u64),
 }
 
 /// A validated cluster configuration with the shard owners precomputed.
@@ -101,6 +114,9 @@ impl Cluster {
                 replication: config.replication,
                 storage_nodes: storage_nodes.len(),
             });
+        }
+        if config.retention_blocks < ClusterConfig::MIN_RETENTION_BLOCKS {
+            return Err(ConfigError::RetentionTooShort(config.retention_blocks));
         }
         let shard_map = ShardMap::new(&storage_nodes, config.replication);
         Ok(Self { config, shard_map })
@@ -175,6 +191,7 @@ mod tests {
         let cluster = Cluster::load(&path).unwrap();
         assert_eq!(cluster.node_id(), NodeId(3));
         assert_eq!(cluster.config().replication, ClusterConfig::DEFAULT_REPLICATION);
+        assert_eq!(cluster.config().retention_blocks, ClusterConfig::MIN_RETENTION_BLOCKS);
         assert_eq!(cluster.address(NodeId(2)), Some("127.0.0.1:9002".parse().unwrap()));
         assert!(cluster.config().nodes[0].storage);
     }
@@ -219,5 +236,9 @@ mod tests {
             parse(&too_many_owners),
             Err(ConfigError::InvalidReplication { replication: 3, storage_nodes: 2 })
         ));
+
+        let short_window =
+            THREE_NODES.replace("node_id = 3", "node_id = 3\nretention_blocks = 159");
+        assert!(matches!(parse(&short_window), Err(ConfigError::RetentionTooShort(159))));
     }
 }
