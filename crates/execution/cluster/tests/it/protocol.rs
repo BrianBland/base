@@ -7,11 +7,12 @@ use std::{
 };
 
 use alloy_eips::BlockNumHash;
-use alloy_primitives::B256;
+use alloy_primitives::{B256, Bytes};
 use base_execution_cluster::{
-    BlockUpdates, ClientError, ClientOptions, Cluster, ClusterClient, ClusterConfig, Frame,
-    NodeConfig, NodeId, OwnerFailure, OwnerServer, OwnerStore, Query, ReadError, ReadResult,
-    Request, Response, ServableRange, Shard, ShardedTable, SnapshotId, StoreError,
+    ApplyFallback, BlockUpdates, ClientError, ClientOptions, Cluster, ClusterClient, ClusterConfig,
+    ExecutedBlocks, Frame, NodeConfig, NodeId, OwnerFailure, OwnerServer, OwnerStore, Query,
+    ReadError, ReadResult, Request, Response, ServableRange, Shard, ShardedTable, SnapshotId,
+    StoreError,
 };
 use reth_db_api::{tables, transaction::DbTxMut};
 use reth_primitives_traits::Bytecode;
@@ -40,6 +41,7 @@ fn cluster_of(
             replication,
             retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
             nodes,
+            apply_from: Vec::new(),
         })
         .unwrap(),
     )
@@ -70,7 +72,7 @@ fn populated_db(shard: Shard) -> (TestFactory, B256) {
 
 fn serve(cluster: &Arc<Cluster>, listener: TcpListener) -> (Arc<OwnerStore<TestTx>>, OwnerServer) {
     let store = Arc::new(OwnerStore::new(Arc::clone(cluster), 160));
-    let server = OwnerServer::spawn(listener, Arc::clone(&store)).unwrap();
+    let server = OwnerServer::spawn(listener, Arc::clone(&store), Arc::default()).unwrap();
     (store, server)
 }
 
@@ -146,7 +148,9 @@ fn every_request_and_error_round_trips_over_a_socket() {
             Ok(Response::Value(Some(_))) => seen_values += 1,
             Ok(Response::Entries(entries)) => assert!(!entries.entries.is_empty()),
             Ok(Response::Duplicates(values)) => assert!(!values.values.is_empty()),
-            Ok(Response::Value(None)) => panic!("expected stored data for {case:?}"),
+            Ok(Response::Value(None) | Response::ExecutedBlock(_)) => {
+                panic!("expected stored data for {case:?}")
+            }
             Err(error) => seen_errors.push(error),
         }
     }
@@ -306,4 +310,104 @@ fn client_returns_a_refusal_that_retrying_cannot_fix() {
             .any(|attempt| matches!(attempt.failure, OwnerFailure::Refused(ReadError::WrongFork)))
     );
     assert!(attempts.iter().any(|attempt| matches!(attempt.failure, OwnerFailure::Unreachable(_))));
+}
+
+/// Node 1 serving execution results on `listener`.
+fn serve_results(listener: TcpListener) -> (Arc<ExecutedBlocks>, OwnerServer) {
+    let view = cluster_of(1, 2, listener.local_addr().unwrap(), closed_port());
+    let executed = Arc::new(ExecutedBlocks::default());
+    let store: Arc<OwnerStore<TestTx>> = Arc::new(OwnerStore::new(view, 160));
+    let server = OwnerServer::spawn(listener, store, Arc::clone(&executed)).unwrap();
+    (executed, server)
+}
+
+/// Stateless node 3 applying from node 1 at `executor`.
+fn applying_client(executor: SocketAddr) -> ClusterClient {
+    let view = cluster_of(3, 2, executor, closed_port());
+    let config = ClusterConfig { apply_from: vec![NodeId(1)], ..view.config().clone() };
+    ClusterClient::new(Arc::new(Cluster::new(config).unwrap()), ClientOptions::default())
+}
+
+const FETCH_BUDGET: Duration = Duration::from_millis(400);
+
+#[test]
+fn executor_serves_a_stored_result_by_hash() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = applying_client(listener.local_addr().unwrap());
+    let (executed, _server) = serve_results(listener);
+    let result = Bytes::from_static(b"encoded result");
+    executed.insert(B256::repeat_byte(1), result.clone());
+    executed.insert(B256::repeat_byte(2), Bytes::from_static(b"another block"));
+
+    assert_eq!(client.executed_block(B256::repeat_byte(1), FETCH_BUDGET), Ok(result));
+}
+
+#[test]
+fn unknown_block_is_not_available_once_the_executor_stops_waiting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = applying_client(listener.local_addr().unwrap());
+    let (_executed, _server) = serve_results(listener);
+
+    let started = Instant::now();
+    let result = client.executed_block(B256::repeat_byte(9), FETCH_BUDGET);
+    let elapsed = started.elapsed();
+    assert_eq!(result, Err(ApplyFallback::Unavailable));
+    assert!(elapsed >= ExecutedBlocks::SERVE_WAIT, "answered before waiting: {elapsed:?}");
+    assert!(elapsed < FETCH_BUDGET + Duration::from_millis(200), "waited {elapsed:?}");
+}
+
+#[test]
+fn fetch_gives_up_at_its_budget_while_the_executor_still_waits() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = applying_client(listener.local_addr().unwrap());
+    let (_executed, _server) = serve_results(listener);
+
+    let budget = Duration::from_millis(50);
+    let started = Instant::now();
+    let result = client.executed_block(B256::repeat_byte(9), budget);
+    let elapsed = started.elapsed();
+    assert_eq!(result, Err(ApplyFallback::Unavailable));
+    assert!(elapsed < ExecutedBlocks::SERVE_WAIT, "waited {elapsed:?}");
+}
+
+#[test]
+fn result_stored_after_the_request_arrives_answers_that_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = applying_client(listener.local_addr().unwrap());
+    let (executed, _server) = serve_results(listener);
+    let hash = B256::repeat_byte(3);
+    let result = Bytes::from_static(b"finished late");
+
+    let finish = {
+        let executed = Arc::clone(&executed);
+        let result = result.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            executed.insert(hash, result);
+        })
+    };
+    assert_eq!(client.executed_block(hash, FETCH_BUDGET), Ok(result));
+    finish.join().unwrap();
+}
+
+#[test]
+fn unreachable_executor_is_reported_as_unreachable() {
+    let client = applying_client(closed_port());
+    assert_eq!(
+        client.executed_block(B256::repeat_byte(1), FETCH_BUDGET),
+        Err(ApplyFallback::Unreachable)
+    );
+}
+
+#[test]
+fn executor_keeps_only_its_most_recent_results() {
+    let executed = ExecutedBlocks::default();
+    let hash = |index: usize| B256::left_padding_from(&index.to_be_bytes());
+    for index in 0..=ExecutedBlocks::CAPACITY {
+        executed.insert(hash(index), Bytes::from(index.to_be_bytes().to_vec()));
+    }
+    assert_eq!(executed.wait_for(hash(0), Duration::ZERO), None);
+    for index in 1..=ExecutedBlocks::CAPACITY {
+        assert!(executed.wait_for(hash(index), Duration::ZERO).is_some(), "lost block {index}");
+    }
 }

@@ -1,5 +1,5 @@
 //! This node's side of a cluster: its owner store and server, its peer client, persistence
-//! points, the commit guard, and shedding.
+//! points, the commit guard, shedding, and the execution results it serves and applies.
 
 use std::{
     fmt, io,
@@ -24,8 +24,8 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 
 use crate::{
-    ClientOptions, Cluster, ClusterClient, KeyPlacement, OwnerServer, OwnerStore, RemoteReadCounts,
-    RemoteReadStats, Shard, ShardedTable,
+    ApplyCounts, ApplyStats, ClientOptions, Cluster, ClusterClient, ExecutedBlocks, KeyPlacement,
+    OwnerServer, OwnerStore, RemoteReadCounts, RemoteReadStats, Shard, ShardedTable,
 };
 
 /// Returns the hash of the canonical block with the given number, when known.
@@ -37,8 +37,8 @@ pub enum ClusterStartError {
     /// The owner server could not be started.
     #[error("failed to start the cluster owner server: {0}")]
     Server(#[from] io::Error),
-    /// The thread logging remote reads could not be started.
-    #[error("failed to start the cluster read stats logger: {0}")]
+    /// A thread logging remote reads or apply-mode outcomes could not be started.
+    #[error("failed to start a cluster stats logger: {0}")]
     StatsLogger(io::Error),
     /// The database could not be read.
     #[error("failed to read the database: {0}")]
@@ -95,6 +95,8 @@ pub struct ClusterNode {
     /// Block of the last persistence point registered.
     registered_point: Mutex<Option<u64>>,
     remote_reads: Arc<RemoteReadStats>,
+    executed_blocks: Arc<ExecutedBlocks>,
+    apply_stats: Arc<ApplyStats>,
 }
 
 impl fmt::Debug for ClusterNode {
@@ -123,9 +125,15 @@ impl ClusterNode {
         let finish = Self::finish_checkpoint(&env.tx()?)?;
         let retention = cluster.config().retention_blocks;
         let owner_store = Arc::new(OwnerStore::new(Arc::clone(&cluster), retention));
-        let server = OwnerServer::spawn(listener, Arc::clone(&owner_store))?;
+        let executed_blocks = Arc::new(ExecutedBlocks::default());
+        let server =
+            OwnerServer::spawn(listener, Arc::clone(&owner_store), Arc::clone(&executed_blocks))?;
         let remote_reads = Arc::new(RemoteReadStats::default());
         remote_reads
+            .spawn_logger(RemoteReadStats::LOG_INTERVAL)
+            .map_err(ClusterStartError::StatsLogger)?;
+        let apply_stats = Arc::new(ApplyStats::default());
+        apply_stats
             .spawn_logger(RemoteReadStats::LOG_INTERVAL)
             .map_err(ClusterStartError::StatsLogger)?;
         let owned = Shard::all().filter(|shard| cluster.owns(*shard)).count();
@@ -134,6 +142,7 @@ impl ClusterNode {
             owned_shards = owned,
             owner_server = %server.local_addr(),
             persisted_tip = finish,
+            apply_from = ?cluster.apply_from(),
             "cluster node started"
         );
         Ok(Self {
@@ -146,6 +155,8 @@ impl ClusterNode {
             committed_finish: Mutex::new(finish),
             registered_point: Mutex::new(None),
             remote_reads,
+            executed_blocks,
+            apply_stats,
         })
     }
 
@@ -185,6 +196,21 @@ impl ClusterNode {
     /// This node's remote reads since it started.
     pub fn remote_reads(&self) -> RemoteReadCounts {
         self.remote_reads.counts()
+    }
+
+    /// The execution results of this node's recent blocks, served to apply nodes.
+    pub const fn executed_blocks(&self) -> &Arc<ExecutedBlocks> {
+        &self.executed_blocks
+    }
+
+    /// The counters of this node's apply-mode outcomes.
+    pub const fn apply_stats(&self) -> &Arc<ApplyStats> {
+        &self.apply_stats
+    }
+
+    /// This node's apply-mode outcomes since it started.
+    pub fn applied_blocks(&self) -> ApplyCounts {
+        self.apply_stats.counts()
     }
 
     /// Installs the block-hash lookup persistence points are registered with. Only the first

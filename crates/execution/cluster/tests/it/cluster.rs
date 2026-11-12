@@ -125,6 +125,7 @@ fn cluster_view(node_id: u64, addresses: &[std::net::SocketAddr]) -> Arc<Cluster
             replication: 2,
             retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
             nodes,
+            apply_from: Vec::new(),
         })
         .unwrap(),
     )

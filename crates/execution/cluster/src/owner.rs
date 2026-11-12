@@ -439,7 +439,8 @@ impl<TX: DbTx + Sync> OwnerStore<TX> {
         self.retained.write().insert_block(block);
     }
 
-    /// Answers `request` as of its snapshot.
+    /// Answers `request` as of its snapshot. Execution results are not state, so
+    /// [`Query::ExecutedBlock`] is `Unsupported` here; the owner server answers it.
     pub fn read(&self, request: &Request) -> Result<Response, StoreError> {
         let table = request.table;
         match &request.query {
@@ -486,6 +487,7 @@ impl<TX: DbTx + Sync> OwnerStore<TX> {
                 let view = self.view(request.snapshot)?;
                 Ok(Response::Duplicates(view.seek_dup_ge(table, key, subkey, *limit as usize)?))
             }
+            Query::ExecutedBlock { .. } => Err(ReadError::Unsupported.into()),
         }
     }
 

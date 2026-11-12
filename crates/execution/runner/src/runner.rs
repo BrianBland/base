@@ -21,7 +21,8 @@ use tokio::sync::broadcast;
 use tracing::info;
 
 use crate::{
-    BaseNodeBuilder, BaseNodeExtension, ClusterFeed, FromExtensionConfig, NodeHooks,
+    ApplyEngineValidatorBuilder, BaseNodeBuilder, BaseNodeExtension, ClusterFeed,
+    FromExtensionConfig, NodeHooks,
     node::BaseNode,
     service::{DefaultPayloadServiceBuilder, PayloadServiceBuilder},
 };
@@ -203,24 +204,45 @@ impl<SB: PayloadServiceBuilder> BaseNodeRunner<SB> {
         }
         let components = service_builder.build_components(&base_node);
         let engine_api = Arc::new(OnceLock::new());
-        let add_ons = base_node.add_ons().with_engine_api(
-            BaseEngineApiBuilder::default().with_in_process_sink(Arc::clone(&engine_api)),
-        );
+        let engine_validator = ApplyEngineValidatorBuilder::default();
+        let add_ons = base_node
+            .add_ons()
+            .with_engine_api(
+                BaseEngineApiBuilder::default().with_in_process_sink(Arc::clone(&engine_api)),
+            )
+            .with_engine_validator(engine_validator.clone());
 
         let builder = builder
             .with_types_and_provider::<BaseNode, BlockchainProvider<_>>()
             .with_components(components)
             .with_add_ons(add_ons);
         let cluster = builder.db().cluster().cloned();
+        if let Some(node) = &cluster {
+            engine_validator.install_cluster(Arc::clone(node));
+        }
+        let owner_feed = cluster.clone();
         let builder = builder.on_component_initialized(move |ctx| {
-            if let Some(node) = cluster {
+            if let Some(node) = owner_feed {
                 let feed = ClusterFeed::start(node, ctx.provider().clone())?;
                 ctx.task_executor().spawn_critical_task("cluster-owner-feed", feed);
             }
             Ok(())
         });
 
-        let hooks = extensions.into_iter().fold(NodeHooks::new(), |hooks, ext| ext.apply(hooks));
+        let mut hooks = NodeHooks::new();
+        // Before every other started hook, so results are kept from the first block a consensus
+        // client started by a later hook delivers.
+        if let Some(node) = cluster {
+            hooks = hooks.add_node_started_hook(move |full_node| {
+                let events = full_node.add_ons_handle.engine_events.new_listener();
+                full_node.task_executor.spawn_critical_task(
+                    "cluster-executed-blocks",
+                    ClusterFeed::serve_executed_blocks(node, events),
+                );
+                Ok(())
+            });
+        }
+        let hooks = extensions.into_iter().fold(hooks, |hooks, ext| ext.apply(hooks));
         let hooks = started_callbacks
             .into_iter()
             .fold(hooks, |hooks, callback| hooks.add_node_started_hook(move |_| callback()));

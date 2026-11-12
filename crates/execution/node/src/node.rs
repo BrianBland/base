@@ -488,6 +488,18 @@ where
         )
     }
 
+    /// Maps the [`EngineValidatorBuilder`] builder type.
+    pub fn with_engine_validator<T>(
+        self,
+        engine_validator_builder: T,
+    ) -> BaseAddOns<N, EthB, PVB, EB, T, RpcMiddleware> {
+        BaseAddOns::new(
+            self.rpc_add_ons.with_engine_validator(engine_validator_builder),
+            self.da_config,
+            self.gas_limit_config,
+        )
+    }
+
     /// Sets the RPC middleware stack for processing RPC requests.
     ///
     /// This method configures a custom middleware stack that will be applied to all RPC requests

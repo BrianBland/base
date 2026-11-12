@@ -134,6 +134,7 @@ async fn seal_one_block_on(storage: Storage, denim: bool, no_tx_pool: bool) -> R
                 replication: 1,
                 retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
                 nodes: vec![node],
+                apply_from: Vec::new(),
             })?;
             ClusteredDatabase::clustered(env, Arc::new(cluster), listener, Default::default())?
         }

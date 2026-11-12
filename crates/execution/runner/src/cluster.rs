@@ -1,9 +1,12 @@
-//! Connects a clustered database to the running node: block hashes for persistence points, and
-//! canonical blocks for the owner store.
+//! Connects a clustered database to the running node: block hashes for persistence points,
+//! canonical blocks for the owner store, and inserted blocks' execution results for apply nodes.
 
 use std::{future::Future, sync::Arc};
 
-use base_execution_cluster::{BlockUpdates, CanonicalBlock, ClusterNode};
+use base_execution_cluster::{BlockUpdates, CanonicalBlock, ClusterNode, ExecutedBlockResult};
+use futures::{Stream, StreamExt};
+use reth_chain_state::ExecutedBlock;
+use reth_node_api::ConsensusEngineEvent;
 use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives};
 use reth_provider::{BlockHashReader, CanonStateNotification, CanonStateSubscriptions, Chain};
 use tokio::sync::broadcast::error::RecvError;
@@ -62,6 +65,39 @@ impl ClusterFeed {
                 ),
                 Err(RecvError::Closed) => return,
             }
+        }
+    }
+
+    /// Keeps the execution result of every block the engine inserts, as `events` report them,
+    /// in `node`'s executed-block store until the events close. Encoding waits for the block's
+    /// trie data, so it runs on a blocking thread.
+    pub async fn serve_executed_blocks<N: NodePrimitives>(
+        node: Arc<ClusterNode>,
+        events: impl Stream<Item = ConsensusEngineEvent<N>>,
+    ) {
+        let mut events = std::pin::pin!(events);
+        while let Some(event) = events.next().await {
+            let (ConsensusEngineEvent::CanonicalBlockAdded(block, _)
+            | ConsensusEngineEvent::ForkBlockAdded(block, _)) = event
+            else {
+                continue;
+            };
+            let node = Arc::clone(&node);
+            tokio::task::spawn_blocking(move || Self::keep_executed_block(&node, &block));
+        }
+    }
+
+    /// Keeps `block`'s execution result in `node`'s executed-block store.
+    pub fn keep_executed_block<N: NodePrimitives>(node: &ClusterNode, block: &ExecutedBlock<N>) {
+        let trie = block.trie_data();
+        let senders = block.recovered_block.senders();
+        match ExecutedBlockResult::new(&block.execution_output, senders, &trie).encode() {
+            Ok(encoded) => node.executed_blocks().insert(block.recovered_block.hash(), encoded),
+            Err(error) => warn!(
+                block = %block.recovered_block.hash(),
+                error = %error,
+                "failed to encode an execution result for apply nodes"
+            ),
         }
     }
 
@@ -136,6 +172,7 @@ mod tests {
             replication: 1,
             retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
             nodes: vec![NodeConfig { id: NodeId(1), address, storage: true }],
+            apply_from: Vec::new(),
         })
         .unwrap();
         let env = Arc::try_unwrap(create_test_rw_db()).unwrap().into_inner_db();

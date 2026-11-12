@@ -38,6 +38,10 @@ pub struct ClusterConfig {
     pub retention_blocks: u64,
     /// Every node of the cluster, including this one.
     pub nodes: Vec<NodeConfig>,
+    /// The nodes this node asks, in order, for the execution results of new payloads instead of
+    /// executing them (apply mode). Empty: this node executes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apply_from: Vec<NodeId>,
 }
 
 impl ClusterConfig {
@@ -82,6 +86,12 @@ pub enum ConfigError {
     /// The retention window is below [`ClusterConfig::MIN_RETENTION_BLOCKS`].
     #[error("retention_blocks {0} is below the minimum {min}", min = ClusterConfig::MIN_RETENTION_BLOCKS)]
     RetentionTooShort(u64),
+    /// `apply_from` lists a node that is not in the cluster.
+    #[error("apply_from lists {0:?}, which is not a cluster node")]
+    UnknownApplySource(NodeId),
+    /// `apply_from` lists this node.
+    #[error("apply_from lists this node {0:?}")]
+    ApplyFromSelf(NodeId),
 }
 
 /// A validated cluster configuration with the shard owners precomputed.
@@ -118,6 +128,12 @@ impl Cluster {
         if config.retention_blocks < ClusterConfig::MIN_RETENTION_BLOCKS {
             return Err(ConfigError::RetentionTooShort(config.retention_blocks));
         }
+        if let Some(source) = config.apply_from.iter().find(|id| !seen.contains(id)) {
+            return Err(ConfigError::UnknownApplySource(*source));
+        }
+        if config.apply_from.contains(&config.node_id) {
+            return Err(ConfigError::ApplyFromSelf(config.node_id));
+        }
         let shard_map = ShardMap::new(&storage_nodes, config.replication);
         Ok(Self { config, shard_map })
     }
@@ -130,6 +146,11 @@ impl Cluster {
     /// The configuration this view was built from.
     pub const fn config(&self) -> &ClusterConfig {
         &self.config
+    }
+
+    /// The nodes this node asks for execution results, in order; empty when it executes.
+    pub fn apply_from(&self) -> &[NodeId] {
+        &self.config.apply_from
     }
 
     /// Owners of `shard`, highest rendezvous score first.
@@ -240,5 +261,19 @@ mod tests {
         let short_window =
             THREE_NODES.replace("node_id = 3", "node_id = 3\nretention_blocks = 159");
         assert!(matches!(parse(&short_window), Err(ConfigError::RetentionTooShort(159))));
+
+        let unknown_source = THREE_NODES.replace("node_id = 3", "node_id = 3\napply_from = [1, 9]");
+        assert!(matches!(parse(&unknown_source), Err(ConfigError::UnknownApplySource(NodeId(9)))));
+
+        let from_self = THREE_NODES.replace("node_id = 3", "node_id = 3\napply_from = [3]");
+        assert!(matches!(parse(&from_self), Err(ConfigError::ApplyFromSelf(NodeId(3)))));
+    }
+
+    #[test]
+    fn apply_from_lists_sources_in_order_and_defaults_to_executing() {
+        assert!(parse(THREE_NODES).unwrap().apply_from().is_empty());
+
+        let applying = THREE_NODES.replace("node_id = 3", "node_id = 3\napply_from = [2, 1]");
+        assert_eq!(parse(&applying).unwrap().apply_from(), [NodeId(2), NodeId(1)]);
     }
 }

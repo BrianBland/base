@@ -2,7 +2,7 @@
 
 use std::io::{self, Read, Write};
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, Bytes};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
@@ -17,7 +17,8 @@ pub struct SnapshotId {
     pub hash: Option<B256>,
 }
 
-/// A read of one sharded table as of a snapshot.
+/// A read of one sharded table as of a snapshot, or a request for a block's execution result
+/// ([`Query::ExecutedBlock`], which ignores the snapshot and the table).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     /// The block the read is answered as of.
@@ -54,6 +55,13 @@ pub enum Query {
         /// Largest number of values wanted.
         limit: u32,
     },
+    /// The execution result of block `hash`, encoded as an
+    /// [`ExecutedBlockResult`](crate::ExecutedBlockResult). Answered by any node that inserted
+    /// the block recently; the snapshot and table of the request are ignored.
+    ExecutedBlock {
+        /// Hash of the block.
+        hash: B256,
+    },
 }
 
 /// Entries returned by [`Query::SeekGe`].
@@ -83,6 +91,8 @@ pub enum Response {
     Entries(ShardEntries),
     /// Answer to [`Query::SeekDupGe`].
     Duplicates(DuplicateValues),
+    /// Answer to [`Query::ExecutedBlock`]: the encoded execution result.
+    ExecutedBlock(Bytes),
 }
 
 /// Inclusive range of blocks an owner can answer as of.
@@ -112,6 +122,9 @@ pub enum ReadError {
     /// The query is not supported for the table, or a key is malformed.
     #[error("unsupported query")]
     Unsupported,
+    /// The node has no execution result for the requested block.
+    #[error("execution result not available")]
+    NotAvailable,
 }
 
 impl ReadError {
@@ -122,7 +135,7 @@ impl ReadError {
             Self::SnapshotUnavailable { servable } => {
                 servable.is_none_or(|range| range.highest < number)
             }
-            Self::WrongFork | Self::NotOwner | Self::Unsupported => false,
+            Self::WrongFork | Self::NotOwner | Self::Unsupported | Self::NotAvailable => false,
         }
     }
 }

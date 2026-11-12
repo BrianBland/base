@@ -3,5 +3,6 @@
 
 mod cluster;
 mod common;
+mod executed;
 mod owner_store;
 mod protocol;

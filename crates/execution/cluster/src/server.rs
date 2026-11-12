@@ -1,4 +1,5 @@
-//! Owner server: answers peer read requests from an [`OwnerStore`] on its own threads.
+//! Owner server: answers peer read requests from an [`OwnerStore`], and execution-result requests
+//! from [`ExecutedBlocks`], on its own threads.
 
 use std::{
     collections::HashMap,
@@ -15,7 +16,9 @@ use parking_lot::Mutex;
 use reth_db_api::transaction::DbTx;
 use tracing::{debug, error};
 
-use crate::{Frame, OwnerStore, ReadResult, Request, StoreError};
+use crate::{
+    ExecutedBlocks, Frame, OwnerStore, Query, ReadError, ReadResult, Request, Response, StoreError,
+};
 
 /// A running owner server. Dropping it stops accepting and closes open connections.
 #[derive(Debug)]
@@ -27,11 +30,12 @@ pub struct OwnerServer {
 }
 
 impl OwnerServer {
-    /// Serves `store` on `listener`: one thread accepts, and each connection is served on its own
-    /// thread, one request at a time.
+    /// Serves `store` and `executed` on `listener`: one thread accepts, and each connection is
+    /// served on its own thread, one request at a time.
     pub fn spawn<TX: DbTx + Sync + 'static>(
         listener: TcpListener,
         store: Arc<OwnerStore<TX>>,
+        executed: Arc<ExecutedBlocks>,
     ) -> io::Result<Self> {
         let local_addr = listener.local_addr()?;
         let stopping = Arc::new(AtomicBool::new(false));
@@ -51,7 +55,9 @@ impl OwnerServer {
                             continue;
                         }
                     };
-                    if let Err(error) = Self::serve_connection(id, stream, &store, &connections) {
+                    let served =
+                        Self::serve_connection(id, stream, &store, &executed, &connections);
+                    if let Err(error) = served {
                         error!(error = %error, "failed to start cluster owner connection");
                     }
                 }
@@ -69,21 +75,27 @@ impl OwnerServer {
         id: u64,
         stream: TcpStream,
         store: &Arc<OwnerStore<TX>>,
+        executed: &Arc<ExecutedBlocks>,
         connections: &Arc<Mutex<HashMap<u64, TcpStream>>>,
     ) -> io::Result<()> {
         stream.set_nodelay(true)?;
         connections.lock().insert(id, stream.try_clone()?);
         let store = Arc::clone(store);
+        let executed = Arc::clone(executed);
         let connections = Arc::clone(connections);
         std::thread::Builder::new().name("cluster-owner-conn".into()).spawn(move || {
-            Self::answer_requests(stream, &store);
+            Self::answer_requests(stream, &store, &executed);
             connections.lock().remove(&id);
         })?;
         Ok(())
     }
 
     /// Answers requests until the peer disconnects, a frame is malformed, or the store fails.
-    fn answer_requests<TX: DbTx + Sync>(mut stream: TcpStream, store: &OwnerStore<TX>) {
+    fn answer_requests<TX: DbTx + Sync>(
+        mut stream: TcpStream,
+        store: &OwnerStore<TX>,
+        executed: &ExecutedBlocks,
+    ) {
         loop {
             let request: Request = match Frame::read(&mut stream) {
                 Ok(request) => request,
@@ -92,12 +104,20 @@ impl OwnerServer {
                     return;
                 }
             };
-            let result: ReadResult = match store.read(&request) {
-                Ok(response) => Ok(response),
-                Err(StoreError::Refused(refusal)) => Err(refusal),
-                Err(StoreError::Database(error)) => {
-                    error!(error = %error, table = ?request.table, "cluster owner read failed");
-                    return;
+            let result: ReadResult = match request.query {
+                Query::ExecutedBlock { hash } => executed
+                    .wait_for(hash, ExecutedBlocks::SERVE_WAIT)
+                    .map(Response::ExecutedBlock)
+                    .ok_or(ReadError::NotAvailable),
+                Query::Get { .. } | Query::SeekGe { .. } | Query::SeekDupGe { .. } => {
+                    match store.read(&request) {
+                        Ok(response) => Ok(response),
+                        Err(StoreError::Refused(refusal)) => Err(refusal),
+                        Err(StoreError::Database(error)) => {
+                            error!(error = %error, table = ?request.table, "cluster owner read failed");
+                            return;
+                        }
+                    }
                 }
             };
             if let Err(error) = Frame::write(&mut stream, &result) {

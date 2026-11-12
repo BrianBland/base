@@ -19,6 +19,9 @@ pub use runner::{BaseNodeRunner, LaunchedBaseNode};
 mod cluster;
 pub use cluster::ClusterFeed;
 
+mod apply;
+pub use apply::{ApplyEngineValidator, ApplyEngineValidatorBuilder, ApplyError, BlockApplier};
+
 mod service;
 pub use service::{DefaultPayloadServiceBuilder, PayloadServiceBuilder};
 

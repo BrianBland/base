@@ -20,10 +20,11 @@ use reth_node_builder::{
     Node, NodeAdapter, NodeComponentsBuilder,
     components::ComponentsBuilder,
     node::{FullNodeTypes, NodeTypes},
-    rpc::BasicEngineValidatorBuilder,
 };
 use reth_provider::providers::ProviderFactoryBuilder;
 use reth_rpc_api::eth::RpcTypes;
+
+use crate::ApplyEngineValidatorBuilder;
 
 /// Type configuration for a regular Base node.
 #[derive(Debug, Clone)]
@@ -225,7 +226,7 @@ where
         BaseEthApiBuilder,
         BasePayloadValidatorBuilder,
         BaseEngineApiBuilder<BasePayloadValidatorBuilder>,
-        BasicEngineValidatorBuilder<BasePayloadValidatorBuilder>,
+        ApplyEngineValidatorBuilder,
     >;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {

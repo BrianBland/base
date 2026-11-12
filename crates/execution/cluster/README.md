@@ -35,12 +35,14 @@ historical state RPC older than the persisted tip, reth storage v1.
   bytes after the shard byte.
 - A node reads the placement from a TOML file. The file is rejected when node ids repeat,
   `node_id` is not listed, `R` is 0 or larger than the number of storage nodes, or the retention
-  window `W` (see [Owner side](#owner-side)) is below 160.
+  window `W` (see [Owner side](#owner-side)) is below 160, or `apply_from` (see
+  [Apply mode](#apply-mode)) lists an unknown node or this node.
 
 ```toml
 node_id = 1          # this node
 replication = 2      # R, optional, default 2
 retention_blocks = 160  # W, optional, default 160
+apply_from = [2]     # optional, default [] (execute); see Apply mode
 
 [[nodes]]
 id = 1
@@ -206,10 +208,12 @@ Keys and values travel as the encoded table bytes MDBX stores, so the protocol i
 | `Get { table, key }` | `HashedAccounts`, `AccountsTrie`, `Bytecodes` | value or absent |
 | `SeekGe { table, key, limit }` | `HashedAccounts`, `AccountsTrie` | up to `limit` entries with key `>=` the given key, ascending, within the key's shard; `end_of_shard` flag |
 | `SeekDupGe { table, key, subkey, limit }` | `HashedStorages`, `StoragesTrie` | up to `limit` duplicate entries of exactly `key` with subkey `>=` the given subkey; `end_of_key` flag |
+| `ExecutedBlock { hash }` | none (see [Apply mode](#apply-mode)) | the block's encoded execution result |
 
 Every request carries the snapshot `P`. Errors: `SnapshotUnavailable` (with the range the owner can
-serve), `WrongFork`, `NotOwner`, `Unsupported`. Iterating across keys of a duplicate-key table is
-`Unsupported` remotely; no live read path needs it, and so is a key or subkey of the wrong length.
+serve), `WrongFork`, `NotOwner`, `Unsupported`, and `NotAvailable` for `ExecutedBlock`. Iterating
+across keys of a duplicate-key table is `Unsupported` remotely; no live read path needs it, and so
+is a key or subkey of the wrong length.
 
 - The shard of a `SeekGe` is the shard of its key. Replicated `AccountsTrie` keys are never
   returned by `SeekGe` (every node holds them), but `Get` answers them.
@@ -241,6 +245,49 @@ sequenceDiagram
     O-->>A: entries | SnapshotUnavailable
     A-->>E: entry (as if local at P)
 ```
+
+## Apply mode
+
+A node in apply mode does not execute the blocks its consensus layer delivers: it takes each
+block's execution result from a peer that executed it, checks it against the header, and inserts
+it as an executed block. Persistence, canonical notifications, the owner feed, the pool and RPC
+then see an executed block as usual. It saves the execution's remote reads on a node that stores
+few or no shards.
+
+- Roles: an **executor** executes blocks as today and serves their results; an **apply node**
+  asks executors for results. Either may store shards or none. Every clustered node serves the
+  results of blocks it inserted (executed or applied), so any node can be an executor.
+- Config: `apply_from = [ids]` at the top level of the cluster TOML lists the nodes this node
+  asks, in order. Absent or empty: the node executes. An id that is not a cluster node, or is
+  this node, is rejected.
+- Executor: keeps the results of its 64 most recent inserted blocks, keyed by block hash, filled
+  from the engine's block-added event (the earliest point a complete result exists, before
+  forkchoice). A result holds the receipts, requests, gas used, blob gas used, the bundle state
+  with reverts, the transaction senders, and the block's sorted hashed state and trie updates.
+- Wire: `Get` gains a sibling query `ExecutedBlock { hash }` on the owner port (its snapshot and
+  table are ignored). The executor answers the encoded result, waiting up to 250 ms for a block
+  it has not inserted yet, or refuses with `NotAvailable`. Other requests keep their encoding.
+- Apply node, for each new payload: convert the payload and run the header, header-against-parent
+  and pre-execution body checks, as execution does; ask the `apply_from` nodes in order within
+  400 ms in total; then run the post-execution checks execution runs on the result: gas used,
+  receipts root, logs bloom and requests (reth's consensus), and Base's message-passer storage
+  root and block-time checks against the result's hashed state.
+- Trusted, not checked: the state root (the hashed state and trie updates are not recomputed),
+  the bundle state, and the senders (signatures are not recovered).
+- Fallback: when no result arrives in time, a peer is unreachable, the result does not decode or
+  fails a check, the payload carries a block access list, or the parent's header or state is not
+  available (a parent off the canonical chain), the node logs a warning and executes the block
+  exactly as today. Apply mode never stalls a node and never changes what it accepts. Blocks
+  downloaded from the network (not new payloads) are always executed.
+- Counters: applied blocks, fallbacks by reason (`unavailable`, `unreachable`, `invalid`,
+  `ineligible`) and time spent fetching, in `ClusterNode::applied_blocks`, the metrics
+  `base_cluster_applied_blocks` and `base_cluster_apply_fallbacks{reason}`, and a `cluster apply`
+  log line every 10 seconds in which a block was applied or fell back.
+
+Limits: the fetch runs on the engine thread, so a slow executor delays forkchoice handling by up
+to the 400 ms budget per block. Two nodes that apply from each other only wait for each other and
+then execute. An apply node does not warm reth's execution cache, so a fallback execution starts
+cold.
 
 ## Bootstrap
 

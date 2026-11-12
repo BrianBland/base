@@ -2,17 +2,20 @@
 
 use std::{
     collections::HashMap,
+    io,
     net::TcpStream,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use alloy_primitives::{B256, Bytes};
 use parking_lot::Mutex;
 use thiserror::Error;
+use tracing::debug;
 
 use crate::{
-    Cluster, DuplicateValues, Frame, FrameError, NodeId, Query, ReadError, ReadResult, Request,
-    Response, Shard, ShardEntries, ShardedTable, SnapshotId,
+    ApplyFallback, Cluster, DuplicateValues, Frame, FrameError, NodeId, Query, ReadError,
+    ReadResult, Request, Response, Shard, ShardEntries, ShardedTable, SnapshotId,
 };
 
 /// Timeouts, retry budget, and pool size of a [`ClusterClient`].
@@ -106,7 +109,9 @@ impl ClusterClient {
         let query = Query::Get { key: key.to_vec() };
         match self.read(Request { snapshot, table, query }, key)? {
             Response::Value(value) => Ok(value),
-            Response::Entries(_) | Response::Duplicates(_) => unreachable!("checked by read"),
+            Response::Entries(_) | Response::Duplicates(_) | Response::ExecutedBlock(_) => {
+                unreachable!("checked by read")
+            }
         }
     }
 
@@ -121,7 +126,9 @@ impl ClusterClient {
         let query = Query::SeekGe { key: key.to_vec(), limit };
         match self.read(Request { snapshot, table, query }, key)? {
             Response::Entries(entries) => Ok(entries),
-            Response::Value(_) | Response::Duplicates(_) => unreachable!("checked by read"),
+            Response::Value(_) | Response::Duplicates(_) | Response::ExecutedBlock(_) => {
+                unreachable!("checked by read")
+            }
         }
     }
 
@@ -137,8 +144,94 @@ impl ClusterClient {
         let query = Query::SeekDupGe { key: key.to_vec(), subkey: subkey.to_vec(), limit };
         match self.read(Request { snapshot, table, query }, key)? {
             Response::Duplicates(values) => Ok(values),
-            Response::Value(_) | Response::Entries(_) => unreachable!("checked by read"),
+            Response::Value(_) | Response::Entries(_) | Response::ExecutedBlock(_) => {
+                unreachable!("checked by read")
+            }
         }
+    }
+
+    /// The encoded execution result of block `hash` from the first of the cluster's `apply_from`
+    /// nodes that has it, asking them in order within `budget` in total. Fails with
+    /// [`ApplyFallback::Unavailable`] when a node was reached but none answered with the result
+    /// in time, and [`ApplyFallback::Unreachable`] when no node was reached.
+    pub fn executed_block(&self, hash: B256, budget: Duration) -> Result<Bytes, ApplyFallback> {
+        let deadline = Instant::now() + budget;
+        let request = Request {
+            snapshot: SnapshotId { number: 0, hash: None },
+            table: ShardedTable::HashedAccounts,
+            query: Query::ExecutedBlock { hash },
+        };
+        let mut failure = ApplyFallback::Unreachable;
+        for &node in self.cluster.apply_from() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ApplyFallback::Unavailable);
+            }
+            match self.ask_within(node, &request, remaining) {
+                Ok(Ok(Response::ExecutedBlock(result))) => return Ok(result),
+                Ok(Ok(_)) => {
+                    debug!(node = node.0, "unexpected answer to an execution result request")
+                }
+                Ok(Err(refusal)) => {
+                    debug!(node = node.0, refusal = %refusal, "execution result refused");
+                    failure = ApplyFallback::Unavailable;
+                }
+                Err(error) => {
+                    debug!(node = node.0, error = %error, "execution result request failed");
+                    if Self::timed_out(&error) {
+                        failure = ApplyFallback::Unavailable;
+                    }
+                }
+            }
+        }
+        Err(failure)
+    }
+
+    /// Whether `error` is a socket timeout: the peer was reached but did not answer in time.
+    fn timed_out(error: &FrameError) -> bool {
+        matches!(error, FrameError::Io(io) if matches!(io.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
+    }
+
+    /// Asks `node` and waits at most `within` for its answer, on a pooled connection when one is
+    /// idle, replaced by a fresh one once if it fails and time remains.
+    fn ask_within(
+        &self,
+        node: NodeId,
+        request: &Request,
+        within: Duration,
+    ) -> Result<ReadResult, FrameError> {
+        let deadline = Instant::now() + within;
+        let idle = self.pools[&node].lock().pop();
+        if let Some(stream) = idle {
+            match self.exchange_within(node, stream, request, within) {
+                Ok(result) => return Ok(result),
+                Err(error) if Self::timed_out(&error) => return Err(error),
+                Err(_) => {}
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(FrameError::Io(io::ErrorKind::TimedOut.into()));
+        }
+        let stream = self.connect_within(node, remaining)?;
+        self.exchange_within(node, stream, request, remaining)
+    }
+
+    /// Like [`Self::exchange`], with the reply awaited at most `within`. The connection goes back
+    /// to the pool with its usual timeout.
+    fn exchange_within(
+        &self,
+        node: NodeId,
+        mut stream: TcpStream,
+        request: &Request,
+        within: Duration,
+    ) -> Result<ReadResult, FrameError> {
+        stream.set_read_timeout(Some(within))?;
+        Frame::write(&mut stream, request)?;
+        let result = Frame::read(&mut stream)?;
+        stream.set_read_timeout(Some(self.options.io_timeout))?;
+        self.release(node, stream);
+        Ok(result)
     }
 
     /// Sends `request` to the owners of `key`'s shard until one answers with the response kind
@@ -201,13 +294,21 @@ impl ClusterClient {
             (Query::Get { .. }, Response::Value(_))
                 | (Query::SeekGe { .. }, Response::Entries(_))
                 | (Query::SeekDupGe { .. }, Response::Duplicates(_))
+                | (Query::ExecutedBlock { .. }, Response::ExecutedBlock(_))
         );
         if expected { Ok(response) } else { Err(OwnerFailure::UnexpectedResponse) }
     }
 
     fn connect(&self, node: NodeId) -> Result<TcpStream, FrameError> {
-        let address = self.cluster.address(node).expect("owners are listed cluster nodes");
-        let stream = TcpStream::connect_timeout(&address, self.options.connect_timeout)?;
+        self.connect_within(node, self.options.connect_timeout)
+    }
+
+    /// Connects to `node`, waiting at most `within` (and never longer than the configured connect
+    /// timeout).
+    fn connect_within(&self, node: NodeId, within: Duration) -> Result<TcpStream, FrameError> {
+        let address = self.cluster.address(node).expect("asked nodes are listed cluster nodes");
+        let timeout = within.min(self.options.connect_timeout);
+        let stream = TcpStream::connect_timeout(&address, timeout)?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(self.options.io_timeout))?;
         stream.set_write_timeout(Some(self.options.io_timeout))?;
@@ -223,10 +324,15 @@ impl ClusterClient {
     ) -> Result<ReadResult, FrameError> {
         Frame::write(&mut stream, request)?;
         let result = Frame::read(&mut stream)?;
+        self.release(node, stream);
+        Ok(result)
+    }
+
+    /// Returns a healthy connection to `node`'s pool, unless the pool is full.
+    fn release(&self, node: NodeId, stream: TcpStream) {
         let mut idle = self.pools[&node].lock();
         if idle.len() < self.options.max_idle_per_owner {
             idle.push(stream);
         }
-        Ok(result)
     }
 }

@@ -20,7 +20,9 @@ mod node;
 pub use node::{BlockHashLookup, ClusterNode, ClusterStartError, CommitRefusal};
 
 mod stats;
-pub use stats::{RemoteReadCounts, RemoteReadKind, RemoteReadStats};
+pub use stats::{
+    ApplyCounts, ApplyFallback, ApplyStats, RemoteReadCounts, RemoteReadKind, RemoteReadStats,
+};
 
 mod placement;
 pub use placement::{KeyPlacement, NodeId, Shard, ShardMap, ShardedTable};
@@ -39,6 +41,9 @@ pub use owner::{
     BlockUpdates, CachedOverlay, CanonicalBlock, OwnerStore, PersistencePoint, ResolvedSnapshot,
     RetainedChain, SnapshotView, StateOverlay, StoreError,
 };
+
+mod executed;
+pub use executed::{ExecutedBlockParts, ExecutedBlockResult, ExecutedBlocks, RecentResults};
 
 mod server;
 pub use server::OwnerServer;

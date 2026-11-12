@@ -72,6 +72,7 @@ pub(crate) fn cluster(node_id: u64) -> Arc<Cluster> {
             replication: 2,
             retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
             nodes,
+            apply_from: Vec::new(),
         })
         .unwrap(),
     )
