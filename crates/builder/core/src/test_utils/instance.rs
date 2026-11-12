@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use base_common_evm::BaseUpgrade;
 use base_common_network::Base;
 use base_execution_chainspec::BaseChainSpec;
+use base_execution_cluster::ClusteredDatabase;
 use base_execution_txpool::BasePooledTransaction;
 use base_node_core::args::RollupArgs;
 use base_node_runner::{
@@ -219,12 +220,12 @@ impl LocalInstance {
         let (pool_handle_tx, pool_handle_rx) =
             oneshot::channel::<Arc<dyn ExternalTransactionPool>>();
 
-        // The node types fix the database to the concrete `DatabaseEnv`, so the test database must
-        // be a bare `DatabaseEnv` (not a `TempDatabase`) for the extension hook types to line up.
+        // The node types fix the database to `ClusteredDatabase`, which wraps a bare `DatabaseEnv`
+        // (not a `TempDatabase`), so the extension hook types line up.
         let (db, db_dir) = create_test_db_env(node_config.clone())?;
 
         let builder = NodeBuilder::<_, BaseChainSpec>::new(node_config.clone())
-            .with_database(db)
+            .with_database(ClusteredDatabase::new(db))
             .with_launch_context(runtime.clone())
             .with_types_and_provider::<BaseNode, BlockchainProvider<_>>()
             .with_components(components)

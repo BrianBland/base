@@ -202,8 +202,8 @@ pub fn create_test_db(config: NodeConfig<BaseChainSpec>) -> Arc<TempDatabase<Dat
 /// Creates a persistent MDBX [`DatabaseEnv`] in a fresh temporary directory.
 ///
 /// Unlike [`create_test_db`], this returns the concrete `DatabaseEnv` (not wrapped in
-/// [`TempDatabase`]) so the resulting node matches the production database type used by the node
-/// builder's type bounds. This is required when applying node extensions whose hooks are typed
+/// [`TempDatabase`]) so it can be wrapped in the production `ClusteredDatabase` required by the
+/// node builder's type bounds. This is required when applying node extensions whose hooks are typed
 /// against the concrete node types. The returned [`PathBuf`] is the temporary directory backing the
 /// database; the caller is responsible for removing it once the database has been dropped.
 pub fn create_test_db_env(

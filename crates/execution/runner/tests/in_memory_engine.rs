@@ -24,6 +24,7 @@ use base_common_rpc_types_engine::{BasePayloadAttributes, PayloadReady};
 use base_consensus_engine::{EngineClient, EngineClientBuilder, EngineEndpoint, InMemoryTransport};
 use base_consensus_providers::L1_RPC_TIMEOUT;
 use base_execution_chainspec::BaseChainSpec;
+use base_execution_cluster::ClusteredDatabase;
 use base_node_core::args::RollupArgs;
 use base_node_runner::{
     BaseNodeRunner,
@@ -94,12 +95,14 @@ async fn seal_one_block(denim: bool, no_tx_pool: bool) -> Result<()> {
         datadir: MaybePlatformPath::<DataDirPath>::from(data_path.clone()),
         ..Default::default()
     });
-    let db = init_db(
-        node_config.datadir().db(),
-        DatabaseArguments::new(ClientVersion::default())
-            .with_geometry_max_size(Some(100 * 1024 * 1024)),
-    )
-    .wrap_err("Failed to create test database")?;
+    let db = ClusteredDatabase::new(
+        init_db(
+            node_config.datadir().db(),
+            DatabaseArguments::new(ClientVersion::default())
+                .with_geometry_max_size(Some(100 * 1024 * 1024)),
+        )
+        .wrap_err("Failed to create test database")?,
+    );
 
     let runtime = Runtime::test();
     let mut launched = BaseNodeRunner::new(RollupArgs::default())

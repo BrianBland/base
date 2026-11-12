@@ -23,16 +23,12 @@ mod standard_node;
 use std::{ffi::OsString, fmt, marker::PhantomData};
 
 pub use app::CliApp;
-use base_execution_chainspec::BaseChainSpec;
 use base_node_core::args::RollupArgs;
-use chainspec::BaseChainSpecParser;
+use base_node_runner::BaseNodeBuilder;
 use clap::Parser;
 use commands::Commands;
 use futures::Future;
-use reth_cli_commands::launcher::FnLauncher;
 use reth_cli_runner::CliRunner;
-use reth_db::DatabaseEnv;
-use reth_node_builder::{NodeBuilder, WithLaunchContext};
 use reth_node_core::{
     args::{LogArgs, TraceArgs},
     version::version_metadata,
@@ -108,11 +104,11 @@ where
 
     /// Execute the configured cli command.
     ///
-    /// This accepts a closure that is used to launch the node via the
+    /// This accepts a closure that is used to launch the node for the
     /// [`NodeCommand`](reth_cli_commands::node::NodeCommand).
     pub fn run<L, Fut>(self, launcher: L) -> eyre::Result<()>
     where
-        L: FnOnce(WithLaunchContext<NodeBuilder<DatabaseEnv, BaseChainSpec>>, Ext) -> Fut,
+        L: FnOnce(BaseNodeBuilder, Ext) -> Fut,
         Fut: Future<Output = eyre::Result<()>>,
     {
         self.with_runner(CliRunner::try_default_runtime()?, launcher)
@@ -121,14 +117,12 @@ where
     /// Execute the configured cli command with the provided [`CliRunner`].
     pub fn with_runner<L, Fut>(self, runner: CliRunner, launcher: L) -> eyre::Result<()>
     where
-        L: FnOnce(WithLaunchContext<NodeBuilder<DatabaseEnv, BaseChainSpec>>, Ext) -> Fut,
+        L: FnOnce(BaseNodeBuilder, Ext) -> Fut,
         Fut: Future<Output = eyre::Result<()>>,
     {
         let mut this = self.configure();
         this.set_runner(runner);
-        this.run(FnLauncher::new::<BaseChainSpecParser, Ext>(async move |builder, chain_spec| {
-            launcher(builder, chain_spec).await
-        }))
+        this.run(launcher)
     }
 }
 

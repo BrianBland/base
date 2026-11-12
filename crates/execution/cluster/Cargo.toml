@@ -1,0 +1,24 @@
+[package]
+name = "base-execution-cluster"
+description = "Clustered Base: state sharding across a group of co-trusted Base execution nodes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-db = { workspace = true, features = ["mdbx"] }
+
+# metrics
+metrics.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+alloy-primitives.workspace = true
+reth-primitives-traits.workspace = true

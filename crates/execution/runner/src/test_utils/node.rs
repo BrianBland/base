@@ -6,11 +6,10 @@ use alloy_provider::RootProvider;
 use alloy_rpc_client::RpcClient;
 use base_common_network::Base;
 use base_execution_chainspec::BaseChainSpec;
+use base_execution_cluster::ClusteredDatabase;
 use base_node_core::args::RollupArgs;
 use eyre::Result;
-use reth_db::{
-    ClientVersion, DatabaseEnv, init_db, mdbx::DatabaseArguments, test_utils::tempdir_path,
-};
+use reth_db::{ClientVersion, init_db, mdbx::DatabaseArguments, test_utils::tempdir_path};
 use reth_node_builder::{Node, NodeBuilder, NodeConfig, NodeHandle};
 use reth_node_core::{
     args::{DatadirArgs, DiscoveryArgs, NetworkArgs, RpcServerArgs},
@@ -150,12 +149,12 @@ impl LocalNode {
     }
 
     /// Creates a test database with a 100 MB map size (vs reth's default 8 TB).
-    fn create_test_database() -> Result<(DatabaseEnv, PathBuf)> {
+    fn create_test_database() -> Result<(ClusteredDatabase, PathBuf)> {
         let path = tempdir_path();
         let args = DatabaseArguments::new(ClientVersion::default())
             .with_geometry_max_size(Some(100 * 1024 * 1024));
         let db = init_db(&path, args).expect("Failed to create test database");
-        Ok((db, path))
+        Ok((ClusteredDatabase::new(db), path))
     }
 
     /// Create an HTTP provider pointed at the node's public RPC endpoint.

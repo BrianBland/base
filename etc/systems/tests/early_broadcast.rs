@@ -44,6 +44,7 @@ use base_consensus_node::{
     StandaloneAttributesBuilder, StandaloneDerivationClient, StandaloneOriginSelector,
 };
 use base_execution_chainspec::BaseChainSpec;
+use base_execution_cluster::ClusteredDatabase;
 use base_node_core::args::RollupArgs;
 use base_node_runner::{
     BaseNodeRunner, LaunchedBaseNode,
@@ -251,7 +252,7 @@ async fn searcher_reactions(early_broadcast: bool) -> Result<Vec<Reaction>> {
             .with_service_builder(NativePayloadServiceBuilder::new(BuilderConfig::default()))
             .launch(
                 NodeBuilder::new(node_config)
-                    .with_database(db)
+                    .with_database(ClusteredDatabase::new(db))
                     .with_launch_context(runtime.clone()),
             )
             .await?;

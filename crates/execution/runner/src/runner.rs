@@ -7,6 +7,7 @@ use std::{
 
 use base_common_network::SharedEngineApi;
 use base_common_rpc_types_engine::PayloadReady;
+use base_execution_cluster::ClusteredDatabase;
 use base_execution_payload_builder::{
     RejectionCache,
     config::{BaseDAConfig, GasLimitConfig, ResourceMeteringConfig},
@@ -34,7 +35,7 @@ const PAYLOAD_READY_CAPACITY: usize = 16;
 #[derive(Debug)]
 pub struct LaunchedBaseNode {
     /// The underlying reth node handle.
-    pub handle: NodeHandleFor<BaseNode>,
+    pub handle: NodeHandleFor<BaseNode, ClusteredDatabase>,
     /// The fully merged authenticated RPC module (Engine API plus auth-only methods), for
     /// in-process callers that want to skip the auth server's transports.
     pub auth_module: RpcModule<()>,

@@ -4,8 +4,9 @@ use base_execution_chainspec::BaseChainSpec;
 use base_execution_consensus::BaseBeaconConsensus;
 use base_execution_evm::BaseExecutorProvider;
 use base_node_core::BaseNode;
+use base_node_runner::BaseNodeBuilder;
 use eyre::{Result, eyre};
-use reth_cli_commands::launcher::Launcher;
+use futures::Future;
 use reth_cli_runner::CliRunner;
 use reth_node_core::args::{OtlpInitStatus, OtlpLogsStatus};
 use reth_node_metrics::recorder::install_prometheus_recorder;
@@ -13,7 +14,7 @@ use reth_rpc_server_types::RpcModuleValidator;
 use reth_tracing::{Layers, TracingGuards};
 use tracing::{info, warn};
 
-use crate::{Cli, Commands};
+use crate::{Cli, Commands, ExecutionNodeRuntimeConfig};
 
 /// A wrapper around a parsed CLI that handles command execution.
 #[derive(Debug)]
@@ -50,12 +51,13 @@ where
 
     /// Execute the configured cli command.
     ///
-    /// This accepts a closure that is used to launch the node via the
+    /// This accepts a closure that is used to launch the node for the
     /// [`NodeCommand`](reth_cli_commands::node::NodeCommand).
-    pub fn run(
-        mut self,
-        launcher: impl Launcher<crate::chainspec::BaseChainSpecParser, Ext>,
-    ) -> Result<()> {
+    pub fn run<L, Fut>(mut self, launcher: L) -> Result<()>
+    where
+        L: FnOnce(BaseNodeBuilder, Ext) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
         let runner = match self.runner.take() {
             Some(runner) => runner,
             None => CliRunner::try_default_runtime()?,
@@ -82,15 +84,10 @@ where
 
         match self.cli.command {
             Commands::Node(command) => {
-                // Validate RPC modules using the configured validator
-                if let Some(http_api) = &command.rpc.http_api {
-                    Rpc::validate_selection(http_api, "http.api").map_err(|e| eyre!("{e}"))?;
-                }
-                if let Some(ws_api) = &command.rpc.ws_api {
-                    Rpc::validate_selection(ws_api, "ws.api").map_err(|e| eyre!("{e}"))?;
-                }
-
-                runner.run_command_until_exit(|ctx| command.execute(ctx, launcher))
+                let (runtime, ext) = ExecutionNodeRuntimeConfig::from_node_command(*command)?;
+                runner.run_command_until_exit(|ctx| async move {
+                    launcher(runtime.into_node_builder::<Rpc>(ctx)?, ext).await
+                })
             }
             Commands::Init(command) => {
                 let runtime = runner.runtime();

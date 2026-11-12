@@ -204,6 +204,7 @@ base-execution-rpc = { path = "crates/execution/rpc" }
 base-metering = { path = "crates/execution/metering" }
 base-node-runner = { path = "crates/execution/runner" }
 base-execution-exex = { path = "crates/execution/exex" }
+base-execution-cluster = { path = "crates/execution/cluster" }
 base-execution-trie = { path = "crates/execution/trie" }
 base-txpool-rpc = { path = "crates/execution/txpool-rpc" }
 base-execution-txpool = { path = "crates/execution/txpool" }

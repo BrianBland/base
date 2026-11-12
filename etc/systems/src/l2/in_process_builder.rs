@@ -11,6 +11,7 @@ use alloy_primitives::hex::ToHexExt;
 use alloy_rpc_types_engine::JwtSecret;
 use base_builder_core::{BuilderConfig, NativePayloadServiceBuilder};
 use base_execution_chainspec::BaseChainSpec;
+use base_execution_cluster::ClusteredDatabase;
 use base_execution_txpool::{
     BasePooledTransaction, BuilderApiImpl, BuilderApiServer, DEFAULT_MAX_VALIDITY_PREDICATES,
     ValiditySignatureMode,
@@ -209,7 +210,7 @@ impl InProcessBuilder {
         });
 
         let node_builder = NodeBuilder::new(node_config.clone())
-            .with_database(db)
+            .with_database(ClusteredDatabase::new(db))
             .with_launch_context(runtime.clone())
             .with_types::<BaseNode>();
 

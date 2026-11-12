@@ -20,6 +20,7 @@ use base_common_rpc_types_engine::{
     BaseExecutionPayloadEnvelopeV4, BasePayloadAttributes, PayloadReady,
 };
 use base_execution_chainspec::BaseChainSpec;
+use base_execution_cluster::ClusteredDatabase;
 use base_node_core::args::RollupArgs;
 use base_node_runner::{BaseNodeRunner, LaunchedBaseNode, test_utils::L1_BLOCK_INFO_DEPOSIT_TX};
 use base_protocol::BaseTimeUpdateTx;
@@ -79,7 +80,11 @@ impl NativeNode {
         // Do not attach a sender directly to the builder: that would bypass the wiring under test.
         let launched = BaseNodeRunner::new(RollupArgs::default())
             .with_service_builder(NativePayloadServiceBuilder::new(BuilderConfig::default()))
-            .launch(NodeBuilder::new(config).with_database(db).with_launch_context(runtime.clone()))
+            .launch(
+                NodeBuilder::new(config)
+                    .with_database(ClusteredDatabase::new(db))
+                    .with_launch_context(runtime.clone()),
+            )
             .await?;
         let address = launched
             .handle

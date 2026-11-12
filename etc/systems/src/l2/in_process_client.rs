@@ -8,6 +8,7 @@ use base_execution_chainspec::BaseChainSpec;
 use base_execution_cli::{
     ExecutionUpgradeSignal, ExecutionUpgradeSignalConfig, ExecutionUpgradeSignalRuntimeExtension,
 };
+use base_execution_cluster::ClusteredDatabase;
 use base_execution_eip8130_rpc_node::Eip8130RpcExtension;
 use base_execution_txpool::ValiditySignatureMode;
 use base_node_core::args::RollupArgs;
@@ -260,7 +261,7 @@ impl InProcessClient {
         };
 
         let builder = NodeBuilder::new(node_config.clone())
-            .with_database(db)
+            .with_database(ClusteredDatabase::new(db))
             .with_launch_context(runtime.clone())
             .with_types_and_provider::<BaseNode, BlockchainProvider<_>>()
             .with_components(base_node.components())

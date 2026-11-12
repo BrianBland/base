@@ -3,9 +3,11 @@
 use std::{net::Ipv4Addr, path::PathBuf, sync::Arc};
 
 use base_execution_chainspec::BaseChainSpec;
+use base_execution_cluster::ClusteredDatabase;
 use base_node_runner::{BaseNodeBuilder, LaunchedBaseNode};
 use base_upgrade_signal::UpgradeSignalStartupMode;
 use clap::{Args, value_parser};
+use reth_cli_commands::node::NodeCommand;
 use reth_cli_runner::CliContext;
 use reth_db::init_db;
 use reth_node_builder::NodeBuilder;
@@ -20,7 +22,10 @@ use reth_node_core::{
 use reth_rpc_server_types::{LenientRpcModuleValidator, RpcModuleValidator};
 use tracing::info;
 
-use crate::{MeteringArgs, RpcStandardNodeArgs, ShadowIndexerArgs, StandardNodeArgs};
+use crate::{
+    MeteringArgs, RpcStandardNodeArgs, ShadowIndexerArgs, StandardNodeArgs,
+    chainspec::BaseChainSpecParser,
+};
 
 const DEFAULT_BASE_MAX_INBOUND_EL_PEERS: usize = 80;
 const DEFAULT_BASE_MAX_OUTBOUND_EL_PEERS: usize = 80;
@@ -199,6 +204,68 @@ pub struct ExecutionNodeRuntimeConfig {
 }
 
 impl ExecutionNodeRuntimeConfig {
+    /// Converts reth's `node` command into a runtime config plus its extension arguments.
+    ///
+    /// Base launches the `node` command itself rather than through
+    /// [`NodeCommand::execute`], which opens the database as a bare MDBX environment.
+    pub fn from_node_command<Ext>(
+        command: NodeCommand<BaseChainSpecParser, Ext>,
+    ) -> eyre::Result<(Self, Ext)>
+    where
+        Ext: clap::Args + std::fmt::Debug,
+    {
+        let NodeCommand {
+            datadir,
+            config,
+            chain,
+            metrics,
+            instance,
+            with_unused_ports,
+            network,
+            rpc,
+            txpool,
+            builder,
+            debug,
+            db,
+            dev,
+            pruning,
+            engine,
+            era,
+            static_files,
+            storage,
+            jit,
+            ext,
+        } = command;
+        engine.validate()?;
+
+        let node_config = NodeConfig {
+            datadir,
+            config,
+            chain,
+            metrics,
+            instance,
+            network,
+            rpc,
+            txpool,
+            builder,
+            debug,
+            db,
+            dev,
+            pruning,
+            engine,
+            era,
+            static_files,
+            storage,
+            jit,
+        };
+        let runtime = Self {
+            node_config,
+            with_unused_ports,
+            upgrade_signal_startup: UpgradeSignalStartupMode::ReadAndApply,
+        };
+        Ok((runtime, ext))
+    }
+
     /// Enables authenticated Engine API over IPC on the supplied node config.
     pub const fn enable_auth_ipc(node_config: &mut NodeConfig<BaseChainSpec>) {
         node_config.rpc.auth_ipc = true;
@@ -257,10 +324,11 @@ impl ExecutionNodeRuntimeConfig {
         let data_dir = self.node_config.datadir();
         let db_path = data_dir.db();
         info!(target: "reth::cli", path = ?db_path, "Opening database");
-        let database = init_db(db_path, self.node_config.db.database_args())?.with_metrics();
+        let database = init_db(db_path, self.node_config.db.database_args())?
+            .with_metrics_if(self.node_config.db.metrics_enabled());
 
         let builder = NodeBuilder::new(self.node_config)
-            .with_database(database)
+            .with_database(ClusteredDatabase::new(database))
             .with_launch_context(ctx.task_executor);
 
         Ok(builder)
