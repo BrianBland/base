@@ -1,10 +1,18 @@
-//! Execution results survive their wire encoding unchanged.
+//! Execution results survive their wire encoding unchanged, and are kept within bounds.
+
+use std::{
+    sync::{Arc, mpsc},
+    time::Duration,
+};
 
 use alloy_consensus::{Eip658Value, Receipt};
 use alloy_eips::eip7685::Requests;
 use alloy_primitives::{Address, B256, Bytes, Log, U256, map::HashMap};
 use base_common_consensus::{BaseReceipt, DepositReceipt};
-use base_execution_cluster::{ExecutedBlockParts, ExecutedBlockResult, Shard};
+use base_execution_cluster::{
+    ExecutedBlockParts, ExecutedBlockResult, ExecutedBlocks, Frame, ReadResult, Response,
+    ResultCapture, Shard,
+};
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_trie_common::SortedTrieData;
 use revm::{bytecode::Bytecode, database::BundleState, state::AccountInfo};
@@ -94,4 +102,55 @@ fn corrupt_encoding_is_rejected() {
     let encoded =
         ExecutedBlockResult::new(&parts.output, &parts.senders, &parts.trie).encode().unwrap();
     assert!(ExecutedBlockResult::decode(&encoded[..encoded.len() / 2]).is_err());
+}
+
+fn block_hash(index: usize) -> B256 {
+    B256::left_padding_from(&index.to_be_bytes())
+}
+
+/// A capture whose encoder holds the first block until released keeps at most its queue of later
+/// blocks, and inserts them after the held one, so the late old result cannot evict a newer one.
+#[test]
+fn capture_is_bounded_and_keeps_results_in_capture_order() {
+    let store = Arc::new(ExecutedBlocks::default());
+    let (encoding_tx, encoding) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel::<()>();
+    let capture = ResultCapture::spawn(Arc::clone(&store), move |index: usize| {
+        if index == 0 {
+            encoding_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }
+        Some((block_hash(index), Bytes::from(index.to_be_bytes().to_vec())))
+    })
+    .unwrap();
+
+    assert!(capture.submit(0));
+    encoding.recv().unwrap();
+    for index in 1..=ResultCapture::<usize>::QUEUE {
+        assert!(capture.submit(index), "dropped block {index} with room in the queue");
+    }
+    let newest = ResultCapture::<usize>::QUEUE;
+    assert!(!capture.submit(newest + 1));
+    assert_eq!(capture.dropped(), 1);
+
+    release.send(()).unwrap();
+    assert!(store.wait_for(block_hash(newest), Duration::from_secs(5)).is_some());
+    capture.stop().unwrap();
+    assert_eq!(store.wait_for(block_hash(0), Duration::ZERO), None, "the late old result stayed");
+    for index in 1..=newest {
+        assert!(store.wait_for(block_hash(index), Duration::ZERO).is_some(), "lost block {index}");
+    }
+    assert_eq!(store.wait_for(block_hash(newest + 1), Duration::ZERO), None);
+}
+
+#[test]
+fn results_too_large_to_serve_are_not_kept() {
+    let store = ExecutedBlocks::default();
+    let largest = Bytes::from(vec![0; ExecutedBlocks::MAX_RESULT_LEN]);
+    let answer: ReadResult = Ok(Response::ExecutedBlock(largest.clone()));
+    assert!(Frame::write(&mut std::io::sink(), &answer).is_ok());
+    assert!(store.insert(block_hash(1), largest));
+
+    assert!(!store.insert(block_hash(2), Bytes::from(vec![0; ExecutedBlocks::MAX_RESULT_LEN + 1])));
+    assert_eq!(store.wait_for(block_hash(2), Duration::ZERO), None);
 }

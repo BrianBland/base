@@ -43,10 +43,14 @@ pub use owner::{
 };
 
 mod executed;
-pub use executed::{ExecutedBlockParts, ExecutedBlockResult, ExecutedBlocks, RecentResults};
+pub use executed::{
+    ExecutedBlockParts, ExecutedBlockResult, ExecutedBlocks, RecentResults, ResultCapture,
+};
 
 mod server;
 pub use server::OwnerServer;
 
 mod client;
-pub use client::{ClientError, ClientOptions, ClusterClient, OwnerAttempt, OwnerFailure};
+pub use client::{
+    ClientError, ClientOptions, ClusterClient, DeadlineStream, OwnerAttempt, OwnerFailure,
+};

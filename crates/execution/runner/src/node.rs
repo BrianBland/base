@@ -197,7 +197,7 @@ impl BaseNode {
     ///             db_args: DatabaseArguments::default(),
     ///             static_files_dir: "db/static_files".into(),
     ///             rocksdb_dir: "db/rocksdb".into(),
-    ///             watch_static_files: false,
+    ///             watch: false,
     ///         },
     ///         runtime,
     ///     )

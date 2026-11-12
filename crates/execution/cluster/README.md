@@ -264,14 +264,23 @@ few or no shards.
   from the engine's block-added event (the earliest point a complete result exists, before
   forkchoice). A result holds the receipts, requests, gas used, blob gas used, the bundle state
   with reverts, the transaction senders, and the block's sorted hashed state and trie updates.
+  One worker encodes results in event order, so a result never evicts a newer one; at most 64
+  inserted blocks wait for it. A block inserted while 64 wait is not kept (apply nodes asking
+  for it execute it) and is counted in `base_cluster_dropped_results`. A result that would not
+  fit in a response frame (`Frame::MAX_LEN`) is not kept. The worker stops with the event stream.
 - Wire: `Get` gains a sibling query `ExecutedBlock { hash }` on the owner port (its snapshot and
   table are ignored). The executor answers the encoded result, waiting up to 250 ms for a block
   it has not inserted yet, or refuses with `NotAvailable`. Other requests keep their encoding.
 - Apply node, for each new payload: convert the payload and run the header, header-against-parent
-  and pre-execution body checks, as execution does; ask the `apply_from` nodes in order within
-  400 ms in total; then run the post-execution checks execution runs on the result: gas used,
-  receipts root, logs bloom and requests (reth's consensus), and Base's message-passer storage
-  root and block-time checks against the result's hashed state.
+  and pre-execution body checks, as execution does; ask the `apply_from` nodes in order before
+  one deadline 400 ms from the first request; then check the result: it carries no execution
+  requests (Base produces none, and reth's post-execution checks do not read them), and it passes
+  the post-execution checks execution runs: gas used, receipts root and logs bloom (reth's
+  consensus), and Base's message-passer storage root and block-time checks against the result's
+  hashed state.
+- Fetch deadline: the deadline bounds every connect, write and read of every node asked, each
+  socket operation waiting only the time left, and an answer completed after it is a miss
+  (`unavailable`). A pooled connection gets its usual timeouts back afterwards.
 - Trusted, not checked: the state root (the hashed state and trie updates are not recomputed),
   the bundle state, and the senders (signatures are not recovered).
 - Fallback: when no result arrives in time, a peer is unreachable, the result does not decode or
@@ -285,7 +294,7 @@ few or no shards.
   log line every 10 seconds in which a block was applied or fell back.
 
 Limits: the fetch runs on the engine thread, so a slow executor delays forkchoice handling by up
-to the 400 ms budget per block. Two nodes that apply from each other only wait for each other and
+to the 400 ms deadline per block. Two nodes that apply from each other only wait for each other and
 then execute. An apply node does not warm reth's execution cache, so a fallback execution starts
 cold.
 

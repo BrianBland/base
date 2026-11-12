@@ -411,3 +411,61 @@ fn executor_keeps_only_its_most_recent_results() {
         assert!(executed.wait_for(hash(index), Duration::ZERO).is_some(), "lost block {index}");
     }
 }
+
+/// A peer that answers one request with a valid execution result, sent in chunks
+/// [`TRICKLE_GAP`] apart, each well within any read timeout but together taking
+/// [`TRICKLE_TOTAL`], longer than the fetch budget.
+fn trickling_executor() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _: Request = Frame::read(&mut stream).unwrap();
+        let answer: ReadResult = Ok(Response::ExecutedBlock(Bytes::from(vec![7; 1000])));
+        let mut frame = Vec::new();
+        Frame::write(&mut frame, &answer).unwrap();
+        let chunks = (TRICKLE_TOTAL.as_millis() / TRICKLE_GAP.as_millis()) as usize;
+        for chunk in frame.chunks(frame.len().div_ceil(chunks)) {
+            std::thread::sleep(TRICKLE_GAP);
+            if std::io::Write::write_all(&mut stream, chunk).is_err() {
+                return;
+            }
+        }
+    });
+    address
+}
+
+const TRICKLE_GAP: Duration = Duration::from_millis(50);
+const TRICKLE_TOTAL: Duration = Duration::from_millis(1000);
+
+/// How late past its budget a fetch may return.
+const DEADLINE_SLACK: Duration = Duration::from_millis(150);
+
+/// Stateless node 3 applying from nodes 1 and 2, in that order.
+fn client_applying_from(owner_1: SocketAddr, owner_2: SocketAddr) -> ClusterClient {
+    let view = cluster_of(3, 2, owner_1, owner_2);
+    let config = ClusterConfig { apply_from: vec![NodeId(1), NodeId(2)], ..view.config().clone() };
+    ClusterClient::new(Arc::new(Cluster::new(config).unwrap()), ClientOptions::default())
+}
+
+#[test]
+fn fetch_budget_bounds_a_result_that_arrives_in_slow_chunks() {
+    let client = applying_client(trickling_executor());
+
+    let started = Instant::now();
+    let result = client.executed_block(B256::repeat_byte(1), FETCH_BUDGET);
+    let elapsed = started.elapsed();
+    assert_eq!(result, Err(ApplyFallback::Unavailable));
+    assert!(elapsed < FETCH_BUDGET + DEADLINE_SLACK, "waited {elapsed:?}");
+}
+
+#[test]
+fn fetch_budget_is_shared_by_every_source() {
+    let client = client_applying_from(trickling_executor(), trickling_executor());
+
+    let started = Instant::now();
+    let result = client.executed_block(B256::repeat_byte(1), FETCH_BUDGET);
+    let elapsed = started.elapsed();
+    assert_eq!(result, Err(ApplyFallback::Unavailable));
+    assert!(elapsed < FETCH_BUDGET + DEADLINE_SLACK, "waited {elapsed:?}");
+}

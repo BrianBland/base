@@ -223,6 +223,9 @@ pub enum ApplyError {
         /// Transactions in the block.
         transactions: usize,
     },
+    /// The result carries execution requests, which Base never produces.
+    #[error("result carries {0} execution requests")]
+    Requests(usize),
     /// The result fails a post-execution check against the block.
     #[error("post-execution check failed: {0}")]
     PostExecution(ConsensusError),
@@ -236,7 +239,7 @@ impl ApplyError {
     pub const fn reason(&self) -> ApplyFallback {
         match self {
             Self::Fetch(reason) => *reason,
-            Self::Decode(_) | Self::Senders { .. } | Self::PostExecution(_) => {
+            Self::Decode(_) | Self::Senders { .. } | Self::Requests(_) | Self::PostExecution(_) => {
                 ApplyFallback::Invalid
             }
             Self::BasePostExecution(error) if error.is_validation_error() => ApplyFallback::Invalid,
@@ -308,6 +311,11 @@ where
         let transactions = block.body().transactions.len();
         if parts.senders.len() != transactions {
             return Err(ApplyError::Senders { senders: parts.senders.len(), transactions });
+        }
+        // Base's post-execution validation does not read the requests.
+        let requests = parts.output.result.requests.len();
+        if requests != 0 {
+            return Err(ApplyError::Requests(requests));
         }
         let block = RecoveredBlock::new_sealed(block, parts.senders);
         self.consensus

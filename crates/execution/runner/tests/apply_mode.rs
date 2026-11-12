@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_eips::{BlockNumberOrTag, Encodable2718};
+use alloy_eips::{BlockNumberOrTag, Encodable2718, eip7685::Requests};
 use alloy_genesis::GenesisAccount;
 use alloy_primitives::{Address, B64, B256, Bytes, TxKind, U256, keccak256};
 use alloy_provider::{Provider, RootProvider};
@@ -50,7 +50,9 @@ use reth_node_core::{
     args::{DatadirArgs, DiscoveryArgs, NetworkArgs, RpcServerArgs},
     dirs::{DataDirPath, MaybePlatformPath},
 };
-use reth_provider::{ChangeSetReader, StorageChangeSetReader};
+use reth_provider::{
+    AccountReader, ChangeSetReader, StateProvider, StateProviderFactory, StorageChangeSetReader,
+};
 use reth_tasks::Runtime;
 
 /// Blocks each test produces.
@@ -72,9 +74,7 @@ const STORAGE_CONTRACT_CODE: [u8; 6] = [0x5f, 0x35, 0x43, 0x90, 0x55, 0x00];
 /// The transactions of block `number`: the L1 info deposit, then user deposits that create
 /// accounts and storage slots, so blocks change the account and storage tries.
 fn block_transactions(number: u64) -> Vec<Bytes> {
-    let seed = |kind: u8, index: u64| {
-        keccak256([[kind].as_slice(), &number.to_be_bytes(), &index.to_be_bytes()].concat())
-    };
+    let seed = |kind, index| deposit_seed(number, kind, index);
     let deposit = |source_hash, to, mint, input| {
         TxDeposit {
             source_hash,
@@ -97,6 +97,12 @@ fn block_transactions(number: u64) -> Vec<Bytes> {
         transactions.push(deposit(seed(4, index), STORAGE_CONTRACT, 0, slot));
     }
     transactions
+}
+
+/// The seed of the `index`th deposit value of `kind` in block `number`: kind 1 is a recipient
+/// account, 3 a written slot of [`STORAGE_CONTRACT`], 2 and 4 their deposits' source hashes.
+fn deposit_seed(number: u64, kind: u8, index: u64) -> B256 {
+    keccak256([[kind].as_slice(), &number.to_be_bytes(), &index.to_be_bytes()].concat())
 }
 
 /// A table's name and its raw `(key, value)` rows, in key order.
@@ -299,6 +305,29 @@ impl TestNode {
         Ok(changesets)
     }
 
+    /// The latest account and storage of every account and slot blocks 1 to `BLOCKS` touched,
+    /// and of a few untouched genesis accounts, read through the node's provider.
+    fn touched_state(&self) -> Result<Vec<String>> {
+        let state = self.launched.handle.node.provider().latest()?;
+        let mut accounts = vec![STORAGE_CONTRACT, Address::repeat_byte(0xde)];
+        accounts.extend((0..4u64).map(|index| Address::from_word(keccak256(index.to_be_bytes()))));
+        let mut slots = Vec::new();
+        for number in 1..=BLOCKS {
+            for index in 0..DEPOSITS_PER_KIND {
+                accounts.push(Address::from_word(deposit_seed(number, 1, index)));
+                slots.push(deposit_seed(number, 3, index));
+            }
+        }
+        let mut read = Vec::new();
+        for account in accounts {
+            read.push(format!("{account}: {:?}", state.basic_account(&account)?));
+        }
+        for slot in slots {
+            read.push(format!("{slot}: {:?}", state.storage(STORAGE_CONTRACT, slot)?));
+        }
+        Ok(read)
+    }
+
     /// Raw dumps of the state, trie and stage tables in this node's MDBX.
     fn state_tables(&self) -> Result<Vec<TableDump>> {
         let tx = self.env.tx()?;
@@ -392,6 +421,7 @@ async fn applied_chain_matches_the_executed_chain() -> Result<()> {
     let changesets = executor.changesets()?;
     assert!(changesets.iter().any(|changeset| changeset != "[]"), "no block has reverts");
     assert_eq!(applier.changesets()?, changesets);
+    assert_eq!(applier.touched_state()?, executor.touched_state()?);
 
     let paths = [executor.data_path.clone(), applier.data_path.clone()];
     drop((executor, applier, runtime));
@@ -401,8 +431,73 @@ async fn applied_chain_matches_the_executed_chain() -> Result<()> {
     Ok(())
 }
 
-/// An apply node executes a payload whose result fails the receipt checks, or when its executor
-/// is unreachable, and counts why.
+/// A stateless apply node (`storage = false`, owning no shard) ends with the executing node's
+/// head, receipts, changesets and state as its provider reads it, while its own sharded tables
+/// hold only the replicated account-trie paths.
+#[tokio::test(flavor = "multi_thread")]
+async fn stateless_apply_node_matches_the_executed_chain() -> Result<()> {
+    base_node_runner::test_utils::init_silenced_tracing();
+    let chain_spec = chain_spec()?;
+    let (executor_listener, executor_address) = bound()?;
+    let (apply_listener, apply_address) = bound()?;
+    let nodes = three_nodes([executor_address, bound()?.1, apply_address]);
+    let runtime = Runtime::test();
+    let executor =
+        TestNode::launch(&runtime, &chain_spec, 1, &nodes, executor_listener, vec![]).await?;
+    let applier =
+        TestNode::launch(&runtime, &chain_spec, 3, &nodes, apply_listener, vec![NodeId(1)]).await?;
+
+    for _ in 0..BLOCKS {
+        let envelope = executor.build_next().await?;
+        let hash = executor.import(&envelope).await?;
+        assert_eq!(applier.import(&envelope).await?, hash);
+    }
+    executor.wait_persisted(BLOCKS).await?;
+    applier.wait_persisted(BLOCKS).await?;
+
+    assert_eq!(applier.cluster.applied_blocks().applied, BLOCKS);
+    assert_eq!(applier.cluster.applied_blocks().fallbacks, [0; 4]);
+    assert_eq!(applier.head().await?, executor.head().await?);
+    assert_eq!(applier.receipts().await?, executor.receipts().await?);
+    let changesets = executor.changesets()?;
+    assert!(changesets.iter().any(|changeset| changeset != "[]"), "no block has reverts");
+    assert_eq!(applier.changesets()?, changesets);
+    let state = executor.touched_state()?;
+    assert!(state.iter().any(|read| read.ends_with(": Some(1)")), "no written slot read");
+    assert_eq!(applier.touched_state()?, state);
+
+    let replicated_only = |(name, rows): TableDump| -> TableDump {
+        if name == "AccountsTrie" {
+            (
+                name,
+                rows.into_iter()
+                    .filter(|(key, _)| key.last().is_some_and(|len| *len < 2))
+                    .collect(),
+            )
+        } else if ["HashedAccounts", "HashedStorages", "StoragesTrie", "Bytecodes"].contains(&name)
+        {
+            (name, Vec::new())
+        } else {
+            (name, rows)
+        }
+    };
+    let expected: Vec<_> = executor.state_tables()?.into_iter().map(replicated_only).collect();
+    assert!(
+        expected.iter().any(|(name, rows)| *name == "AccountsTrie" && !rows.is_empty()),
+        "no replicated account-trie path to compare"
+    );
+    assert_eq!(applier.state_tables()?, expected);
+
+    let paths = [executor.data_path.clone(), applier.data_path.clone()];
+    drop((executor, applier, runtime));
+    for path in paths {
+        let _ = std::fs::remove_dir_all(path);
+    }
+    Ok(())
+}
+
+/// An apply node executes a payload whose result fails the receipt checks or carries execution
+/// requests, or when its executor is unreachable, and counts why.
 #[tokio::test(flavor = "multi_thread")]
 async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
     base_node_runner::test_utils::init_silenced_tracing();
@@ -446,15 +541,30 @@ async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
     assert_eq!(applier.import(&envelope).await?, hash);
     assert_eq!(applier.cluster.applied_blocks().fallbacks(ApplyFallback::Invalid), 1);
 
+    // Block 2's result differs only in carrying an execution request.
+    let envelope = executor.build_next().await?;
+    let hash = executor.import(&envelope).await?;
+    let result = executor
+        .cluster
+        .executed_blocks()
+        .wait_for(hash, Duration::from_secs(5))
+        .ok_or_else(|| eyre!("executor kept no result for block 2"))?;
+    let mut parts = ExecutedBlockResult::decode(&result)?.into_parts::<BaseReceipt>()?;
+    parts.output.result.requests = Requests::new(vec![Bytes::from_static(&[0x01, 0xaa])]);
+    let corrupt = ExecutedBlockResult::new(&parts.output, &parts.senders, &parts.trie).encode()?;
+    corrupt_results.insert(hash, corrupt);
+    assert_eq!(applier.import(&envelope).await?, hash);
+    assert_eq!(applier.cluster.applied_blocks().fallbacks(ApplyFallback::Invalid), 2);
+
     drop(corrupt_server);
-    for _ in 1..BLOCKS {
+    for _ in 2..BLOCKS {
         let envelope = executor.build_next().await?;
         let hash = executor.import(&envelope).await?;
         assert_eq!(applier.import(&envelope).await?, hash);
     }
     let counts = applier.cluster.applied_blocks();
     assert_eq!(counts.applied, 0);
-    assert_eq!(counts.fallbacks(ApplyFallback::Unreachable), BLOCKS - 1);
+    assert_eq!(counts.fallbacks(ApplyFallback::Unreachable), BLOCKS - 2);
     assert_eq!(applier.head().await?, executor.head().await?);
     assert_eq!(applier.receipts().await?, executor.receipts().await?);
 

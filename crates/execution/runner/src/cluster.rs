@@ -3,7 +3,10 @@
 
 use std::{future::Future, sync::Arc};
 
-use base_execution_cluster::{BlockUpdates, CanonicalBlock, ClusterNode, ExecutedBlockResult};
+use alloy_primitives::{B256, Bytes};
+use base_execution_cluster::{
+    BlockUpdates, CanonicalBlock, ClusterNode, ExecutedBlockResult, ResultCapture,
+};
 use futures::{Stream, StreamExt};
 use reth_chain_state::ExecutedBlock;
 use reth_node_api::ConsensusEngineEvent;
@@ -70,11 +73,22 @@ impl ClusterFeed {
 
     /// Keeps the execution result of every block the engine inserts, as `events` report them,
     /// in `node`'s executed-block store until the events close. Encoding waits for the block's
-    /// trie data, so it runs on a blocking thread.
+    /// trie data, so it runs on the bounded [`ResultCapture`] worker, which drops blocks captured
+    /// while it is backed up and stops with the events.
     pub async fn serve_executed_blocks<N: NodePrimitives>(
         node: Arc<ClusterNode>,
         events: impl Stream<Item = ConsensusEngineEvent<N>>,
     ) {
+        let capture = match ResultCapture::spawn(
+            Arc::clone(node.executed_blocks()),
+            |block: ExecutedBlock<N>| Self::encode_executed_block(&block),
+        ) {
+            Ok(capture) => capture,
+            Err(error) => {
+                warn!(error = %error, "failed to start keeping execution results for apply nodes");
+                return;
+            }
+        };
         let mut events = std::pin::pin!(events);
         while let Some(event) = events.next().await {
             let (ConsensusEngineEvent::CanonicalBlockAdded(block, _)
@@ -82,22 +96,29 @@ impl ClusterFeed {
             else {
                 continue;
             };
-            let node = Arc::clone(&node);
-            tokio::task::spawn_blocking(move || Self::keep_executed_block(&node, &block));
+            let hash = block.recovered_block.hash();
+            if !capture.submit(block) {
+                warn!(block = %hash, "execution result capture backed up; dropped a block's result");
+            }
+        }
+        if let Ok(Err(_)) = tokio::task::spawn_blocking(move || capture.stop()).await {
+            warn!("execution result capture worker panicked");
         }
     }
 
-    /// Keeps `block`'s execution result in `node`'s executed-block store.
-    pub fn keep_executed_block<N: NodePrimitives>(node: &ClusterNode, block: &ExecutedBlock<N>) {
+    /// `block`'s hash and encoded execution result, or `None` when it does not encode.
+    pub fn encode_executed_block<N: NodePrimitives>(
+        block: &ExecutedBlock<N>,
+    ) -> Option<(B256, Bytes)> {
+        let hash = block.recovered_block.hash();
         let trie = block.trie_data();
         let senders = block.recovered_block.senders();
         match ExecutedBlockResult::new(&block.execution_output, senders, &trie).encode() {
-            Ok(encoded) => node.executed_blocks().insert(block.recovered_block.hash(), encoded),
-            Err(error) => warn!(
-                block = %block.recovered_block.hash(),
-                error = %error,
-                "failed to encode an execution result for apply nodes"
-            ),
+            Ok(encoded) => Some((hash, encoded)),
+            Err(error) => {
+                warn!(block = %hash, error = %error, "failed to encode an execution result for apply nodes");
+                None
+            }
         }
     }
 

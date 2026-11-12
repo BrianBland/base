@@ -1,14 +1,22 @@
-//! Execution results of recent blocks: their wire encoding and the executor's bounded store.
+//! Execution results of recent blocks: their wire encoding, the executor's bounded store, and the
+//! bounded worker that fills it.
 
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, SyncSender, TrySendError},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use alloy_eips::eip7685::Requests;
 use alloy_primitives::{Address, B256, Bytes};
+use metrics::Counter;
 use parking_lot::{Condvar, Mutex};
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_primitives_traits::Receipt;
@@ -18,6 +26,9 @@ use reth_trie_common::{
 };
 use revm::database::BundleState;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+use crate::Frame;
 
 /// What an apply node needs, besides the block it already has, to insert a block as executed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,9 +151,17 @@ impl ExecutedBlocks {
     /// and finishes executing it shortly after they ask.
     pub const SERVE_WAIT: Duration = Duration::from_millis(250);
 
+    /// Largest result kept: a larger one would not fit in a response frame of at most
+    /// [`Frame::MAX_LEN`] bytes, which adds a few bytes of framing to the result.
+    pub const MAX_RESULT_LEN: usize = Frame::MAX_LEN - 64;
+
     /// Keeps the encoded result of block `hash`, dropping the oldest beyond
-    /// [`Self::CAPACITY`], and wakes requests waiting for it.
-    pub fn insert(&self, hash: B256, encoded: Bytes) {
+    /// [`Self::CAPACITY`], and wakes requests waiting for it. Returns `false`, keeping nothing,
+    /// when the result is longer than [`Self::MAX_RESULT_LEN`].
+    pub fn insert(&self, hash: B256, encoded: Bytes) -> bool {
+        if encoded.len() > Self::MAX_RESULT_LEN {
+            return false;
+        }
         let mut results = self.results.lock();
         if results.by_hash.insert(hash, encoded).is_none() {
             results.order.push_back(hash);
@@ -154,6 +173,7 @@ impl ExecutedBlocks {
         }
         drop(results);
         self.inserted.notify_all();
+        true
     }
 
     /// The encoded result of block `hash`, waiting up to `wait` for it to be inserted.
@@ -168,5 +188,81 @@ impl ExecutedBlocks {
                 return results.by_hash.get(&hash).cloned();
             }
         }
+    }
+}
+
+/// Encodes captured blocks into an [`ExecutedBlocks`] store on one worker thread, in capture
+/// order, so a result never evicts one captured after it. At most [`Self::QUEUE`] captured blocks
+/// wait; a block captured while the queue is full is dropped and counted in the metric
+/// `base_cluster_dropped_results` (apply nodes asking for it execute instead), so a slow encoder
+/// never holds more than that many blocks.
+#[derive(Debug)]
+pub struct ResultCapture<T> {
+    queue: SyncSender<T>,
+    stopped: Arc<AtomicBool>,
+    worker: JoinHandle<()>,
+    dropped: AtomicU64,
+    dropped_metric: Counter,
+}
+
+impl<T: Send + 'static> ResultCapture<T> {
+    /// Captured blocks waiting at most: a result queued behind more than the store keeps would
+    /// be evicted as soon as the newer ones are inserted.
+    pub const QUEUE: usize = ExecutedBlocks::CAPACITY;
+
+    /// Starts the worker, which turns each captured block into its hash and encoded result with
+    /// `encode` (`None` keeps nothing) and inserts it into `store`.
+    pub fn spawn(
+        store: Arc<ExecutedBlocks>,
+        mut encode: impl FnMut(T) -> Option<(B256, Bytes)> + Send + 'static,
+    ) -> io::Result<Self> {
+        let (queue, captured) = mpsc::sync_channel(Self::QUEUE);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
+        let worker = thread::Builder::new().name("cluster-results".into()).spawn(move || {
+            while let Ok(block) = captured.recv() {
+                if worker_stopped.load(Ordering::Relaxed) {
+                    return;
+                }
+                let Some((hash, encoded)) = encode(block) else { continue };
+                let len = encoded.len();
+                if !store.insert(hash, encoded) {
+                    warn!(block = %hash, len, "execution result too large to serve");
+                }
+            }
+        })?;
+        Ok(Self {
+            queue,
+            stopped,
+            worker,
+            dropped: AtomicU64::new(0),
+            dropped_metric: metrics::counter!("base_cluster_dropped_results"),
+        })
+    }
+
+    /// Queues `block` for encoding. Returns `false`, dropping and counting it, when the queue is
+    /// full or the worker has stopped.
+    pub fn submit(&self, block: T) -> bool {
+        match self.queue.try_send(block) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                self.dropped_metric.increment(1);
+                false
+            }
+        }
+    }
+
+    /// Blocks dropped so far.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Stops the worker, discarding the blocks still queued, and waits for it to finish the one
+    /// it is encoding. Fails with the worker's panic, if it panicked.
+    pub fn stop(self) -> thread::Result<()> {
+        self.stopped.store(true, Ordering::Relaxed);
+        drop(self.queue);
+        self.worker.join()
     }
 }

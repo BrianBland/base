@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    io,
+    io::{self, Read, Write},
     net::TcpStream,
     sync::Arc,
     time::{Duration, Instant},
@@ -151,9 +151,10 @@ impl ClusterClient {
     }
 
     /// The encoded execution result of block `hash` from the first of the cluster's `apply_from`
-    /// nodes that has it, asking them in order within `budget` in total. Fails with
-    /// [`ApplyFallback::Unavailable`] when a node was reached but none answered with the result
-    /// in time, and [`ApplyFallback::Unreachable`] when no node was reached.
+    /// nodes that has it, asking them in order. One deadline, `budget` from now, bounds every
+    /// connect, write and read across all of them, and an answer completed after it is a miss.
+    /// Fails with [`ApplyFallback::Unavailable`] when a node was reached but none answered with
+    /// the result in time, and [`ApplyFallback::Unreachable`] when no node was reached.
     pub fn executed_block(&self, hash: B256, budget: Duration) -> Result<Bytes, ApplyFallback> {
         let deadline = Instant::now() + budget;
         let request = Request {
@@ -163,11 +164,10 @@ impl ClusterClient {
         };
         let mut failure = ApplyFallback::Unreachable;
         for &node in self.cluster.apply_from() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            if Instant::now() >= deadline {
                 return Err(ApplyFallback::Unavailable);
             }
-            match self.ask_within(node, &request, remaining) {
+            match self.ask_before(node, &request, deadline) {
                 Ok(Ok(Response::ExecutedBlock(result))) => return Ok(result),
                 Ok(Ok(_)) => {
                     debug!(node = node.0, "unexpected answer to an execution result request")
@@ -192,18 +192,17 @@ impl ClusterClient {
         matches!(error, FrameError::Io(io) if matches!(io.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
     }
 
-    /// Asks `node` and waits at most `within` for its answer, on a pooled connection when one is
+    /// Asks `node` and waits for its answer until `deadline`, on a pooled connection when one is
     /// idle, replaced by a fresh one once if it fails and time remains.
-    fn ask_within(
+    fn ask_before(
         &self,
         node: NodeId,
         request: &Request,
-        within: Duration,
+        deadline: Instant,
     ) -> Result<ReadResult, FrameError> {
-        let deadline = Instant::now() + within;
         let idle = self.pools[&node].lock().pop();
         if let Some(stream) = idle {
-            match self.exchange_within(node, stream, request, within) {
+            match self.exchange_before(node, stream, request, deadline) {
                 Ok(result) => return Ok(result),
                 Err(error) if Self::timed_out(&error) => return Err(error),
                 Err(_) => {}
@@ -211,26 +210,30 @@ impl ClusterClient {
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(FrameError::Io(io::ErrorKind::TimedOut.into()));
+            return Err(DeadlineStream::expired().into());
         }
         let stream = self.connect_within(node, remaining)?;
-        self.exchange_within(node, stream, request, remaining)
+        self.exchange_before(node, stream, request, deadline)
     }
 
-    /// Like [`Self::exchange`], with the reply awaited at most `within`. The connection goes back
-    /// to the pool with its usual timeout.
-    fn exchange_within(
+    /// Like [`Self::exchange`], with every write and read of the exchange finished by `deadline`.
+    /// The connection goes back to the pool with its usual timeouts.
+    fn exchange_before(
         &self,
         node: NodeId,
-        mut stream: TcpStream,
+        stream: TcpStream,
         request: &Request,
-        within: Duration,
+        deadline: Instant,
     ) -> Result<ReadResult, FrameError> {
-        stream.set_read_timeout(Some(within))?;
-        Frame::write(&mut stream, request)?;
-        let result = Frame::read(&mut stream)?;
-        stream.set_read_timeout(Some(self.options.io_timeout))?;
-        self.release(node, stream);
+        let mut bounded = DeadlineStream { stream, deadline };
+        Frame::write(&mut bounded, request)?;
+        let result = Frame::read(&mut bounded)?;
+        if Instant::now() > deadline {
+            return Err(DeadlineStream::expired().into());
+        }
+        bounded.stream.set_read_timeout(Some(self.options.io_timeout))?;
+        bounded.stream.set_write_timeout(Some(self.options.io_timeout))?;
+        self.release(node, bounded.stream);
         Ok(result)
     }
 
@@ -334,5 +337,45 @@ impl ClusterClient {
         if idle.len() < self.options.max_idle_per_owner {
             idle.push(stream);
         }
+    }
+}
+
+/// A connection whose every read and write must finish by `deadline`: each operation's socket
+/// timeout is the time left, and an operation started at or after it fails with `TimedOut`.
+#[derive(Debug)]
+pub struct DeadlineStream {
+    /// The connection.
+    pub stream: TcpStream,
+    /// When every operation must have finished.
+    pub deadline: Instant,
+}
+
+impl DeadlineStream {
+    /// The error of an operation that missed the deadline.
+    pub fn expired() -> io::Error {
+        io::ErrorKind::TimedOut.into()
+    }
+
+    fn remaining(&self) -> io::Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { Err(Self::expired()) } else { Ok(remaining) }
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(buf)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
     }
 }
