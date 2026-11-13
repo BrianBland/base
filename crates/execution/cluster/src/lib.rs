@@ -19,6 +19,9 @@ pub use split::SplitCursor;
 mod snapshot;
 pub use snapshot::ReadSnapshot;
 
+mod local;
+pub use local::LocalReads;
+
 mod node;
 pub use node::{BlockHashLookup, ClusterNode, ClusterStartError, CommitRefusal};
 
