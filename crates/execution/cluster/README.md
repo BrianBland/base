@@ -774,8 +774,15 @@ reusing pages until it finishes, so prefer a stopped node.
   for example) fails on its next remote read.
 - One network round trip per remote exact read.
 - Trie rows are never read from a peer, so anything that needs trie rows of shards this node does
-  not own (`eth_getProof`, storage roots of foreign accounts, witnesses) fails or answers from the
-  visible rows only. The state root of a block is not computed from foreign rows by this crate.
+  not own (proofs, storage roots of foreign accounts, witnesses) cannot be answered. A clustered
+  node launched by `base-node-runner` replaces `eth_getProof`, `eth_getMultiProof`,
+  `eth_getAccount`, `debug_executionWitness`, `debug_executionWitnessByBlockHash`,
+  `debug_executePayload`, `debug_accountAt`, `debug_stateRootWithUpdates` and
+  `debug_intermediateRoots` with methods that fail with code -32601 and `<method> is not
+  supported on a clustered node: it holds only a slice of the state trie; ask an unclustered
+  node`, even on a node holding every shard. Other code paths that compute storage or state roots
+  (none known on the RPC surface besides these) would fail or answer from the visible rows only.
+  The state root of a block is not computed from foreign rows by this crate.
 - An owner answers a bytecode only once it has persisted it, so reading code from a block this
   node persisted before every owner of the code's shard did waits for an owner to persist it,
   and fails if none does within the client's retry budget (`read_retry_secs`, 60 s by default).

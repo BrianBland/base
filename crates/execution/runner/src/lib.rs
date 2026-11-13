@@ -19,6 +19,9 @@ pub use runner::{BaseNodeRunner, LaunchedBaseNode};
 mod cluster;
 pub use cluster::ClusterFeed;
 
+mod cluster_rpc;
+pub use cluster_rpc::ClusterUnsupportedRpc;
+
 mod apply;
 pub use apply::{
     ApplyEngineValidator, ApplyEngineValidatorBuilder, ApplyError, BlockApplier,

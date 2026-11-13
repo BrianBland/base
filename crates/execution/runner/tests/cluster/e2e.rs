@@ -19,6 +19,7 @@ use base_execution_cluster::{
     RootCheckSchedule, RootChecker, RootMismatchMarker, Shard, ShardHash,
 };
 use eyre::{Result, eyre};
+use jsonrpsee::{core::client::ClientT, http_client::HttpClient, rpc_params};
 use reth_db::{
     Database, DatabaseEnv,
     cursor::DbCursorRO,
@@ -30,8 +31,8 @@ use reth_trie::PackedStoredNibbles;
 use reth_trie_common::{BranchNodeCompact, Nibbles};
 
 use crate::{
-    DEPOSITOR, STORAGE_CONTRACT, TestNode, chain_spec_with, cluster_config, deposit, deposit_from,
-    free_address, slices::SliceRows, store_call,
+    DEPOSITOR, Datadir, STORAGE_CONTRACT, TestNode, chain_spec_with, cluster_config, deposit,
+    deposit_from, free_address, slices::SliceRows, store_call,
 };
 
 /// Genesis density: enough accounts and split-contract slots that the two-nibble trie nodes are
@@ -545,6 +546,52 @@ async fn a_node_with_the_root_check_off_captures_nothing() -> Result<()> {
     assert!(node.cluster().root_captures().by_hash(head).is_none(), "block {number} captured");
     assert!(node.cluster().trie_slices().capture_elapsed.is_zero());
     for node in [chain.producer, node] {
+        node.remove().await?;
+    }
+    Ok(())
+}
+
+/// Launches a node with its HTTP RPC server on, and returns it with a client of that server.
+async fn launch_with_http(
+    chain_spec: &Arc<base_execution_chainspec::BaseChainSpec>,
+    cluster: Option<ClusterConfig>,
+) -> Result<(TestNode, HttpClient)> {
+    let mut datadir = Datadir::fresh(chain_spec);
+    datadir.node_config.rpc.http = true;
+    let node = datadir.launch(cluster).await?;
+    let client = node
+        .launched
+        .handle
+        .node
+        .rpc_server_handle()
+        .http_client()
+        .ok_or_else(|| eyre!("the HTTP RPC server is off"))?;
+    Ok((node, client))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clustered_node_refuses_proof_rpcs_and_says_why() -> Result<()> {
+    base_node_runner::test_utils::init_silenced_tracing();
+    let chain_spec = chain_spec_with(256, 0, [])?;
+    let nodes = [ClusterNodeConfig { id: NodeId(1), address: free_address()?, storage: true }];
+    let config = ClusterConfig { replication: 1, ..cluster_config(1, &nodes) };
+    let (unclustered, full) = launch_with_http(&chain_spec, None).await?;
+    let (clustered, sliced) = launch_with_http(&chain_spec, Some(config)).await?;
+    let proof = || rpc_params![DEPOSITOR, Vec::<B256>::new(), "latest"];
+
+    let answered: Result<serde_json::Value, _> = full.request("eth_getProof", proof()).await;
+    assert!(answered.is_ok(), "an unclustered node answers: {answered:?}");
+    for (method, params) in
+        [("eth_getProof", proof()), ("eth_getAccount", rpc_params![DEPOSITOR, "latest"])]
+    {
+        let refused: Result<serde_json::Value, _> = sliced.request(method, params).await;
+        let message = format!("{refused:?}");
+        assert!(
+            message.contains(&format!("{method} is not supported on a clustered node")),
+            "{message}"
+        );
+    }
+    for node in [unclustered, clustered] {
         node.remove().await?;
     }
     Ok(())

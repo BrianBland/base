@@ -5108,6 +5108,7 @@ dependencies = [
  "reth-provider",
  "reth-rpc-api",
  "reth-rpc-layer",
+ "reth-rpc-server-types",
  "reth-storage-overlay",
  "reth-tasks",
  "reth-tracing",

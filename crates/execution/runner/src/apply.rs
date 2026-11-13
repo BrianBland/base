@@ -11,7 +11,9 @@ use std::{
 use alloy_primitives::{B256, keccak256};
 use base_common_consensus::{BasePrimitives, Predeploys};
 use base_common_rpc_types_engine::ExecutionData;
-use base_execution_cluster::{ApplyFallback, ClusterNode, ExecutedBlockResult, OwnersNotReady, Shard};
+use base_execution_cluster::{
+    ApplyFallback, ClusterNode, ExecutedBlockResult, OwnersNotReady, Shard,
+};
 use base_node_core::{
     BaseEngineTypes, BaseNodeTypes, BasePayloadValidatorBuilder, MessagePasserRootCheck,
 };

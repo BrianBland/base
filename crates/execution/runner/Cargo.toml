@@ -30,6 +30,7 @@ reth-trie-common.workspace = true
 reth-node-builder.workspace = true
 reth-payload-builder.workspace = true
 reth-storage-overlay.workspace = true
+reth-rpc-server-types.workspace = true
 reth-primitives-traits.workspace = true
 reth-db = { workspace = true, optional = true }
 reth-ipc = { workspace = true, optional = true }

@@ -22,7 +22,7 @@ use tracing::info;
 
 use crate::{
     ApplyEngineValidatorBuilder, BaseNodeBuilder, BaseNodeExtension, ClusterFeed,
-    FromExtensionConfig, NodeHooks, RootCheckTask,
+    ClusterUnsupportedRpc, FromExtensionConfig, NodeHooks, RootCheckTask,
     node::BaseNode,
     service::{DefaultPayloadServiceBuilder, PayloadServiceBuilder},
 };
@@ -245,6 +245,7 @@ impl<SB: PayloadServiceBuilder> BaseNodeRunner<SB> {
         let mut hooks = NodeHooks::new();
         // Before every other started hook, so results are kept from the first block a consensus
         // client started by a later hook delivers.
+        let clustered = cluster.is_some();
         if let Some(node) = cluster {
             hooks = hooks.add_node_started_hook(move |full_node| {
                 let events = full_node.add_ons_handle.engine_events.new_listener();
@@ -259,6 +260,9 @@ impl<SB: PayloadServiceBuilder> BaseNodeRunner<SB> {
         let hooks = started_callbacks
             .into_iter()
             .fold(hooks, |hooks, callback| hooks.add_node_started_hook(move |_| callback()));
+        // After every extension, so no extension puts a refused method back.
+        let hooks =
+            if clustered { hooks.add_rpc_module(ClusterUnsupportedRpc::install) } else { hooks };
         // Registered after every extension so the captured module includes all merged auth methods.
         let auth_module = Arc::new(OnceLock::new());
         let captured = Arc::clone(&auth_module);
