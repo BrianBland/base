@@ -1,5 +1,6 @@
 //! Shared fixtures: a three-node cluster, MDBX test databases written with reth's own writers,
-//! seeded random block updates, and raw dumps of the sharded tables.
+//! seeded random block updates, chains of blocks over plain keys with real changesets, and raw
+//! dumps of the sharded tables.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -7,29 +8,45 @@ use std::{
 };
 
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{B256, U256, keccak256, map::B256Map};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256, map::B256Map};
 use base_execution_cluster::{
-    BlockUpdates, CanonicalBlock, Cluster, ClusterConfig, NodeConfig, NodeId, Shard, ShardedTable,
+    CanonicalBlock, Cluster, ClusterConfig, NodeConfig, NodeId, OwnerStore, ProviderChangesets,
+    Shard,
 };
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use reth_db::{DatabaseEnv, test_utils::TempDatabase};
 use reth_db_api::{
-    Database,
+    Database, DatabaseError,
     cursor::DbCursorRO,
     models::StorageSettings,
     table::Table,
-    tables::{self, RawKey, RawTable},
+    tables::{self, RawTable},
     transaction::DbTx,
 };
 use reth_primitives_traits::Account;
 use reth_provider::{
-    ProviderFactory, StateWriter, StorageSettingsCache, TrieWriter,
+    ProviderFactory, ProviderResult, StageCheckpointWriter, StateWriteConfig, StateWriter,
+    StorageSettingsCache,
     test_utils::{MockNodeTypesWithDB, create_test_provider_factory},
 };
+use reth_stages_types::{StageCheckpoint, StageId};
 use reth_trie::{
     BranchNodeCompact, HashedPostStateSorted, HashedStorageSorted, Nibbles, PackedStoredNibbles,
     updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
 };
+use revm::{
+    database::states::{PlainStateReverts, PlainStorageRevert, RevertToSlot},
+    state::AccountInfo,
+};
+
+/// The sorted state and trie changes of one block, as reth writes them.
+#[derive(Debug, Clone)]
+pub(crate) struct BlockUpdates {
+    /// Hashed accounts and storage written by the block. Deletions are explicit per key.
+    pub(crate) hashed_state: Arc<HashedPostStateSorted>,
+    /// Trie nodes written by the block. Removed nodes are explicit per path.
+    pub(crate) trie_updates: Arc<TrieUpdatesSorted>,
+}
 
 /// A provider factory over a temporary MDBX using storage v2 (packed trie keys).
 pub(crate) type TestFactory = ProviderFactory<MockNodeTypesWithDB>;
@@ -49,16 +66,13 @@ pub(crate) fn snapshot(factory: &TestFactory) -> TestTx {
     factory.db_ref().tx().unwrap()
 }
 
-/// Writes `updates` with reth's writers in one committed transaction.
-pub(crate) fn write(factory: &TestFactory, updates: &BlockUpdates) {
-    let provider = factory.provider_rw().unwrap();
-    provider.write_hashed_state(&updates.hashed_state).unwrap();
-    provider.write_trie_updates_sorted(&updates.trie_updates).unwrap();
-    provider.commit().unwrap();
-}
-
 /// Three storage nodes, `R = 2`, seen from `node_id`.
 pub(crate) fn cluster(node_id: u64) -> Arc<Cluster> {
+    cluster_splitting(node_id, &[])
+}
+
+/// Three storage nodes, `R = 2`, seen from `node_id`, splitting the storage of `split`.
+pub(crate) fn cluster_splitting(node_id: u64, split: &[Address]) -> Arc<Cluster> {
     let nodes = (1..=3)
         .map(|id| NodeConfig {
             id: NodeId(id),
@@ -73,7 +87,10 @@ pub(crate) fn cluster(node_id: u64) -> Arc<Cluster> {
             retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
             nodes,
             apply_from: Vec::new(),
-            split_storage: Vec::new(),
+            split_storage: split
+                .iter()
+                .map(|address| Bytes::copy_from_slice(address.as_slice()))
+                .collect(),
             read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
         })
         .unwrap(),
@@ -85,17 +102,12 @@ pub(crate) fn packed(path: Nibbles) -> Vec<u8> {
     PackedStoredNibbles(path).to_compact_array().to_vec()
 }
 
-/// The canonical block wrapper for generated updates.
-pub(crate) fn canonical(
-    number: u64,
-    hash: B256,
-    parent_hash: B256,
-    updates: &BlockUpdates,
-) -> CanonicalBlock {
+/// Canonical block `number` of fork 0 with its hashed state.
+pub(crate) fn canonical(number: u64, hashed_state: &Arc<HashedPostStateSorted>) -> CanonicalBlock {
     CanonicalBlock {
-        block: BlockNumHash::new(number, hash),
-        parent_hash,
-        updates: Some(updates.clone()),
+        block: BlockNumHash::new(number, block_hash(0, number)),
+        parent_hash: block_hash(0, number.wrapping_sub(1)),
+        hashed_state: Some(Arc::clone(hashed_state)),
     }
 }
 
@@ -111,9 +123,6 @@ pub(crate) struct KeyUniverse {
     pub(crate) slots: Vec<B256>,
     pub(crate) account_paths: Vec<Nibbles>,
     pub(crate) storage_paths: Vec<Nibbles>,
-    /// Contracts whose storage is split, read through their own checks; empty unless a test
-    /// sets them, and never written by [`random_updates`].
-    pub(crate) split_contracts: Vec<B256>,
 }
 
 impl KeyUniverse {
@@ -153,7 +162,6 @@ impl KeyUniverse {
             slots,
             account_paths: account_paths.into_iter().collect(),
             storage_paths,
-            split_contracts: Vec::new(),
         }
     }
 }
@@ -242,40 +250,205 @@ pub(crate) fn random_updates(rng: &mut StdRng, keys: &KeyUniverse) -> BlockUpdat
     }
 }
 
-/// `updates` restricted to the keys `cluster`'s node holds, as that node would persist them.
-/// `cluster` splits no contract, so storage is placed by address.
-pub(crate) fn held_by(cluster: &Cluster, updates: &BlockUpdates) -> BlockUpdates {
-    let holds = |table, key: &[u8]| cluster.holds(table, key, &[]).unwrap();
-    let hashed = &updates.hashed_state;
-    let accounts = hashed
-        .accounts
-        .iter()
-        .filter(|(address, _)| holds(ShardedTable::HashedAccounts, address.as_slice()))
-        .copied()
-        .collect();
-    let storages = hashed
-        .storages
-        .iter()
-        .filter(|(address, _)| holds(ShardedTable::HashedStorages, address.as_slice()))
-        .map(|(address, storage)| (*address, storage.clone()))
-        .collect();
-    let trie = &updates.trie_updates;
-    let account_nodes = trie
-        .account_nodes_ref()
-        .iter()
-        .filter(|(path, _)| holds(ShardedTable::AccountsTrie, &packed(*path)))
-        .cloned()
-        .collect();
-    let storage_tries = trie
-        .storage_tries_ref()
-        .iter()
-        .filter(|(address, _)| holds(ShardedTable::StoragesTrie, address.as_slice()))
-        .map(|(address, nodes)| (*address, nodes.clone()))
-        .collect();
-    BlockUpdates {
-        hashed_state: Arc::new(HashedPostStateSorted::new(accounts, storages)),
-        trie_updates: Arc::new(TrieUpdatesSorted::new(account_nodes, storage_tries)),
+/// Plain keys a chain of blocks draws from: addresses spread over chosen shards, slots, and
+/// optionally a split contract with many slots.
+#[derive(Debug, Clone)]
+pub(crate) struct PlainKeys {
+    pub(crate) addresses: Vec<Address>,
+    pub(crate) slots: Vec<B256>,
+    pub(crate) split: Option<Address>,
+    pub(crate) split_slots: Vec<B256>,
+}
+
+impl PlainKeys {
+    /// Three addresses whose hashed address is in each of `shards`, eight slots, and with
+    /// `split` a contract with 300 slots.
+    pub(crate) fn new(rng: &mut StdRng, shards: &[Shard], split: bool) -> Self {
+        let mut addresses = Vec::new();
+        for shard in shards {
+            let mut found = 0;
+            while found < 3 {
+                let address = Address::from(rng.random::<[u8; 20]>());
+                if keccak256(address)[0] == shard.0 {
+                    addresses.push(address);
+                    found += 1;
+                }
+            }
+        }
+        let slots = (0..8).map(|_| B256::from(rng.random::<[u8; 32]>())).collect();
+        let split = split.then(|| Address::from(rng.random::<[u8; 20]>()));
+        let split_slots = split
+            .map(|_| (0..300).map(|_| B256::from(rng.random::<[u8; 32]>())).collect())
+            .unwrap_or_default();
+        Self { addresses, slots, split, split_slots }
     }
+
+    /// Every (address, slot) pair the chain may write.
+    pub(crate) fn storage_keys(&self) -> Vec<(Address, B256)> {
+        let plain = self
+            .addresses
+            .iter()
+            .flat_map(|address| self.slots.iter().map(|slot| (*address, *slot)));
+        let split = self
+            .split
+            .iter()
+            .flat_map(|address| self.split_slots.iter().map(|slot| (*address, *slot)));
+        plain.chain(split).collect()
+    }
+}
+
+/// The plain state after a block.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PlainState {
+    pub(crate) accounts: BTreeMap<Address, Account>,
+    pub(crate) storage: BTreeMap<(Address, B256), U256>,
+}
+
+impl PlainState {
+    /// The slot's value, zero when absent.
+    pub(crate) fn slot(&self, address: Address, slot: B256) -> U256 {
+        self.storage.get(&(address, slot)).copied().unwrap_or_default()
+    }
+
+    /// Whether the account has any storage.
+    pub(crate) fn has_storage(&self, address: Address) -> bool {
+        self.storage
+            .range((address, B256::ZERO)..=(address, B256::repeat_byte(0xff)))
+            .next()
+            .is_some()
+    }
+}
+
+/// One block of a chain over plain keys: its changesets (previous values) and hashed state (new
+/// values).
+#[derive(Debug, Clone)]
+pub(crate) struct ChainBlock {
+    pub(crate) number: u64,
+    pub(crate) reverts: PlainStateReverts,
+    pub(crate) hashed: Arc<HashedPostStateSorted>,
+}
+
+/// The next block after `state`: accounts created, changed, emptied (deleted) and recreated,
+/// slots set, zeroed and set again. Returns the block and the state after it.
+pub(crate) fn next_block(
+    rng: &mut StdRng,
+    keys: &PlainKeys,
+    state: &PlainState,
+    number: u64,
+) -> (ChainBlock, PlainState) {
+    let mut after = state.clone();
+    let mut account_reverts = Vec::new();
+    let mut accounts = Vec::new();
+    for address in &keys.addresses {
+        let before = state.accounts.get(address).copied();
+        let new = match rng.random_range(0..10) {
+            0..=2 => Some(Account {
+                nonce: rng.random_range(0..1000),
+                balance: U256::from(rng.random_range(1..u64::MAX)),
+                bytecode_hash: None,
+            }),
+            3 if before.is_some() => None,
+            _ => continue,
+        };
+        let info = |account: Account| AccountInfo {
+            balance: account.balance,
+            nonce: account.nonce,
+            ..Default::default()
+        };
+        account_reverts.push((*address, before.map(info)));
+        accounts.push((keccak256(address), new));
+        match new {
+            Some(account) => after.accounts.insert(*address, account),
+            None => after.accounts.remove(address),
+        };
+    }
+    let mut storage_reverts = Vec::new();
+    let mut storages: B256Map<Vec<(B256, U256)>> = B256Map::default();
+    let mut write = |rng: &mut StdRng, address: Address, slot: B256, after: &mut PlainState| {
+        let before = state.slot(address, slot);
+        let new = if rng.random_bool(0.35) {
+            U256::ZERO
+        } else {
+            U256::from(rng.random_range(1..u64::MAX))
+        };
+        if new == before {
+            return;
+        }
+        storage_reverts.push(PlainStorageRevert {
+            address,
+            wiped: false,
+            storage_revert: vec![(U256::from_be_bytes(slot.0), RevertToSlot::Some(before))],
+        });
+        storages.entry(keccak256(address)).or_default().push((keccak256(slot), new));
+        if new.is_zero() {
+            after.storage.remove(&(address, slot));
+        } else {
+            after.storage.insert((address, slot), new);
+        }
+    };
+    for address in &keys.addresses {
+        if rng.random_bool(0.4) {
+            for slot in &keys.slots {
+                if rng.random_bool(0.5) {
+                    write(rng, *address, *slot, &mut after);
+                }
+            }
+        }
+    }
+    if let Some(split) = keys.split {
+        for slot in &keys.split_slots {
+            if number == 0 || rng.random_bool(0.2) {
+                write(rng, split, *slot, &mut after);
+            }
+        }
+    }
+    accounts.sort_by_key(|(address, _)| *address);
+    let storages = storages
+        .into_iter()
+        .map(|(address, mut slots)| {
+            slots.sort_by_key(|(slot, _)| *slot);
+            (address, HashedStorageSorted { storage_slots: slots })
+        })
+        .collect();
+    let block = ChainBlock {
+        number,
+        reverts: PlainStateReverts {
+            accounts: vec![account_reverts],
+            storage: vec![storage_reverts],
+        },
+        hashed: Arc::new(HashedPostStateSorted::new(accounts, storages)),
+    };
+    (block, after)
+}
+
+/// A chain of `blocks` blocks from genesis (block 0) and the plain state after each.
+pub(crate) fn plain_chain(
+    rng: &mut StdRng,
+    keys: &PlainKeys,
+    blocks: u64,
+) -> (Vec<ChainBlock>, Vec<PlainState>) {
+    let mut states: Vec<PlainState> = Vec::new();
+    let mut chain = Vec::new();
+    for number in 0..blocks {
+        let empty = PlainState::default();
+        let (block, state) = next_block(rng, keys, states.last().unwrap_or(&empty), number);
+        chain.push(block);
+        states.push(state);
+    }
+    (chain, states)
+}
+
+/// Writes `block`'s changesets and hashed state with reth's writers.
+pub(crate) fn write_chain_block(
+    provider: &impl StateWriter,
+    block: &ChainBlock,
+) -> ProviderResult<()> {
+    provider.write_state_reverts(
+        block.reverts.clone(),
+        block.number,
+        StateWriteConfig::default(),
+    )?;
+    provider.write_hashed_state(&block.hashed)
 }
 
 /// Raw contents of the sharded tables, exactly as MDBX stores them.
@@ -330,10 +503,36 @@ pub(crate) fn rng(seed: u64) -> StdRng {
     StdRng::seed_from_u64(seed)
 }
 
-/// The raw stored value of `key` in table `T`.
-pub(crate) fn raw_get<T: Table>(factory: &TestFactory, key: &[u8]) -> Option<Vec<u8>> {
-    snapshot(factory)
-        .get::<RawTable<T>>(RawKey::from_vec(key.to_vec()))
-        .unwrap()
-        .map(|value| value.into_value())
+/// An owner store over a [`TestFactory`]'s database.
+pub(crate) type Store = OwnerStore<Arc<TempDatabase<DatabaseEnv>>>;
+
+/// An owner over `factory`'s database with the block-hash lookup of fork 0 and a changeset reader,
+/// so its history is built from disk. The returned factory must outlive the reads.
+pub(crate) fn open_owner(
+    factory: &TestFactory,
+    cluster: &Arc<Cluster>,
+    retention: u64,
+) -> (Store, Arc<TestFactory>) {
+    let store =
+        OwnerStore::new(Arc::clone(cluster), Arc::clone(factory.db_ref()), retention).unwrap();
+    assert!(store.install_block_hashes(Box::new(|number| Some(block_hash(0, number)))));
+    let shared = Arc::new(factory.clone());
+    assert!(store.install_changesets(Box::new(ProviderChangesets::new(&shared))).unwrap());
+    (store, shared)
+}
+
+/// Persists `blocks` (changesets, hashed state, `Finish`) in one commit, through `store`'s
+/// persistence hook when given.
+pub(crate) fn persist_chain(factory: &TestFactory, store: Option<&Store>, blocks: &[ChainBlock]) {
+    let provider = factory.provider_rw().unwrap();
+    for block in blocks {
+        write_chain_block(&*provider, block).unwrap();
+    }
+    let tip = blocks.last().unwrap().number;
+    provider.save_stage_checkpoint(StageId::Finish, StageCheckpoint::new(tip)).unwrap();
+    let commit = || provider.commit().map_err(|error| DatabaseError::Other(error.to_string()));
+    match store {
+        Some(store) => store.commit_persisted(tip, commit).unwrap(),
+        None => commit().unwrap(),
+    }
 }

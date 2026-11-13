@@ -1,17 +1,21 @@
-//! Connects a clustered database to the running node: block hashes for persistence points,
-//! canonical blocks for the owner store, and inserted blocks' execution results for apply nodes.
+//! Connects a clustered database to the running node: block hashes and persisted changesets for
+//! the owner store's history, canonical blocks above the persisted tip, and inserted blocks'
+//! execution results for apply nodes.
 
 use std::{future::Future, sync::Arc};
 
 use alloy_primitives::{B256, Bytes};
 use base_execution_cluster::{
-    BlockUpdates, CanonicalBlock, ClusterNode, ExecutedBlockResult, ResultCapture,
+    CanonicalBlock, ClusterNode, ExecutedBlockResult, ProviderChangesets, ResultCapture,
 };
 use futures::{Stream, StreamExt};
 use reth_chain_state::ExecutedBlock;
 use reth_node_api::ConsensusEngineEvent;
 use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives};
-use reth_provider::{BlockHashReader, CanonStateNotification, CanonStateSubscriptions, Chain};
+use reth_provider::{
+    BlockHashReader, CanonStateNotification, CanonStateSubscriptions, Chain, ChangeSetReader,
+    DatabaseProviderFactory, StaticFileProviderFactory, StorageChangeSetReader,
+};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, warn};
 
@@ -20,19 +24,20 @@ use tracing::{info, warn};
 pub struct ClusterFeed;
 
 impl ClusterFeed {
-    /// Installs `provider`'s block hashes on `node`, registers the initial persistence point,
-    /// and returns the task that feeds every canonical block to `node`'s owner store. Subscribes
-    /// before returning, so no block notified after this call is missed.
+    /// Installs `provider`'s block hashes and persisted changesets on `node`, which builds its
+    /// owner's history index, and returns the task that feeds every canonical block to `node`'s
+    /// owner store. Subscribes before building, so no block notified after this call is missed.
     ///
-    /// The provider owns the clustered database, which owns `node`, so the installed lookup
-    /// references the provider only weakly and the task keeps it alive: dropping the task and the
-    /// node's other handles releases the node, its owner server and its held snapshots.
+    /// The provider owns the clustered database, which owns `node`, so the installed lookup and
+    /// reader reference the provider only weakly and the task keeps it alive: dropping the task
+    /// and the node's other handles releases the node and its owner server.
     pub fn start<P>(
         node: Arc<ClusterNode>,
         provider: P,
     ) -> eyre::Result<impl Future<Output = ()> + Send + 'static>
     where
-        P: BlockHashReader + CanonStateSubscriptions + 'static,
+        P: BlockHashReader + CanonStateSubscriptions + DatabaseProviderFactory + 'static,
+        P::Provider: ChangeSetReader + StorageChangeSetReader + StaticFileProviderFactory,
     {
         let notifications = provider.subscribe_to_canonical_state();
         let provider = Arc::new(provider);
@@ -40,11 +45,8 @@ impl ClusterFeed {
         node.install_block_hashes(Box::new(move |number| {
             lookup.upgrade()?.block_hash(number).ok().flatten()
         }));
-        let point = node.register_persistence_point()?;
-        info!(
-            persisted_tip = ?point.map(|block| block.number),
-            "cluster owner store following canonical blocks"
-        );
+        node.install_changesets(Box::new(ProviderChangesets::new(&provider)))?;
+        info!("cluster owner store following canonical blocks");
         Ok(Self::follow(node, notifications, provider))
     }
 
@@ -56,15 +58,17 @@ impl ClusterFeed {
     ) {
         loop {
             match notifications.recv().await {
-                Ok(notification) => {
-                    for block in Self::canonical_blocks(&notification.committed()) {
-                        node.owner_store().insert_block(block);
-                    }
+                Ok(CanonStateNotification::Commit { new }) => {
+                    node.owner_store().commit_blocks(Self::canonical_blocks(&new));
+                }
+                Ok(CanonStateNotification::Reorg { old, new }) => {
+                    let reverted_from = old.first().number();
+                    node.owner_store().reorg_blocks(reverted_from, Self::canonical_blocks(&new));
                 }
                 Err(RecvError::Lagged(skipped)) => warn!(
                     skipped,
-                    "cluster owner store missed canonical blocks; it serves past them only from \
-                     its next persistence point"
+                    "cluster owner store missed canonical blocks; it serves past them only once \
+                     they are persisted"
                 ),
                 Err(RecvError::Closed) => return,
             }
@@ -122,8 +126,8 @@ impl ClusterFeed {
         }
     }
 
-    /// The blocks of `chain` as the owner store retains them; a block whose notification lacks
-    /// trie data has updates `None`.
+    /// The blocks of `chain` as the owner store keeps them; a block whose notification lacks
+    /// trie data has hashed state `None`.
     pub fn canonical_blocks<N: NodePrimitives>(chain: &Chain<N>) -> Vec<CanonicalBlock> {
         chain
             .blocks()
@@ -131,10 +135,7 @@ impl ClusterFeed {
             .map(|block| CanonicalBlock {
                 block: block.num_hash(),
                 parent_hash: block.parent_hash(),
-                updates: chain.trie_data_at(block.number()).map(|data| BlockUpdates {
-                    hashed_state: data.hashed_state(),
-                    trie_updates: data.trie_updates(),
-                }),
+                hashed_state: chain.trie_data_at(block.number()).map(|data| data.hashed_state()),
             })
             .collect()
     }
@@ -150,16 +151,37 @@ mod tests {
         ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, NodeConfig, NodeId,
     };
     use reth_db::test_utils::create_test_rw_db;
-    use reth_provider::{CanonStateNotifications, ProviderResult};
+    use reth_provider::{
+        CanonStateNotifications, ProviderFactory, ProviderResult,
+        test_utils::{MockNodeTypesWithDB, create_test_provider_factory},
+    };
     use tokio::sync::broadcast;
 
     use super::*;
 
-    /// A provider that, like the node's real one, owns the clustered database.
+    type TestFactory = ProviderFactory<MockNodeTypesWithDB>;
+
+    /// A provider that, like the node's real one, owns the clustered database. Changesets come
+    /// from a separate, empty test database.
     #[derive(Clone)]
     struct DatabaseOwningProvider {
         _database: ClusteredDatabase,
+        changesets: TestFactory,
         canonical: broadcast::Sender<CanonStateNotification<BasePrimitives>>,
+    }
+
+    impl DatabaseProviderFactory for DatabaseOwningProvider {
+        type DB = <TestFactory as DatabaseProviderFactory>::DB;
+        type Provider = <TestFactory as DatabaseProviderFactory>::Provider;
+        type ProviderRW = <TestFactory as DatabaseProviderFactory>::ProviderRW;
+
+        fn database_provider_ro(&self) -> ProviderResult<Self::Provider> {
+            self.changesets.database_provider_ro()
+        }
+
+        fn database_provider_rw(&self) -> ProviderResult<Self::ProviderRW> {
+            self.changesets.database_provider_rw()
+        }
     }
 
     impl BlockHashReader for DatabaseOwningProvider {
@@ -207,11 +229,14 @@ mod tests {
         )
         .unwrap();
         let node = Arc::clone(database.cluster().unwrap());
-        let provider =
-            DatabaseOwningProvider { _database: database, canonical: broadcast::channel(1).0 };
+        let provider = DatabaseOwningProvider {
+            _database: database,
+            changesets: create_test_provider_factory(),
+            canonical: broadcast::channel(1).0,
+        };
 
         let feed = ClusterFeed::start(Arc::clone(&node), provider).unwrap();
-        assert_eq!(node.block_hash(0), Some(B256::ZERO));
+        assert_eq!(node.owner_store().block_hash(0), Some(B256::ZERO));
 
         drop(feed);
         drop(node);

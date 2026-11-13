@@ -6,20 +6,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_eips::BlockNumHash;
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::{B256, Bytes, keccak256};
 use base_execution_cluster::{
-    ApplyFallback, BlockUpdates, ClientError, ClientOptions, Cluster, ClusterClient, ClusterConfig,
+    ApplyFallback, ClientError, ClientOptions, Cluster, ClusterClient, ClusterConfig,
     ExecutedBlocks, Frame, NodeConfig, NodeId, OwnerFailure, OwnerServer, OwnerStore, Query,
     ReadError, ReadResult, Request, Response, ServableRange, Shard, ShardedTable, SnapshotId,
     StoreError,
 };
-use reth_db_api::{tables, transaction::DbTxMut};
-use reth_primitives_traits::Bytecode;
+use reth_db::test_utils::create_test_rw_db;
+use reth_db_api::{table::Compress, tables, transaction::DbTxMut};
+use reth_primitives_traits::{Bytecode, StorageEntry};
 
 use crate::common::{
-    KeyUniverse, TableDump, TestFactory, TestTx, block_hash, canonical, factory, random_updates,
-    rng, snapshot, write,
+    ChainBlock, PlainKeys, PlainState, Store, TestFactory, block_hash, factory, open_owner,
+    persist_chain, plain_chain, rng,
 };
 
 /// Storage nodes 1 and 2 at the given addresses and a stateless node 3, seen from `node_id`.
@@ -53,14 +53,15 @@ fn closed_port() -> SocketAddr {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
 }
 
-/// A database with random state in shard `shard` and a bytecode, and the bytecode's hash.
-fn populated_db(shard: Shard) -> (TestFactory, B256) {
+/// A chain of plain-key blocks with addresses in `shard`, persisted through block 4 with real
+/// changesets, plus a bytecode in `shard`; returns the database, keys, true states and the
+/// bytecode's hash.
+fn populated_db(shard: Shard) -> (TestFactory, PlainKeys, Vec<PlainState>, B256) {
     let db = factory();
     let mut rng = rng(5);
-    let keys = KeyUniverse::new(&mut rng, &[shard]);
-    for _ in 0..3 {
-        write(&db, &random_updates(&mut rng, &keys));
-    }
+    let keys = PlainKeys::new(&mut rng, &[shard], false);
+    let (chain, states) = plain_chain(&mut rng, &keys, 5);
+    persist_chain(&db, None, &chain);
     let mut code_hash = B256::repeat_byte(0x55);
     code_hash.0[0] = shard.0;
     let provider = db.provider_rw().unwrap();
@@ -69,21 +70,44 @@ fn populated_db(shard: Shard) -> (TestFactory, B256) {
         .put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(vec![0x00].into()))
         .unwrap();
     provider.commit().unwrap();
-    (db, code_hash)
+    (db, keys, states, code_hash)
 }
 
-fn serve(cluster: &Arc<Cluster>, listener: TcpListener) -> (Arc<OwnerStore<TestTx>>, OwnerServer) {
-    let store = Arc::new(OwnerStore::new(Arc::clone(cluster), 160));
+/// An owner of `cluster`'s node over `db` serving on `listener`.
+fn serve(
+    cluster: &Arc<Cluster>,
+    listener: TcpListener,
+    db: &TestFactory,
+    retention: u64,
+) -> (Arc<Store>, OwnerServer, Arc<TestFactory>) {
+    let (store, shared) = open_owner(db, cluster, retention);
+    let store = Arc::new(store);
     let server = OwnerServer::spawn(listener, Arc::clone(&store), Arc::default()).unwrap();
-    (store, server)
+    (store, server, shared)
 }
 
-fn local(store: &OwnerStore<TestTx>, request: &Request) -> ReadResult {
+fn local(store: &Store, request: &Request) -> ReadResult {
     match store.read(request) {
         Ok(response) => Ok(response),
         Err(StoreError::Refused(refusal)) => Err(refusal),
         Err(StoreError::Database(error)) => panic!("database error {error}"),
     }
+}
+
+/// Node 1's view of the cluster seen by `client_view`.
+fn owner_view(client_view: &Cluster) -> Arc<Cluster> {
+    Arc::new(
+        Cluster::new(ClusterConfig { node_id: NodeId(1), ..client_view.config().clone() }).unwrap(),
+    )
+}
+
+/// An address of `keys` with an account and storage in `state`.
+fn busy_address(keys: &PlainKeys, state: &PlainState) -> alloy_primitives::Address {
+    *keys
+        .addresses
+        .iter()
+        .find(|address| state.accounts.contains_key(*address) && state.has_storage(**address))
+        .expect("an address with an account and storage")
 }
 
 #[test]
@@ -93,81 +117,50 @@ fn every_request_and_error_round_trips_over_a_socket() {
     let owned = Shard::all().find(|shard| cluster.owns(*shard)).unwrap();
     let unowned = Shard::all().find(|shard| !cluster.owns(*shard)).unwrap();
 
-    let (db, code_hash) = populated_db(owned);
-    let (store, server) = serve(&cluster, listener);
-    let tip = SnapshotId { number: 0, hash: Some(block_hash(0, 0)) };
-    store.register_persistence_point(BlockNumHash::new(0, block_hash(0, 0)), snapshot(&db));
-
-    let dump = TableDump::read(&db);
-    let address = dump.hashed_storages.keys().find(|k| dump.storages_trie.contains_key(*k));
-    let address = address.expect("an address with storage and a storage trie").clone();
-    let path = dump.accounts_trie.keys().find(|k| k[32] >= 2).expect("a sharded trie node").clone();
-    let mut unowned_key = vec![0u8; 32];
-    unowned_key[0] = unowned.0;
+    let (db, keys, states, code_hash) = populated_db(owned);
+    let (store, server, _shared) = serve(&cluster, listener, &db, 160);
+    let tip = SnapshotId { number: 4, hash: Some(block_hash(0, 4)) };
+    let plain = busy_address(&keys, &states[4]);
+    let address = keccak256(plain);
+    let slot = keys.slots.iter().find(|slot| !states[4].slot(plain, **slot).is_zero()).unwrap();
+    let mut unowned_key = B256::ZERO;
+    unowned_key.0[0] = unowned.0;
     let request = |snapshot, table, query| Request { snapshot, table, query };
+    let accounts = ShardedTable::HashedAccounts;
+    let storages = ShardedTable::HashedStorages;
     let cases = [
-        request(tip, ShardedTable::HashedAccounts, Query::Get { key: address.clone() }),
-        request(tip, ShardedTable::AccountsTrie, Query::Get { key: path.clone() }),
+        request(tip, accounts, Query::AccountValue { address }),
+        request(tip, storages, Query::StorageValue { address, slot: keccak256(slot) }),
         request(tip, ShardedTable::Bytecodes, Query::Get { key: code_hash.to_vec() }),
+        request(tip, storages, Query::HasStorage { address }),
+        request(tip, accounts, Query::Status),
+        request(SnapshotId { number: 9, hash: None }, accounts, Query::AccountValue { address }),
         request(
-            tip,
-            ShardedTable::HashedAccounts,
-            Query::SeekGe { key: address.clone(), limit: 4 },
+            SnapshotId { number: 4, hash: Some(block_hash(1, 4)) },
+            accounts,
+            Query::AccountValue { address },
         ),
-        request(tip, ShardedTable::AccountsTrie, Query::SeekGe { key: path, limit: 4 }),
-        request(
-            tip,
-            ShardedTable::HashedStorages,
-            Query::SeekDupGe { key: address.clone(), subkey: vec![0; 32], limit: 4 },
-        ),
-        request(
-            tip,
-            ShardedTable::StoragesTrie,
-            Query::SeekDupGe { key: address.clone(), subkey: vec![0; 33], limit: 4 },
-        ),
-        request(
-            SnapshotId { number: 9, hash: None },
-            ShardedTable::HashedAccounts,
-            Query::Get { key: address.clone() },
-        ),
-        request(
-            SnapshotId { number: 0, hash: Some(block_hash(1, 0)) },
-            ShardedTable::HashedAccounts,
-            Query::Get { key: address.clone() },
-        ),
-        request(tip, ShardedTable::HashedAccounts, Query::Get { key: unowned_key }),
-        request(tip, ShardedTable::HashedStorages, Query::Get { key: address }),
+        request(tip, accounts, Query::AccountValue { address: unowned_key }),
+        request(tip, accounts, Query::Get { key: address.to_vec() }),
     ];
 
     let mut stream = TcpStream::connect(server.local_addr()).unwrap();
-    let mut seen_values = 0;
-    let mut seen_errors = Vec::new();
+    let mut answers = Vec::new();
     for case in &cases {
         Frame::write(&mut stream, case).unwrap();
         let remote: ReadResult = Frame::read(&mut stream).unwrap();
         assert_eq!(remote, local(&store, case), "{case:?}");
-        match remote {
-            Ok(Response::Value(Some(_))) => seen_values += 1,
-            Ok(Response::Entries(entries)) => assert!(!entries.entries.is_empty()),
-            Ok(Response::Duplicates(values)) => assert!(!values.values.is_empty()),
-            Ok(Response::Value(None) | Response::ExecutedBlock(_)) => {
-                panic!("expected stored data for {case:?}")
-            }
-            Err(error) => seen_errors.push(error),
-        }
+        answers.push(remote);
     }
-    assert_eq!(seen_values, 3);
-    assert_eq!(
-        seen_errors,
-        [
-            ReadError::SnapshotUnavailable {
-                servable: Some(ServableRange { lowest: 0, highest: 0 })
-            },
-            ReadError::WrongFork,
-            ReadError::NotOwner,
-            ReadError::Unsupported,
-        ]
-    );
+    assert!(matches!(&answers[0], Ok(Response::Value(Some(_)))));
+    assert!(matches!(&answers[1], Ok(Response::Value(Some(_)))));
+    assert!(matches!(&answers[2], Ok(Response::Value(Some(_)))));
+    assert_eq!(answers[3], Ok(Response::HasStorage(true)));
+    assert_eq!(answers[4], Ok(Response::Status(Some(ServableRange { lowest: 0, highest: 4 }))));
+    assert!(matches!(&answers[5], Err(refusal) if refusal.is_behind(9)));
+    assert_eq!(answers[6], Err(ReadError::WrongFork));
+    assert_eq!(answers[7], Err(ReadError::NotOwner));
+    assert_eq!(answers[8], Err(ReadError::Unsupported));
 }
 
 #[test]
@@ -175,66 +168,56 @@ fn client_fails_over_when_the_first_owner_is_down() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let client_view = cluster_of(3, 2, listener.local_addr().unwrap(), closed_port());
     let shard = Shard::all().find(|shard| client_view.owners(*shard)[0] == NodeId(2)).unwrap();
-
-    let owner_view = Arc::new(
-        Cluster::new(ClusterConfig { node_id: NodeId(1), ..client_view.config().clone() }).unwrap(),
-    );
-    let (db, code_hash) = populated_db(shard);
-    let (store, _server) = serve(&owner_view, listener);
-    store.register_persistence_point(BlockNumHash::new(0, block_hash(0, 0)), snapshot(&db));
-    let tip = SnapshotId { number: 0, hash: None };
+    let owner_view = owner_view(&client_view);
+    let (db, keys, states, code_hash) = populated_db(shard);
+    let (_store, _server, _shared) = serve(&owner_view, listener, &db, 160);
+    let tip = SnapshotId { number: 4, hash: None };
+    let state = &states[4];
 
     let client = ClusterClient::new(client_view, ClientOptions::default());
-    let dump = TableDump::read(&db);
-    let address = dump.hashed_storages.keys().find(|k| dump.hashed_accounts.contains_key(*k));
-    let address = address.expect("an address with an account and storage").clone();
-    let expected = |table, query| local(&store, &Request { snapshot: tip, table, query }).unwrap();
+    let plain = busy_address(&keys, state);
+    let address = keccak256(plain);
+    let account = client.account(tip, address).unwrap();
+    assert_eq!(account, state.accounts.get(&plain).map(|account| account.compress()));
+    for slot in &keys.slots {
+        let value = state.slot(plain, *slot);
+        let want =
+            (!value.is_zero()).then(|| StorageEntry { key: keccak256(slot), value }.compress());
+        assert_eq!(client.storage(tip, address, keccak256(slot)).unwrap(), want);
+    }
+    assert!(client.has_storage(tip, address).unwrap());
+    assert!(client.bytecode(tip, code_hash.as_slice()).unwrap().is_some());
+    assert_eq!(client.status(NodeId(1)).unwrap(), Some(ServableRange { lowest: 0, highest: 4 }));
+}
 
-    let get = client.get(tip, ShardedTable::HashedAccounts, &address).unwrap();
-    assert_eq!(
-        Response::Value(get),
-        expected(ShardedTable::HashedAccounts, Query::Get { key: address.clone() })
-    );
-    let code = client.get(tip, ShardedTable::Bytecodes, code_hash.as_slice()).unwrap();
-    assert!(code.is_some());
-    let entries = client.seek_ge(tip, ShardedTable::HashedAccounts, &address, 8).unwrap();
-    assert_eq!(
-        Response::Entries(entries),
-        expected(ShardedTable::HashedAccounts, Query::SeekGe { key: address.clone(), limit: 8 })
-    );
-    let values =
-        client.seek_dup_ge(tip, ShardedTable::HashedStorages, &address, &[0; 32], 8, None).unwrap();
-    assert_eq!(
-        Response::Duplicates(values),
-        expected(
-            ShardedTable::HashedStorages,
-            Query::SeekDupGe { key: address, subkey: vec![0; 32], limit: 8 }
-        )
-    );
+/// An owner of node 1 at persisted block 0 over a fresh database, with the chain that follows.
+fn owner_at_genesis(
+    client_view: &Cluster,
+    listener: TcpListener,
+) -> (Arc<Store>, OwnerServer, Arc<TestFactory>, TestFactory, Vec<ChainBlock>) {
+    let db = factory();
+    let mut rng = rng(6);
+    let keys = PlainKeys::new(&mut rng, &[Shard(0x42)], false);
+    let (chain, _) = plain_chain(&mut rng, &keys, 2);
+    persist_chain(&db, None, &chain[..=0]);
+    let (store, server, shared) = serve(&owner_view(client_view), listener, &db, 160);
+    (store, server, shared, db, chain)
 }
 
 #[test]
 fn client_retries_while_every_owner_is_behind() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let client_view = cluster_of(3, 2, listener.local_addr().unwrap(), closed_port());
-    let owner_view = Arc::new(
-        Cluster::new(ClusterConfig { node_id: NodeId(1), ..client_view.config().clone() }).unwrap(),
-    );
-    let (store, _server) = serve(&owner_view, listener);
-    let db = factory();
+    let (store, _server, _shared, db, chain) = owner_at_genesis(&client_view, listener);
 
-    let catch_up = {
-        let store = Arc::clone(&store);
-        let tx = snapshot(&db);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            store.register_persistence_point(BlockNumHash::new(0, block_hash(0, 0)), tx);
-        })
-    };
+    let catch_up = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        persist_chain(&db, Some(&store), &chain[1..=1]);
+    });
     let options = ClientOptions { retry_for: Duration::from_secs(10), ..Default::default() };
     let client = ClusterClient::new(client_view, options);
-    let tip = SnapshotId { number: 0, hash: Some(block_hash(0, 0)) };
-    assert_eq!(client.get(tip, ShardedTable::HashedAccounts, &[0x42; 32]).unwrap(), None);
+    let tip = SnapshotId { number: 1, hash: Some(block_hash(0, 1)) };
+    assert_eq!(client.account(tip, B256::repeat_byte(0x42)).unwrap(), None);
     catch_up.join().unwrap();
 }
 
@@ -245,24 +228,15 @@ const PAST_OLD_RETRY_BUDGET: Duration = Duration::from_millis(2500);
 fn client_waits_by_default_for_an_owner_behind_longer_than_two_seconds() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let client_view = cluster_of(3, 2, listener.local_addr().unwrap(), closed_port());
-    let owner_view = Arc::new(
-        Cluster::new(ClusterConfig { node_id: NodeId(1), ..client_view.config().clone() }).unwrap(),
-    );
-    let (store, _server) = serve(&owner_view, listener);
-    let db = factory();
-    store.register_persistence_point(BlockNumHash::new(0, block_hash(0, 0)), snapshot(&db));
+    let (store, _server, _shared, db, chain) = owner_at_genesis(&client_view, listener);
 
-    let catch_up = {
-        let store = Arc::clone(&store);
-        let tx = snapshot(&db);
-        std::thread::spawn(move || {
-            std::thread::sleep(PAST_OLD_RETRY_BUDGET);
-            store.register_persistence_point(BlockNumHash::new(1, block_hash(0, 1)), tx);
-        })
-    };
+    let catch_up = std::thread::spawn(move || {
+        std::thread::sleep(PAST_OLD_RETRY_BUDGET);
+        persist_chain(&db, Some(&store), &chain[1..=1]);
+    });
     let client = ClusterClient::new(client_view, ClientOptions::default());
     let tip = SnapshotId { number: 1, hash: Some(block_hash(0, 1)) };
-    assert_eq!(client.get(tip, ShardedTable::HashedAccounts, &[0x42; 32]).unwrap(), None);
+    assert_eq!(client.account(tip, B256::repeat_byte(0x42)).unwrap(), None);
     catch_up.join().unwrap();
     assert_eq!(client.remote_read_stats().counts().waits, 1);
 }
@@ -271,20 +245,18 @@ fn client_waits_by_default_for_an_owner_behind_longer_than_two_seconds() {
 fn client_refuses_at_once_when_owners_no_longer_have_the_block() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let client_view = cluster_of(3, 2, listener.local_addr().unwrap(), closed_port());
-    let owner_view = Arc::new(
-        Cluster::new(ClusterConfig { node_id: NodeId(1), ..client_view.config().clone() }).unwrap(),
-    );
-    let (store, _server) = serve(&owner_view, listener);
-    store.register_persistence_point(
-        BlockNumHash::new(500, block_hash(0, 500)),
-        snapshot(&factory()),
-    );
+    let db = factory();
+    let mut rng = rng(7);
+    let keys = PlainKeys::new(&mut rng, &[Shard(0x42)], false);
+    let (chain, _) = plain_chain(&mut rng, &keys, 13);
+    persist_chain(&db, None, &chain);
+    let (_store, _server, _shared) = serve(&owner_view(&client_view), listener, &db, 5);
 
     let client = ClusterClient::new(client_view, ClientOptions::default());
-    let discarded = SnapshotId { number: 100, hash: Some(block_hash(0, 100)) };
+    let discarded = SnapshotId { number: 2, hash: Some(block_hash(0, 2)) };
     let started = Instant::now();
     let Err(ClientError::OwnersFailed(attempts)) =
-        client.get(discarded, ShardedTable::HashedAccounts, &[0x42; 32])
+        client.account(discarded, B256::repeat_byte(0x42))
     else {
         panic!("expected every owner to fail")
     };
@@ -292,74 +264,35 @@ fn client_refuses_at_once_when_owners_no_longer_have_the_block() {
     assert!(attempts.iter().any(|attempt| matches!(
         attempt.failure,
         OwnerFailure::Refused(ReadError::SnapshotUnavailable { servable: Some(range) })
-            if range.lowest > 100
+            if range.lowest > 2
     )));
     assert_eq!(client.remote_read_stats().counts().waits, 0);
-}
-
-#[test]
-fn a_stalled_owner_holds_a_read_with_a_distant_deadline_only_for_the_io_timeout() {
-    let stalled = TcpListener::bind("127.0.0.1:0").unwrap();
-    let client_view = cluster_of(3, 2, stalled.local_addr().unwrap(), closed_port());
-    let io_timeout = Duration::from_millis(200);
-    let options = ClientOptions { io_timeout, ..Default::default() };
-    let client = ClusterClient::new(client_view, options);
-    let tip = SnapshotId { number: 0, hash: None };
-
-    let started = Instant::now();
-    let deadline = Some(started + Duration::from_secs(30));
-    let read =
-        client.seek_dup_ge(tip, ShardedTable::HashedStorages, &[0x42; 32], &[0; 32], 4, deadline);
-    assert!(matches!(read, Err(ClientError::OwnersFailed(_))), "{read:?}");
-    assert!(started.elapsed() < io_timeout * 5, "took {:?}", started.elapsed());
-    drop(stalled);
 }
 
 #[test]
 fn client_waits_for_an_owner_to_persist_requested_code() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let client_view = cluster_of(3, 2, listener.local_addr().unwrap(), closed_port());
-    let owner_view = Arc::new(
-        Cluster::new(ClusterConfig { node_id: NodeId(1), ..client_view.config().clone() }).unwrap(),
-    );
+    let owner_view = owner_view(&client_view);
     let shard = Shard::all().find(|shard| owner_view.owns(*shard)).unwrap();
     let mut code_hash = B256::repeat_byte(0x66);
     code_hash.0[0] = shard.0;
+    let (store, _server, _shared, db, chain) = owner_at_genesis(&client_view, listener);
 
-    let (store, _server) = serve(&owner_view, listener);
-    let db = factory();
-    store.register_persistence_point(BlockNumHash::new(99, block_hash(0, 99)), snapshot(&db));
-    for number in [100, 101] {
-        let empty = BlockUpdates { hashed_state: Arc::default(), trie_updates: Arc::default() };
-        store.insert_block(canonical(
-            number,
-            block_hash(0, number),
-            block_hash(0, number - 1),
-            &empty,
-        ));
-    }
-
-    let persist_code = {
-        let store = Arc::clone(&store);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            let provider = db.provider_rw().unwrap();
-            provider
-                .tx_ref()
-                .put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(vec![0x60, 0x00].into()))
-                .unwrap();
-            provider.commit().unwrap();
-            store.register_persistence_point(
-                BlockNumHash::new(100, block_hash(0, 100)),
-                snapshot(&db),
-            );
-        })
-    };
+    let persist_code = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        let provider = db.provider_rw().unwrap();
+        provider
+            .tx_ref()
+            .put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(vec![0x60, 0x00].into()))
+            .unwrap();
+        provider.commit().unwrap();
+        persist_chain(&db, Some(&store), &chain[1..=1]);
+    });
     let options = ClientOptions { retry_for: Duration::from_secs(10), ..Default::default() };
     let client = ClusterClient::new(client_view, options);
-    let tip = SnapshotId { number: 100, hash: Some(block_hash(0, 100)) };
-    let code = client.get(tip, ShardedTable::Bytecodes, code_hash.as_slice()).unwrap();
-    assert!(code.is_some());
+    let tip = SnapshotId { number: 1, hash: Some(block_hash(0, 1)) };
+    assert!(client.bytecode(tip, code_hash.as_slice()).unwrap().is_some());
     persist_code.join().unwrap();
 }
 
@@ -367,18 +300,14 @@ fn client_waits_for_an_owner_to_persist_requested_code() {
 fn client_returns_a_refusal_that_retrying_cannot_fix() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let client_view = cluster_of(3, 2, listener.local_addr().unwrap(), closed_port());
-    let owner_view = Arc::new(
-        Cluster::new(ClusterConfig { node_id: NodeId(1), ..client_view.config().clone() }).unwrap(),
-    );
-    let (store, _server) = serve(&owner_view, listener);
-    store.register_persistence_point(BlockNumHash::new(0, block_hash(0, 0)), snapshot(&factory()));
+    let (_store, _server, _shared, _db, _chain) = owner_at_genesis(&client_view, listener);
 
     let options = ClientOptions { retry_for: Duration::from_secs(10), ..Default::default() };
     let client = ClusterClient::new(client_view, options);
     let other_fork = SnapshotId { number: 0, hash: Some(block_hash(1, 0)) };
     let started = Instant::now();
     let Err(ClientError::OwnersFailed(attempts)) =
-        client.get(other_fork, ShardedTable::HashedAccounts, &[0x42; 32])
+        client.account(other_fork, B256::repeat_byte(0x42))
     else {
         panic!("expected every owner to fail")
     };
@@ -395,7 +324,7 @@ fn client_returns_a_refusal_that_retrying_cannot_fix() {
 fn serve_results(listener: TcpListener) -> (Arc<ExecutedBlocks>, OwnerServer) {
     let view = cluster_of(1, 2, listener.local_addr().unwrap(), closed_port());
     let executed = Arc::new(ExecutedBlocks::default());
-    let store: Arc<OwnerStore<TestTx>> = Arc::new(OwnerStore::new(view, 160));
+    let store = Arc::new(OwnerStore::new(view, create_test_rw_db(), 160).unwrap());
     let server = OwnerServer::spawn(listener, store, Arc::clone(&executed)).unwrap();
     (executed, server)
 }

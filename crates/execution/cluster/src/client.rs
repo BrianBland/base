@@ -14,8 +14,8 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::{
-    ApplyFallback, Cluster, DuplicateValues, Frame, FrameError, NodeId, Query, ReadError,
-    ReadResult, RemoteReadStats, Request, Response, Shard, ShardEntries, ShardedTable, SnapshotId,
+    ApplyFallback, Cluster, Frame, FrameError, KeyPlacement, NodeId, Query, ReadError, ReadResult,
+    RemoteReadStats, Request, Response, ServableRange, Shard, ShardedTable, SnapshotId,
 };
 
 /// Timeouts, retry budget, and pool size of a [`ClusterClient`].
@@ -26,7 +26,7 @@ pub struct ClientOptions {
     /// Timeout for each socket read or write.
     pub io_timeout: Duration,
     /// How long one read keeps retrying while every owner is unreachable or behind the requested
-    /// snapshot; also the deadline of one read of a split contract.
+    /// snapshot.
     pub retry_for: Duration,
     /// Pause between retry rounds.
     pub retry_interval: Duration,
@@ -84,18 +84,14 @@ pub enum ClientError {
     /// Every owner failed in the last round tried.
     #[error("every owner failed: {0:?}")]
     OwnersFailed(Vec<OwnerAttempt>),
-    /// The read's deadline passed before an owner answered.
-    #[error("deadline passed before an owner answered")]
-    DeadlineExpired,
 }
 
 /// Reads keys of shards this node does not own from their owners.
 ///
 /// Calls block the calling thread. Owners are tried in rendezvous order, skipping this node;
 /// the round is retried within [`ClientOptions::retry_for`] only while every owner is unreachable
-/// or behind the snapshot and at least one is behind. A read given a deadline also finishes every
-/// connect, write, read and retry by it, each socket operation still waiting at most its
-/// configured timeout. A read that waits on behind owners for longer than
+/// or behind the snapshot and at least one is behind. A read that waits on behind owners for
+/// longer than
 /// [`Self::SLOW_WAIT`] logs one warning and counts one wait in [`Self::remote_read_stats`].
 #[derive(Debug)]
 pub struct ClusterClient {
@@ -126,63 +122,77 @@ impl ClusterClient {
         &self.remote_reads
     }
 
-    /// The encoded value of `key` in `table` as of `snapshot`, or `None` when absent.
-    pub fn get(
+    /// The encoded account at hashed `address` as of `snapshot`, or `None` when absent.
+    pub fn account(
         &self,
         snapshot: SnapshotId,
-        table: ShardedTable,
+        address: B256,
+    ) -> Result<Option<Vec<u8>>, ClientError> {
+        let table = ShardedTable::HashedAccounts;
+        let shard = Self::key_shard(table, address.as_slice())?;
+        match self
+            .read(Request { snapshot, table, query: Query::AccountValue { address } }, shard)?
+        {
+            Response::Value(value) => Ok(value),
+            _ => unreachable!("checked by read"),
+        }
+    }
+
+    /// The encoded storage entry of exactly hashed `slot` of hashed `address` as of `snapshot`,
+    /// or `None` when the slot is absent. For a split contract the owners of the slot's range
+    /// answer.
+    pub fn storage(
+        &self,
+        snapshot: SnapshotId,
+        address: B256,
+        slot: B256,
+    ) -> Result<Option<Vec<u8>>, ClientError> {
+        let table = ShardedTable::HashedStorages;
+        let shard = match self.cluster.placement(table, address.as_slice(), slot.as_slice()) {
+            Some(KeyPlacement::Shard(shard)) => shard,
+            Some(KeyPlacement::Replicated) | None => return Err(ClientError::InvalidKey),
+        };
+        let query = Query::StorageValue { address, slot };
+        match self.read(Request { snapshot, table, query }, shard)? {
+            Response::Value(value) => Ok(value),
+            _ => unreachable!("checked by read"),
+        }
+    }
+
+    /// Whether hashed `address` has any storage as of `snapshot`.
+    pub fn has_storage(&self, snapshot: SnapshotId, address: B256) -> Result<bool, ClientError> {
+        let table = ShardedTable::HashedStorages;
+        let shard = Self::key_shard(table, address.as_slice())?;
+        match self.read(Request { snapshot, table, query: Query::HasStorage { address } }, shard)? {
+            Response::HasStorage(has) => Ok(has),
+            _ => unreachable!("checked by read"),
+        }
+    }
+
+    /// The encoded bytecode with hash `key`, or `None` when absent.
+    pub fn bytecode(
+        &self,
+        snapshot: SnapshotId,
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, ClientError> {
+        let table = ShardedTable::Bytecodes;
         let query = Query::Get { key: key.to_vec() };
-        match self.read(Request { snapshot, table, query }, Self::key_shard(table, key)?, None)? {
+        match self.read(Request { snapshot, table, query }, Self::key_shard(table, key)?)? {
             Response::Value(value) => Ok(value),
-            Response::Entries(_) | Response::Duplicates(_) | Response::ExecutedBlock(_) => {
-                unreachable!("checked by read")
-            }
+            _ => unreachable!("checked by read"),
         }
     }
 
-    /// Up to `limit` entries of `key`'s shard with key `>= key`, as of `snapshot`.
-    pub fn seek_ge(
-        &self,
-        snapshot: SnapshotId,
-        table: ShardedTable,
-        key: &[u8],
-        limit: u32,
-    ) -> Result<ShardEntries, ClientError> {
-        let query = Query::SeekGe { key: key.to_vec(), limit };
-        match self.read(Request { snapshot, table, query }, Self::key_shard(table, key)?, None)? {
-            Response::Entries(entries) => Ok(entries),
-            Response::Value(_) | Response::Duplicates(_) | Response::ExecutedBlock(_) => {
-                unreachable!("checked by read")
-            }
-        }
-    }
-
-    /// Up to `limit` duplicate values of `key` with subkey `>= subkey`, as of `snapshot`. For a
-    /// split contract the owners of the subkey's range answer, within that range only. With a
-    /// `deadline`, the read fails once it passes.
-    pub fn seek_dup_ge(
-        &self,
-        snapshot: SnapshotId,
-        table: ShardedTable,
-        key: &[u8],
-        subkey: &[u8],
-        limit: u32,
-        deadline: Option<Instant>,
-    ) -> Result<DuplicateValues, ClientError> {
-        let shard = if self.cluster.is_split(table, key) {
-            self.cluster.placement(table, key, subkey).ok_or(ClientError::InvalidKey)?;
-            Shard(subkey[0])
-        } else {
-            Self::key_shard(table, key)?
+    /// The range of blocks `node` can serve state reads as of, asked once.
+    pub fn status(&self, node: NodeId) -> Result<Option<ServableRange>, OwnerFailure> {
+        let request = Request {
+            snapshot: SnapshotId { number: 0, hash: None },
+            table: ShardedTable::HashedAccounts,
+            query: Query::Status,
         };
-        let query = Query::SeekDupGe { key: key.to_vec(), subkey: subkey.to_vec(), limit };
-        match self.read(Request { snapshot, table, query }, shard, deadline)? {
-            Response::Duplicates(values) => Ok(values),
-            Response::Value(_) | Response::Entries(_) | Response::ExecutedBlock(_) => {
-                unreachable!("checked by read")
-            }
+        match self.ask(node, &request)? {
+            Response::Status(servable) => Ok(servable),
+            _ => unreachable!("checked by ask"),
         }
     }
 
@@ -280,13 +290,8 @@ impl ClusterClient {
     }
 
     /// Sends `request` to the owners of `shard` until one answers with the response kind the
-    /// query expects, finishing by `deadline` when there is one.
-    fn read(
-        &self,
-        request: Request,
-        shard: Shard,
-        deadline: Option<Instant>,
-    ) -> Result<Response, ClientError> {
+    /// query expects.
+    fn read(&self, request: Request, shard: Shard) -> Result<Response, ClientError> {
         let owners: Vec<_> = self
             .cluster
             .owners(shard)
@@ -300,15 +305,11 @@ impl ClusterClient {
 
         let started = Instant::now();
         let retry_until = started + self.options.retry_for;
-        let retry_until = deadline.map_or(retry_until, |deadline| retry_until.min(deadline));
         let mut warned = false;
         loop {
             let mut attempts = Vec::with_capacity(owners.len());
             for &node in &owners {
-                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Err(ClientError::DeadlineExpired);
-                }
-                match self.ask(node, &request, deadline) {
+                match self.ask(node, &request) {
                     Ok(response) => return Ok(response),
                     Err(failure) => attempts.push(OwnerAttempt { node, failure }),
                 }
@@ -358,24 +359,17 @@ impl ClusterClient {
     }
 
     /// Asks one owner, on a pooled connection when one is idle. A pooled connection that fails is
-    /// replaced by a fresh one once, since the owner may have closed it while idle. With a
-    /// `deadline`, the owner must answer by it.
-    fn ask(
-        &self,
-        node: NodeId,
-        request: &Request,
-        deadline: Option<Instant>,
-    ) -> Result<Response, OwnerFailure> {
-        let result = deadline.map_or_else(
-            || self.ask_within_timeouts(node, request),
-            |deadline| self.ask_before(node, request, deadline),
-        );
+    /// replaced by a fresh one once, since the owner may have closed it while idle.
+    fn ask(&self, node: NodeId, request: &Request) -> Result<Response, OwnerFailure> {
+        let result = self.ask_within_timeouts(node, request);
         let response = result.map_err(OwnerFailure::Unreachable)?.map_err(OwnerFailure::Refused)?;
         let expected = matches!(
             (&request.query, &response),
-            (Query::Get { .. }, Response::Value(_))
-                | (Query::SeekGe { .. }, Response::Entries(_))
-                | (Query::SeekDupGe { .. }, Response::Duplicates(_))
+            (
+                Query::Get { .. } | Query::AccountValue { .. } | Query::StorageValue { .. },
+                Response::Value(_)
+            ) | (Query::HasStorage { .. }, Response::HasStorage(_))
+                | (Query::Status, Response::Status(_))
                 | (Query::ExecutedBlock { .. }, Response::ExecutedBlock(_))
         );
         if expected { Ok(response) } else { Err(OwnerFailure::UnexpectedResponse) }

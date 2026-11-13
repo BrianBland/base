@@ -1,31 +1,26 @@
-//! This node's side of a cluster: its owner store and server, its peer client, persistence
-//! points, the commit guard, shedding, and the execution results it serves and applies.
+//! This node's side of a cluster: its owner store and server, its peer client, the commit
+//! guard, shedding, and the execution results it serves and applies.
 
-use std::{
-    fmt, io,
-    net::TcpListener,
-    sync::{Arc, OnceLock},
-    thread::JoinHandle,
-};
+use std::{fmt, io, net::TcpListener, sync::Arc, thread::JoinHandle};
 
-use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use parking_lot::Mutex;
 use reth_db::{
     Database, DatabaseEnv, DatabaseError,
     cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO},
-    mdbx::{RO, RW, TransactionKind, tx::Tx},
+    mdbx::{RW, TransactionKind, tx::Tx},
     table::{DupSort, Table},
     tables::{self, RawDupSort, RawKey, RawTable},
     transaction::{DbTx, DbTxMut},
 };
 use reth_stages_types::StageId;
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::{
-    ApplyCounts, ApplyStats, ClientOptions, Cluster, ClusterClient, ExecutedBlocks, KeyPlacement,
-    OwnerServer, OwnerStore, RemoteReadCounts, RemoteReadStats, Shard, ShardedTable,
+    ApplyCounts, ApplyStats, ChangesetReader, ClientOptions, Cluster, ClusterClient,
+    ExecutedBlocks, KeyPlacement, OwnerServer, OwnerStore, RemoteReadCounts, RemoteReadStats,
+    Shard, ShardedTable,
 };
 
 /// Returns the hash of the canonical block with the given number, when known.
@@ -87,13 +82,10 @@ pub struct ClusterNode {
     env: DatabaseEnv,
     cluster: Arc<Cluster>,
     client: ClusterClient,
-    owner_store: Arc<OwnerStore<Tx<RO>>>,
+    owner_store: Arc<OwnerStore<DatabaseEnv>>,
     server: OwnerServer,
-    block_hashes: OnceLock<BlockHashLookup>,
     /// `Finish` of the last commit.
     committed_finish: Mutex<u64>,
-    /// Block of the last persistence point registered.
-    registered_point: Mutex<Option<u64>>,
     executed_blocks: Arc<ExecutedBlocks>,
     apply_stats: Arc<ApplyStats>,
 }
@@ -104,7 +96,6 @@ impl fmt::Debug for ClusterNode {
             .field("node_id", &self.cluster.node_id())
             .field("owner_server", &self.server.local_addr())
             .field("committed_finish", &*self.committed_finish.lock())
-            .field("registered_point", &*self.registered_point.lock())
             .finish_non_exhaustive()
     }
 }
@@ -123,7 +114,11 @@ impl ClusterNode {
     ) -> Result<Self, ClusterStartError> {
         let finish = Self::finish_checkpoint(&env.tx()?)?;
         let retention = cluster.config().retention_blocks;
-        let owner_store = Arc::new(OwnerStore::new(Arc::clone(&cluster), retention));
+        let owner_store = Arc::new(OwnerStore::new(Arc::clone(&cluster), env.clone(), retention)?);
+        owner_store
+            .stats()
+            .spawn_logger(RemoteReadStats::LOG_INTERVAL)
+            .map_err(ClusterStartError::StatsLogger)?;
         let executed_blocks = Arc::new(ExecutedBlocks::default());
         let server =
             OwnerServer::spawn(listener, Arc::clone(&owner_store), Arc::clone(&executed_blocks))?;
@@ -151,9 +146,7 @@ impl ClusterNode {
             cluster,
             owner_store,
             server,
-            block_hashes: OnceLock::new(),
             committed_finish: Mutex::new(finish),
-            registered_point: Mutex::new(None),
             executed_blocks,
             apply_stats,
         })
@@ -170,7 +163,7 @@ impl ClusterNode {
     }
 
     /// The store answering peers' reads of this node's shards.
-    pub const fn owner_store(&self) -> &Arc<OwnerStore<Tx<RO>>> {
+    pub const fn owner_store(&self) -> &Arc<OwnerStore<DatabaseEnv>> {
         &self.owner_store
     }
 
@@ -226,32 +219,31 @@ impl ClusterNode {
         self.apply_stats.counts()
     }
 
-    /// Installs the block-hash lookup persistence points are registered with. Only the first
-    /// lookup installed is kept; returns whether this one was.
+    /// Installs the canonical block-hash lookup on the owner store. Only the first lookup
+    /// installed is kept; returns whether this one was.
     pub fn install_block_hashes(&self, lookup: BlockHashLookup) -> bool {
-        self.block_hashes.set(lookup).is_ok()
+        self.owner_store.install_block_hashes(lookup)
     }
 
-    /// The hash of block `number` from the installed lookup, if any.
-    pub fn block_hash(&self, number: u64) -> Option<B256> {
-        self.block_hashes.get().and_then(|lookup| lookup(number))
+    /// Installs the changeset reader on the owner store, which builds its history index from it.
+    /// Only the first reader installed is kept; returns whether this one was.
+    pub fn install_changesets(&self, reader: ChangesetReader) -> Result<bool, DatabaseError> {
+        self.owner_store.install_changesets(reader)
     }
 
     /// The `Finish` stage checkpoint visible in `tx`: the block its state tables are at.
-    pub fn finish_checkpoint<K: TransactionKind>(tx: &Tx<K>) -> Result<u64, DatabaseError> {
+    pub fn finish_checkpoint(tx: &impl DbTx) -> Result<u64, DatabaseError> {
         Self::stage_checkpoint(tx, StageId::Finish)
     }
 
-    fn stage_checkpoint<K: TransactionKind>(
-        tx: &Tx<K>,
-        stage: StageId,
-    ) -> Result<u64, DatabaseError> {
+    fn stage_checkpoint(tx: &impl DbTx, stage: StageId) -> Result<u64, DatabaseError> {
         let checkpoint = tx.get::<tables::StageCheckpoints>(stage.to_string())?;
         Ok(checkpoint.map(|checkpoint| checkpoint.block_number).unwrap_or_default())
     }
 
-    /// Commits `tx` unless it would run the pipeline or unwind persisted blocks, then registers a
-    /// persistence point when `Finish` moved.
+    /// Commits `tx` unless it would run the pipeline or unwind persisted blocks. The owner store
+    /// indexes the blocks the commit persists before any of its reads sees them (see
+    /// [`OwnerStore::commit_persisted`]).
     pub fn commit<K: TransactionKind>(&self, tx: Tx<K>) -> Result<(), DatabaseError> {
         let finish = Self::finish_checkpoint(&tx)?;
         if let Some(refusal) = self.commit_refusal(&tx, finish)? {
@@ -259,11 +251,8 @@ impl ClusterNode {
             tx.abort();
             return Err(refusal.into());
         }
-        tx.commit()?;
+        self.owner_store.commit_persisted(finish, || tx.commit().map(drop))?;
         *self.committed_finish.lock() = finish;
-        if let Err(error) = self.register_persistence_point() {
-            warn!(error = %error, "failed to register a cluster persistence point");
-        }
         Ok(())
     }
 
@@ -284,27 +273,6 @@ impl ClusterNode {
             }
         }
         Ok(None)
-    }
-
-    /// Registers a raw read snapshot of the database with the owner store at its `Finish` block,
-    /// unless that block is already registered or its hash is unknown. Returns the block
-    /// registered.
-    pub fn register_persistence_point(&self) -> Result<Option<BlockNumHash>, DatabaseError> {
-        let Some(lookup) = self.block_hashes.get() else { return Ok(None) };
-        let mut registered = self.registered_point.lock();
-        let tx = self.env.tx()?;
-        let number = Self::finish_checkpoint(&tx)?;
-        if *registered == Some(number) {
-            return Ok(None);
-        }
-        let Some(hash) = lookup(number) else {
-            warn!(block = number, "no hash for the persisted tip; persistence point skipped");
-            return Ok(None);
-        };
-        let block = BlockNumHash::new(number, hash);
-        self.owner_store.register_persistence_point(block, tx);
-        *registered = Some(number);
-        Ok(Some(block))
     }
 
     /// Deletes up to `max_rows` rows of sharded tables this node does not hold, in one write

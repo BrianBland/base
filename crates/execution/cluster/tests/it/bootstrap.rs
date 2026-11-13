@@ -442,11 +442,11 @@ fn refuses_targets_that_disagree_or_repeat() {
         Err(BootstrapError::ConfigMismatch(NodeId(2)))
     ));
 
-    let mut other_apply_from = targets(path, &[1, 2], &[]);
-    let mut config = other_apply_from[1].cluster.config().clone();
-    config.apply_from = vec![NodeId(1)];
-    other_apply_from[1].cluster = Cluster::new(config).unwrap();
-    assert!(Bootstrap::new(other_apply_from).is_ok(), "apply_from may differ");
+    let mut other_retry = targets(path, &[1, 2], &[]);
+    let mut config = other_retry[1].cluster.config().clone();
+    config.read_retry_secs = 5;
+    other_retry[1].cluster = Cluster::new(config).unwrap();
+    assert!(Bootstrap::new(other_retry).is_ok(), "read_retry_secs may differ");
 }
 
 #[test]

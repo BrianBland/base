@@ -46,17 +46,18 @@ historical state RPC older than the persisted tip, reth storage v1.
   addresses (used as they are), told apart by length; any other entry is rejected. Absent or
   empty: no contract is split.
 - A node reads the placement from a TOML file. The file is rejected when node ids repeat,
-  `node_id` is not listed, `R` is 0 or larger than the number of storage nodes, or the retention
-  window `W` (see [Owner side](#owner-side)) is below 160, or `apply_from` (see
-  [Apply mode](#apply-mode)) lists an unknown node or this node, or a `split_storage` entry is
-  neither 20 nor 32 bytes, or `read_retry_secs` (see [Read rule](#read-rule)) is 0. Every node must list the same `split_storage`; this is not checked
-  (see [Limits](#limits)).
+  `node_id` is not listed, `R` is 0 or larger than the number of storage nodes, or the history
+  window `W` (`retention_blocks`, see [Owner side](#owner-side)) is below 160, or `apply_from`
+  (see [Apply mode](#apply-mode)) lists an unknown node or this node, or is set on a node that
+  stores shards, or a `split_storage` entry is neither 20 nor 32 bytes, or `read_retry_secs`
+  (see [Read rule](#read-rule)) is 0. Every node must list the same `split_storage` and the same
+  `retention_blocks`; this is not checked (see [Limits](#limits)).
 
 ```toml
 node_id = 1          # this node
 replication = 2      # R, optional, default 2
-retention_blocks = 160  # W, optional, default 160
-apply_from = [2]     # optional, default [] (execute); see Apply mode
+retention_blocks = 30000  # W, optional, default 30000; the same on every node
+apply_from = [2]     # optional, default [] (execute); only on a node with storage = false
 split_storage = ["0x4200000000000000000000000000000000000016"]  # optional, default []
 read_retry_secs = 60 # optional, default 60; see Read rule
 
@@ -72,94 +73,116 @@ address = "10.0.0.2:9650"
 
 ## Read rule
 
-A read of a key this node does not own must return exactly what this node's own MDBX would have
-returned at the transaction's snapshot if the node stored everything. That snapshot is the node's
-persisted tip `P`: the `Finish` stage checkpoint visible in the same MDBX transaction. reth layers
-its in-memory blocks above `P` itself, so nothing in reth needs to know the read was remote.
+A clustered node reads three kinds of rows differently:
+
+- **Trie rows** (`AccountsTrie`, `StoragesTrie`) are derived data. Every read of them is local and
+  sees only the rows this node holds: rows of the shards it owns (for a split contract, the
+  ranges it owns) and the replicated short paths. Every other row, including a row of a shard it
+  does not own that shed has not deleted yet, is invisible: never read from a peer and never an
+  error. This holds in every transaction, read-only or read-write.
+- **Hashed state rows** (`HashedAccounts`, `HashedStorages`) read on a thread inside a
+  [`LocalReads`] scope follow the same local, placement-filtered rule. The trie computation of a
+  block holds this scope, because it walks ordered ranges and normally seeks into and past ranges
+  the node does not hold.
+- **Hashed state rows read outside that scope**, in a read-only transaction, are read locally
+  when this node holds them and otherwise from an owner as **exact values** at the transaction's
+  snapshot. That snapshot is the node's persisted tip `P`: the `Finish` stage checkpoint visible
+  in the same MDBX transaction. reth layers its in-memory blocks above `P` itself, so nothing in
+  reth needs to know the read was remote.
+
+`Bytecodes` are content-addressed and read as before: local when held, otherwise an exact read
+from an owner. Read-write transactions read the hashed tables and `Bytecodes` from local MDBX
+only (see [Write rule](#write-rule)).
 
 Consequences:
 
 - Every remote read carries `P` (block number, and hash when known). The owner answers as of `P`,
   never as of its own head.
-- Results may be cached for the lifetime of one transaction or cursor only.
-- The owner refuses when it cannot reproduce `P` (it is behind, has discarded `P`, or is on a
-  different fork). The asker then tries the next owner, and retries for a bounded time when every
-  owner is merely behind.
+- Results are never cached beyond one cursor position.
+- The owner refuses when it cannot reproduce `P` (it is behind, `P` is below its history, or it
+  is on a different fork). The asker then tries the next owner, and retries for a bounded time
+  when every owner is merely behind.
 - An owner behind `P` is normal while the cluster follows the chain: the node reading may have
-  persisted a block or two before the owner did. The asker waits for it, retrying every 20 ms for
-  up to `read_retry_secs` (cluster config, default 60 seconds, 0 is rejected), which is also the
-  deadline of one read of a split contract. An owner that no longer has `P` (its lowest servable
-  block is above `P`, after a restart for example) is not waited for. A read that waits more than
-  1 second logs one warning, `cluster read waiting for owners behind the requested block`, with
-  the `table`, the requested `block`, each owner's highest servable block (`owners_highest`) and
-  the time `waited`, and is counted in `waits` of the remote-read log line. Running out of time
-  is an error, never "absent".
-- `Bytecodes` is the exception: entries are content-addressed and never change, so an owner
-  answers from its newest data without reproducing `P`.
+  persisted a block or two before the owner received it. The asker waits for it, retrying every
+  20 ms for up to `read_retry_secs` (cluster config, default 60 seconds, 0 is rejected). An owner
+  whose lowest servable block is above `P` is not waited for: that refusal is permanent. A read
+  that waits more than 1 second logs one warning, `cluster read waiting for owners behind the
+  requested block`, with the `table`, the requested `block`, each owner's highest servable block
+  (`owners_highest`) and the time `waited`, and is counted in `waits` of the remote-read log
+  line. Running out of time is an error, never "absent".
+- `Bytecodes` are the exception: an owner answers from its newest data without reproducing `P`.
 
-### Routing
+### Local filtered reads
 
-Routing applies to read-only transactions of a clustered database. Read-write transactions read
-local MDBX only (see [Write rule](#write-rule)).
+The visible rows are decided from the placement alone, never from what local MDBX happens to
+contain, so a node whose shed has not finished reads exactly as a shed node does. Ordered
+operations (`first`, `seek`, `next`, `seek_exact`, `seek_by_key_subkey`, `next_dup`, walks)
+behave like a database that contains only the visible rows, including the cursor states below.
 
-- A key is read from local MDBX when this node holds it (it is replicated or in an owned shard)
-  and from an owner otherwise. The decision is made from the placement alone, never from what
-  local MDBX happens to contain: a node whose MDBX still has keys of shards it does not own (shed
-  has not run or not finished) reads exactly as a shed node does. In a shard this node does not
-  own, the only local keys that count are the replicated `AccountsTrie` paths.
-- Shards are contiguous key ranges (the first key byte), so an ordered walk visits them one at a
-  time: owned shards from local MDBX, other shards with `SeekGe` pages. In every shard the
-  replicated `AccountsTrie` paths of that byte range (the root in shard 0, the one-nibble path
-  `n` in shard `n0`) sort before every sharded key and are read locally, because `SeekGe` never
-  returns them.
-- A split contract is read the same way one level down: its ranges are contiguous subkey ranges
-  (the first subkey byte), and "the first duplicate with subkey `>=` X" (`seek_by_key_subkey`,
-  and `seek_exact`, `get` and `next_dup`, which ask for the first duplicate from the smallest
-  subkey or from after the current one) starts in X's range: its replicated storage-trie paths
-  from local MDBX, then the range from local MDBX when this node holds it and from an owner with
-  a `SeekDupGe` page otherwise. When the range has no such duplicate, the read continues with the
-  next range, local or remote as placement says, until a duplicate is found or the contract's
-  256 ranges are exhausted. Local reads of a split contract use a second MDBX cursor of the same
-  table, which works on encoded keys and is opened only when the cursor first reads a split
-  contract. Contracts outside `split_storage` are read as before, by key, with no continuation.
-- One read of a split contract (one `seek_exact`, `get`, `seek_by_key_subkey`, or `next_dup` that
-  continues past the current page or local range) has one deadline, the client's retry budget
-  (`read_retry_secs`) after it starts. Every range it visits, owner it asks, connect, frame write
-  and frame read, and retry pause inside it finishes by that deadline, each socket operation
-  waiting only the time left and never longer than its usual connect or I/O timeout, so one
-  stalled owner does not use up the whole budget. Running out of time is a `DatabaseError`, never
-  "absent".
-- The cursor keeps its own position; after a remote answer the MDBX cursor's position is
-  meaningless.
-- A remote failure is a `DatabaseError`, never "absent".
+Shards are contiguous key ranges (the first key byte), so a walk that meets a row of a shard the
+node does not own seeks once to the start of the next shard instead of stepping over that
+shard's leftover rows. In every shard the replicated `AccountsTrie` paths of that byte range (the
+root in shard 0, the one-nibble path `n` in shard `n0`) sort before every sharded key and stay
+visible. A split contract is filtered the same way one level down: its ranges are contiguous
+subkey ranges (the first subkey byte), a duplicate in a range the node does not own makes the
+walk seek to the next range, and its replicated storage-trie paths stay visible. A value's subkey
+is encoded to place it only for a split contract; every other row is placed by its key.
 
-Cursor operations on the sharded tables:
+### Remote exact reads
 
-| Operation | `HashedAccounts`, `AccountsTrie` | `Bytecodes` | `HashedStorages`, `StoragesTrie` |
-|---|---|---|---|
-| `get`, `get_by_encoded_key`, `seek_exact` | yes | yes | yes (first duplicate of the key, across ranges for a split contract) |
-| `current` | yes | yes | yes |
-| `first`, `seek`, `next`, forward walks | yes | only inside owned shards | error |
-| `seek_by_key_subkey`, `next_dup`, `next_dup_val`, `walk_dup` with a key | | | yes |
-| `last`, `prev`, reverse walks, `prev_dup`, `last_dup`, `next_no_dup`, `walk_dup` without a key | error | error | error |
+Outside a [`LocalReads`] scope, in a read-only transaction, the hashed tables answer as follows
+for rows this node does not hold:
+
+- `HashedAccounts` `get`, `get_by_encoded_key` and `seek_exact`: the account at `P` from an owner
+  (`AccountValue`).
+- `HashedStorages` `seek_by_key_subkey(address, slot)`: the value of exactly that slot at `P`
+  from the owners of the row (`StorageValue`), returned only if that slot exists. An absent slot
+  returns nothing even when a later slot exists: reth's callers accept only an exact match. For a
+  split contract the owners of the slot's range answer, and a slot in a range this node owns is
+  read locally with the same exact-match rule.
+- A first-row probe of an account's storage (`get`, `seek_exact(address)`, or
+  `seek_by_key_subkey(address, 0)`) asks an owner whether the account has any storage at `P`
+  (`HasStorage`): none returns nothing; some is an unsupported-operation error naming the
+  account (it is the start of a walk over a destroyed account's storage, which cannot happen
+  after Cancun). A probe of a split contract is that error too: no single owner holds all of it.
+- Every other operation that would read a row this node does not hold is an
+  unsupported-operation error: `next` or `next_dup` from a remote answer, `first`, `seek` or
+  `next` reaching a shard this node does not own (a walk inside owned shards is local), and
+  `next_dup` of a split contract.
+
+Rows this node holds are read from local MDBX with MDBX's own semantics.
+
+### Cursor operations
+
+| Operation | `HashedAccounts`, `AccountsTrie`, `Bytecodes` | `HashedStorages`, `StoragesTrie` |
+|---|---|---|
+| `get`, `get_by_encoded_key`, `seek_exact` | yes | yes (first visible duplicate; a probe outside the scope) |
+| `current` | yes | yes |
+| `first`, `seek`, `next`, forward walks | yes (outside the scope only inside owned shards) | error |
+| `seek_by_key_subkey`, `next_dup`, `next_dup_val`, `walk_dup` with a key | | yes (outside the scope see above) |
+| `last`, `prev`, reverse walks, `prev_dup`, `last_dup`, `next_no_dup`, `walk_dup` without a key | error | error |
 
 "Error" means a `DatabaseError` on every clustered read-only cursor of that table, even when the
 node holds the key, so behaviour does not depend on placement. No live read path needs these
-operations; reth's account and storage cursors (`DatabaseHashedCursorFactory`,
-`DatabaseTrieCursorFactory`) and its state providers use only the supported ones.
+operations.
 
 Cursor states match MDBX: a fresh cursor's `next` is `first`; after a positioning call finds
-nothing, `current` and `next` return nothing; after `next` runs past the last entry, `current`
-still returns the last entry.
+nothing, `current` and `next` return nothing; after `next` or `next_dup` runs past the last
+visible entry, `current` still returns that entry. After a write through a read-write cursor,
+`next`, `next_dup` and `current` continue from wherever MDBX left the cursor, skipping invisible
+rows.
+
+A remote failure is a `DatabaseError`, never "absent".
 
 ## Write rule
 
 In a read-write transaction, a write (`put`, `upsert`, `insert`, `append`, `append_dup`) to a key
-this node does not hold is dropped, and every read is local. Local MDBX never holds a value for
-such a key once shed has run, and before that only a stale one; forward persistence of new blocks
-only reads state tables to decide between insert, update and delete of the same key, whose write
-is dropped anyway, so this is sufficient there. Deletes run locally (a stale key is simply
-removed).
+this node does not hold is dropped. Reads of the hashed tables and `Bytecodes` are local and
+unfiltered; reads of the trie tables are local and filtered (see [Read rule](#read-rule)). Local
+MDBX never holds a value for a dropped key once shed has run, and before that only a stale one;
+forward persistence of new blocks only reads state tables to decide between insert, update and
+delete of the same key, whose write is dropped anyway, so this is sufficient there. Deletes run
+locally (a stale key is simply removed).
 
 A write of a duplicate of a split contract is kept or dropped by the duplicate's own placement:
 its subkey is the start of the encoded value. Whole-contract operations act on the rows this
@@ -181,113 +204,133 @@ in the transaction that advances `Finish`, so a read-write commit is refused wit
 - the `Headers` or `Bodies` checkpoint is ahead of `Finish`: reth's staged pipeline is running;
 - `Finish` is below the last committed `Finish`: blocks are being unwound.
 
-## Persistence points
-
-After a read-write commit, the database opens a raw MDBX read snapshot and registers it with the
-owner store at that snapshot's `Finish` block, when that block differs from the last one
-registered. The block hash comes from a lookup the node installs once its provider exists; until
-it is installed, or while it does not know the block, no point is registered. The node registers
-the initial point at startup, right after installing the lookup.
-
 ## Operating requirements
 
 A clustered node refuses to start unless:
 
 - `--engine.num-state-masking-blocks` is 0 (Base's default). With masking, the state tables lag
   the `Finish` checkpoint and `P` no longer identifies their contents.
-- State roots are computed for every block, so every canonical block carries trie updates
-  (`--debug.skip-state-root` is refused: skipped blocks carry empty trie updates, which an owner
-  cannot tell from real ones).
+- `--debug.skip-state-root` is not set.
 - The datadir is initialised: genesis is written (a `Finish` checkpoint exists).
+- reth's account and storage changesets are kept for at least `W` blocks (Base's full node
+  default keeps them); an owner can serve history only as far back as they reach.
 
 A node is clustered when started with `--cluster.config <FILE>` (`base rpc` and the `node`
 command); without it the database is a pass-through to MDBX. At startup a clustered node checks
-the requirements above before opening anything, opens the clustered database, starts its owner server on its configured
-address, launches, and sheds in the background. Once its provider exists it installs the
-block-hash lookup, registers the initial persistence point, and feeds every canonical block
-(including reorgs) to its owner store, with updates `None` when a notification lacks them. It
-logs the shards it owns and shed progress, and counts remote reads and failures in the metrics
-`base_cluster_remote_reads` and `base_cluster_remote_read_failures`. Every 10 seconds in which
-any remote read happened it logs `cluster remote reads` with the reads of each kind (`gets`,
-`seeks`, `duplicate_seeks`), the `failures`, the reads that waited more than 1 second on owners
-behind the requested block (`waits`), and the total time spent in them (`elapsed`) since the
-previous line; `ClusterNode::remote_reads` returns the same counts since start.
+the requirements above before opening anything, opens the clustered database, starts its owner
+server on its configured address, launches, and sheds in the background. Once its provider
+exists it installs the block-hash lookup and the changeset reader (which builds the owner's
+history index, see [Owner side](#owner-side)) and feeds every canonical-state notification to its
+owner. It logs the shards it owns and shed progress, and counts remote reads and failures in the
+metrics `base_cluster_remote_reads` and `base_cluster_remote_read_failures`. Every 10 seconds in
+which any remote read happened it logs `cluster remote reads` with the reads of each kind
+(`accounts`, `storages`, `storage_probes`, `bytecodes`), the `failures`, the reads that waited
+more than 1 second on owners behind the requested block (`waits`), and the total time spent in
+them (`elapsed`) since the previous line; `ClusterNode::remote_reads` returns the same counts
+since start.
 
-The block-hash lookup holds the provider only weakly; the feed task holds it strongly. The
-provider owns the clustered database, which owns the node, so a strong lookup would keep the
-node, its owner listener and its held snapshots alive forever. Once the feed task stops (at
-shutdown) the lookup knows no block and no further persistence point is registered.
-
+The block-hash lookup and the changeset reader hold the provider only weakly; the feed task holds
+it strongly. The provider owns the clustered database, which owns the node, so a strong
+reference would keep the node and its owner listener alive forever. Once the feed task stops (at
+shutdown) the lookup knows no block and the reader reads nothing.
 
 ## Owner side
 
-An owner answers "state at `P`" from:
+An owner answers exact reads of the rows it holds (`AccountValue`, `StorageValue`, `HasStorage`)
+as of any block `P` inside its history window, from three sources:
 
-- a held MDBX read snapshot at one of its own persistence points `S <= P` (long-read safety
-  disabled for that transaction), plus
-- the sorted hashed-state and trie updates of canonical blocks `(S, P]`, retained from
-  canonical-state notifications and applied oldest to newest.
+- its MDBX database, at its persisted tip `T`;
+- a **history index** of the rows it holds, keyed by hashed key (hashed address; hashed address
+  and hashed slot), holding for every change of the row in blocks `(L, I]` the block and the
+  row's **previous** value. It is built only from reth's persisted account and storage
+  changesets (plain keys, which the owner hashes): at startup for the last `W` blocks up to `T`,
+  and at every persistence commit for the newly persisted blocks. Entries of blocks at or below
+  `T - W` are pruned. `L` is the real lowest block covered: `T - W` or, when history on disk is
+  shorter, the block before the lowest one whose changesets are on disk;
+- an **in-memory chain** of the canonical blocks above `T`, each with its number, hash, parent
+  hash and the **new** values of its hashed state, taken from canonical-state notifications.
+  Blocks at or below `T` are dropped at each persistence commit.
 
-In those updates a deletion is always explicit and per key: an account or trie node of `None`, a
-storage slot of zero. There is no "wipe storage" or "delete trie" marker to honour. reth's
-in-memory cursor overlays (`HashedPostStateCursorFactory`, `InMemoryTrieCursorFactory`) already
-implement this merge over a database cursor factory.
-Because deletions are per slot and per trie path, a wiped storage of a split contract needs no
-special case: each owner applies the deletions of the ranges it serves.
+The value of row `k` at `P`, with `T` and the database row read in **one** MDBX read transaction
+and the index and chain consulted under **one** lock:
 
-Retention: an owner keeps snapshots and per-block updates covering the last `W` blocks, `W >= 160`
-(Base's persistence backpressure threshold), set by `retention_blocks` in the cluster config. Each retained block is identified by number and hash;
-an owner serves `P` only when its retained chain from `S` to `P` is unbroken. A block that arrives
-without trie updates makes the owner unable to serve past it.
+- `P <= T`: needs `L <= P` and `I >= T`. The answer is the previous value of `k`'s first change
+  in `(P, T]`; when `k` did not change there, the database row. Index entries above the
+  transaction's `T` are ignored, so persistence advancing between the transaction and the lookup
+  changes nothing. `P`'s hash must be the owner's canonical hash for that number.
+- `P > T`: needs the chain to hold every block `T + 1 ..= P`, each the child of the one before
+  (block `T + 1` of the canonical block `T`) and each with its hashed state. The answer is the new
+  value of `k`'s last change in `(T, P]`; when `k` did not change there, the database row. `P`'s
+  hash must be the chain's hash at `P`.
+- `HasStorage` is answered from the same sources: the account has storage at `P` when a slot
+  changed in the window has a nonzero value at `P`, or the database holds a slot that did not
+  change there.
 
-- The window is `[head - W + 1, head]`, where `head` is the newest block or persistence point the
-  owner has seen. `P` outside it is refused with `SnapshotUnavailable`.
-- A block or persistence point at an already retained number replaces it and drops everything
-  retained above it (a reorg of in-memory blocks).
-- `P` with a hash that differs from the owner's block at that number is refused with `WrongFork`.
-  Any other way of failing to reach `P` (a gap, a block without trie updates, no snapshot at or
-  below `P`) is `SnapshotUnavailable`. Its range is the lowest and highest block the owner can
-  serve; the owner may still refuse blocks inside it.
+Refusals:
 
-Serving never issues a remote read: an owner serves only shards it owns, and for a split
-contract only the ranges of shards it owns.
+- `P` below `L`: `SnapshotUnavailable` with the servable range, whose lowest block is above `P`.
+  The asker does not wait for it.
+- A gap in the chain (a missed notification), a block without hashed state, an index that has
+  not reached `T` (the changesets of a committed block could not be read yet), or no index yet:
+  `SnapshotUnavailable` whose highest block is below `P` (or with no range): the owner is behind
+  and the asker retries.
+- A hash for `P` that differs from the owner's: `WrongFork`.
+- A row the owner does not hold: `NotOwner`.
+
+A notification of a block at a number already in the chain replaces that block and drops every
+block above it; a reorg notification drops the reverted blocks and adds the new ones (a reorg of
+in-memory blocks). A reorg that reverts a block at or below `T` cannot be served: the owner stops
+serving state reads for good (every read is `WrongFork`), as the node cannot survive it either
+(see [Write rule](#write-rule)). A hashed post-state carries no
+"wipe storage" marker: a wiped storage is a zeroed slot per row, which the chain applies like any
+other change.
+
+Persistence and the index move together: the commit that advances `Finish` holds the owner's
+lock across the MDBX commit and the reading of the new blocks' changesets, so a read that sees
+the new `T` also sees the index extended to it. A read whose transaction predates a commit
+answers `P <= T` from the index as above and, for `P > T`, opens a fresh transaction, because
+the chain no longer holds the blocks it would need. Every read opens its own short read
+transaction; the owner holds no long-lived one.
+
+At startup the owner logs one line, `cluster owner history built`, with the shards it owns, the
+index's lowest and highest block and its entry count. Every 10 seconds it logs `cluster owner`
+with the reads `served`, refused as `behind`, and otherwise `refused` since the previous line,
+the index `entries`, and the `lowest` and `highest` servable block.
+
+Serving never issues a remote read: an owner serves only rows it holds.
 
 ## Wire protocol
 
-Keys and values travel as the encoded table bytes MDBX stores, so the protocol is table-agnostic.
+Keys and values travel as the encoded table bytes MDBX stores.
 
-| Request | Tables | Response |
-|---|---|---|
-| `Get { table, key }` | `HashedAccounts`, `AccountsTrie`, `Bytecodes` | value or absent |
-| `SeekGe { table, key, limit }` | `HashedAccounts`, `AccountsTrie` | up to `limit` entries with key `>=` the given key, ascending, within the key's shard; `end_of_shard` flag |
-| `SeekDupGe { table, key, subkey, limit }` | `HashedStorages`, `StoragesTrie` | up to `limit` duplicate entries of exactly `key` with subkey `>=` the given subkey; for a split contract only within the subkey's range; `end_of_key` flag |
-| `ExecutedBlock { hash }` | none (see [Apply mode](#apply-mode)) | the block's encoded execution result |
+| Request | Response |
+|---|---|
+| `AccountValue { address }` | the encoded account at `P`, or absent |
+| `StorageValue { address, slot }` | the encoded storage entry of exactly that slot at `P`, or absent |
+| `HasStorage { address }` | whether the account has any storage at `P` |
+| `Status` | the owner's servable range of state reads, or none |
+| `Get { table: Bytecodes, key }` | the bytecode, or absent |
+| `ExecutedBlock { hash }` (see [Apply mode](#apply-mode)) | the block's encoded execution result |
 
-Every request carries the snapshot `P`. Errors: `SnapshotUnavailable` (with the range the owner can
-serve), `WrongFork`, `NotOwner`, `Unsupported`, and `NotAvailable` for `ExecutedBlock`. Iterating
-across keys of a duplicate-key table is `Unsupported` remotely; no live read path needs it, and so
-is a key or subkey of the wrong length.
+Every request carries the snapshot `P` and a table (`HashedAccounts` or `HashedStorages` for the
+exact reads; ignored by `Status` and `ExecutedBlock`). Errors: `SnapshotUnavailable` (with the
+range the owner can serve), `WrongFork`, `NotOwner`, `Unsupported`, and `NotAvailable` for
+`ExecutedBlock`. The new requests and responses are appended to the end of the enums, so the
+encoding of the older ones is unchanged; an owner refuses the older ordered and trie requests
+(`Get` of a table other than `Bytecodes`, `SeekGe`, `SeekDupGe`) with `Unsupported`, so a node of
+the previous version fails loudly. Mixed versions are not supported: upgrade every node together.
 
-- The shard of a `SeekGe` is the shard of its key. Replicated `AccountsTrie` keys are never
-  returned by `SeekGe` (every node holds them), but `Get` answers them.
-- A `SeekDupGe` of a split contract is served by the owners of its subkey's range (the shard of
-  the subkey's first byte) and refused with `NotOwner` elsewhere. Its page ends at the range
-  boundary: `end_of_key` then means "no more duplicates in this range", and the asker continues
-  with the next range. Replicated storage-trie paths are never returned. The owner derives the
-  range from the subkey and its own `split_storage`, so the encoding is unchanged.
-- An owner may return fewer than `limit` entries without setting the end flag; the asker seeks
-  again from after the last entry.
+- `HasStorage` of a split contract is `Unsupported`; a `StorageValue` of a split contract is
+  served by the owners of the slot's range.
 - `Bytecodes`: an owner that lacks the code and has not persisted up to `P` refuses with
-  `SnapshotUnavailable` instead of answering absent. The range it advertises ends at its newest
-  persistence point, not at its newest retained block, so the asker sees it as behind and
-  retries until the owner persists the code.
+  `SnapshotUnavailable`, advertising its persisted tip as its highest block, so an asker ahead of
+  it retries until the owner persists the code.
 - Each message is a 4-byte big-endian length followed by the bincode (standard configuration)
   encoding of the request, or of the response-or-error. An owner that fails internally (a
   database error) closes the connection, and the asker treats it like an unreachable owner.
 - The asker tries the owners in rendezvous order, skipping itself. It retries the round, for a
   bounded time, only when every owner was unreachable or behind (`SnapshotUnavailable` with no
-  range or a range below `P`) and at least one was behind. Any other refusal is returned. Within a
-  read of a split contract the retries also end at that read's deadline (see [Routing](#routing)).
+  range or a range below `P`) and at least one was behind. Any other refusal is returned.
 
 Transport is blocking sockets with a small connection pool, because reads happen inside
 synchronous cursor calls on engine and trie worker threads. Owners serve from their own threads.
@@ -296,15 +339,15 @@ stopping the server never depends on a connection arriving.
 
 ```mermaid
 sequenceDiagram
-    participant E as reth (execution, trie, RPC)
+    participant E as reth (execution, RPC)
     participant A as ClusteredDatabase (asker)
-    participant O as Owner store
-    E->>A: cursor.seek(key)
-    A->>A: shard(key) owned? yes: local MDBX
-    A->>O: SeekGe{P, table, key}
-    O->>O: snapshot S <= P, merge updates (S, P]
-    O-->>A: entries | SnapshotUnavailable
-    A-->>E: entry (as if local at P)
+    participant O as Owner
+    E->>A: storage cursor seek_by_key_subkey(address, slot)
+    A->>A: row held? yes: local MDBX
+    A->>O: StorageValue{P, address, slot}
+    O->>O: one MDBX read (T, row), index (P, T] or chain (T, P]
+    O-->>A: value | absent | SnapshotUnavailable
+    A-->>E: entry only if it is exactly that slot
 ```
 
 ## Apply mode
@@ -316,11 +359,12 @@ then see an executed block as usual. It saves the execution's remote reads on a 
 few or no shards.
 
 - Roles: an **executor** executes blocks as today and serves their results; an **apply node**
-  asks executors for results. Either may store shards or none. Every clustered node serves the
-  results of blocks it inserted (executed or applied), so any node can be an executor.
+  asks executors for results. Only a node that stores nothing may apply: an executor's result
+  carries only the executor's trie rows. Every clustered node serves the results of blocks it
+  inserted (executed or applied), so any node can be an executor.
 - Config: `apply_from = [ids]` at the top level of the cluster TOML lists the nodes this node
   asks, in order. Absent or empty: the node executes. An id that is not a cluster node, or is
-  this node, is rejected.
+  this node, is rejected, and so is `apply_from` on a node with `storage = true`.
 - Executor: keeps the results of its 64 most recent inserted blocks, keyed by block hash, filled
   from the engine's block-added event (the earliest point a complete result exists, before
   forkchoice). A result holds the receipts, requests, gas used, blob gas used, the bundle state
@@ -366,7 +410,7 @@ Shedding deletes every row of a sharded table that the node does not hold, inclu
 of split contracts in shards it does not own. It runs on raw MDBX in
 the background after launch, in batches of bounded size, each its own short write transaction so
 the engine's persistence writer never waits long. Reads do not depend on it (see
-[Routing](#routing)), and writes never add such keys, so it is idempotent and a node stopped
+[Local filtered reads](#local-filtered-reads)), and writes never add such keys, so it is idempotent and a node stopped
 mid-shed resumes on its next start. Scale-up copies a shard from an owner at a persisted tip;
 scale-down sheds it.
 
@@ -449,33 +493,32 @@ reusing pages until it finishes, so prefer a stopped node.
 ## Limits
 
 - A clustered node can only follow the chain live. It must be re-cloned when it falls behind by
-  more than the engine's backfill threshold, when it restarts more than `W` blocks behind its
-  peers, or when a reorg reaches persisted blocks.
-- A read-only transaction older than `W` blocks (a long trace, for example) fails on its next
-  remote read.
-- One network round trip per remote seek until read-ahead batching is tuned. A walk asks every
-  shard it crosses that this node does not own, even an empty one.
+  more than the engine's backfill threshold, or when a reorg reaches persisted blocks.
+- Nodes must stay within `W` blocks of each other: a node whose persisted tip is more than `W`
+  blocks below every owner of a shard it reads cannot read that shard (the refusal is
+  permanent). Any restart order works inside that window, because owners rebuild their history
+  from disk. `W` must be the same on every node; nothing checks it. The index costs memory in
+  proportion to the rows changed in `W` blocks.
+- A read-only transaction whose `P` falls more than `W` blocks behind the owners (a long trace,
+  for example) fails on its next remote read.
+- One network round trip per remote exact read.
+- Trie rows are never read from a peer, so anything that needs trie rows of shards this node does
+  not own (`eth_getProof`, storage roots of foreign accounts, witnesses) fails or answers from the
+  visible rows only. The state root of a block is not computed from foreign rows by this crate.
 - An owner answers a bytecode only once it has persisted it, so reading code from a block this
   node persisted before every owner of the code's shard did waits for an owner to persist it,
   and fails if none does within the client's retry budget (`read_retry_secs`, 60 s by default).
 - A read that runs out of `read_retry_secs` while owners stay behind fails. Inside transaction
   execution reth retries the block, but when the failure lands in the pre-execution system calls
-  (the block-hash contract call, for example) or the post-execution checks (the L2 withdrawals
-  root), reth records the block as invalid, rejects every descendant, and the node needs a
-  restart.
+  (the block-hash contract call, for example) or the post-execution checks, reth records the
+  block as invalid, rejects every descendant, and the node needs a restart.
+- An owner checks a block hash with the node's provider on each read below its persisted tip.
 - `entries` (table statistics) of a sharded table counts local rows only.
 - Shedding frees pages inside MDBX but does not shrink the file without a compacting copy.
 - `split_storage` must be identical on every node. Nothing checks it: a node with a different
   list asks the wrong owners and reads wrong data. Changing the list (on every node) needs a
   re-clone from a full datadir, because rows already shed under the old placement are gone.
 - Split contracts are chosen by the operator; nothing detects large contracts or rebalances.
-- A read of a split contract that finds nothing in a range asks the next range, so a seek past
-  the last slot of a range that this node does not hold costs one more remote read per empty
-  range crossed. Large contracts are dense, so this is rare. A seek past a contract's last slot
-  visits every remaining range, and a read of a contract with no storage visits all 256: with
-  1 ms round trips that is about 256 ms, and with slow owners the read fails at its 2-second
-  deadline. Ranges are asked one after another, and an owner that timed out is asked again for
-  the next range.
 - A storage wipe of a split contract is applied per row and per range like any other deletion.
   A wipe of an existing contract cannot happen after Cancun, so this cost is not optimised.
 

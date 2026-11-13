@@ -301,13 +301,12 @@ async fn seal_one_block_on(storage: Storage, denim: bool, no_tx_pool: bool) -> R
 /// which an owner answers only from a persistence point at or above the block.
 async fn wait_until_served(node: &ClusterNode, hash: B256) -> Result<()> {
     let snapshot = SnapshotId { number: 1, hash: Some(hash) };
-    let read = |table, key: Vec<u8>| {
-        node.owner_store().read(&Request { snapshot, table, query: Query::Get { key } })
-    };
+    let read = |table, query| node.owner_store().read(&Request { snapshot, table, query });
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let state = read(ShardedTable::HashedAccounts, vec![0x42; 32]);
-        let code = read(ShardedTable::Bytecodes, vec![0x42; 32]);
+        let address = B256::repeat_byte(0x42);
+        let state = read(ShardedTable::HashedAccounts, Query::AccountValue { address });
+        let code = read(ShardedTable::Bytecodes, Query::Get { key: address.to_vec() });
         if matches!((&state, &code), (Ok(Response::Value(_)), Ok(Response::Value(None)))) {
             return Ok(());
         }

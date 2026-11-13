@@ -14,7 +14,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use reth_db_api::transaction::DbTx;
+use reth_db_api::Database;
 use tracing::{debug, error};
 
 use crate::{
@@ -37,9 +37,9 @@ impl OwnerServer {
 
     /// Serves `store` and `executed` on `listener`: one thread accepts, and each connection is
     /// served on its own thread, one request at a time.
-    pub fn spawn<TX: DbTx + Sync + 'static>(
+    pub fn spawn<DB: Database + 'static>(
         listener: TcpListener,
-        store: Arc<OwnerStore<TX>>,
+        store: Arc<OwnerStore<DB>>,
         executed: Arc<ExecutedBlocks>,
     ) -> io::Result<Self> {
         let local_addr = listener.local_addr()?;
@@ -80,10 +80,10 @@ impl OwnerServer {
         self.local_addr
     }
 
-    fn serve_connection<TX: DbTx + Sync + 'static>(
+    fn serve_connection<DB: Database + 'static>(
         id: u64,
         stream: TcpStream,
-        store: &Arc<OwnerStore<TX>>,
+        store: &Arc<OwnerStore<DB>>,
         executed: &Arc<ExecutedBlocks>,
         connections: &Arc<Mutex<HashMap<u64, TcpStream>>>,
     ) -> io::Result<()> {
@@ -102,9 +102,9 @@ impl OwnerServer {
     }
 
     /// Answers requests until the peer disconnects, a frame is malformed, or the store fails.
-    fn answer_requests<TX: DbTx + Sync>(
+    fn answer_requests<DB: Database>(
         mut stream: TcpStream,
-        store: &OwnerStore<TX>,
+        store: &OwnerStore<DB>,
         executed: &ExecutedBlocks,
     ) {
         loop {
@@ -120,16 +120,14 @@ impl OwnerServer {
                     .wait_for(hash, ExecutedBlocks::SERVE_WAIT)
                     .map(Response::ExecutedBlock)
                     .ok_or(ReadError::NotAvailable),
-                Query::Get { .. } | Query::SeekGe { .. } | Query::SeekDupGe { .. } => {
-                    match store.read(&request) {
-                        Ok(response) => Ok(response),
-                        Err(StoreError::Refused(refusal)) => Err(refusal),
-                        Err(StoreError::Database(error)) => {
-                            error!(error = %error, table = ?request.table, "cluster owner read failed");
-                            return;
-                        }
+                _ => match store.read(&request) {
+                    Ok(response) => Ok(response),
+                    Err(StoreError::Refused(refusal)) => Err(refusal),
+                    Err(StoreError::Database(error)) => {
+                        error!(error = %error, table = ?request.table, "cluster owner read failed");
+                        return;
                     }
-                }
+                },
             };
             if let Err(error) = Frame::write(&mut stream, &result) {
                 debug!(error = %error, "cluster owner reply failed");

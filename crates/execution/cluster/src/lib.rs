@@ -11,7 +11,7 @@ mod cursor;
 pub use cursor::{ClusteredCursor, CursorSharding};
 
 mod reads;
-pub use reads::{CursorPosition, FoundEntry, ShardedReads};
+pub use reads::{CursorPosition, PointRead, ReadMode, RowPlace, ShardedReads};
 
 mod split;
 pub use split::SplitCursor;
@@ -27,7 +27,8 @@ pub use node::{BlockHashLookup, ClusterNode, ClusterStartError, CommitRefusal};
 
 mod stats;
 pub use stats::{
-    ApplyCounts, ApplyFallback, ApplyStats, RemoteReadCounts, RemoteReadKind, RemoteReadStats,
+    ApplyCounts, ApplyFallback, ApplyStats, OwnerAnswer, OwnerCounts, OwnerStats, RemoteReadCounts,
+    RemoteReadKind, RemoteReadStats,
 };
 
 mod placement;
@@ -58,11 +59,14 @@ pub use protocol::{
     ServableRange, ShardEntries, SnapshotId,
 };
 
+mod changesets;
+pub use changesets::{ChangesetReader, ChangesetSource, PlainChangesets, ProviderChangesets};
+
+mod history;
+pub use history::{HistoryIndex, HistoryKey};
+
 mod owner;
-pub use owner::{
-    BlockUpdates, CachedOverlay, CanonicalBlock, OwnerStore, PersistencePoint, ResolvedSnapshot,
-    RetainedChain, SnapshotView, StateOverlay, StoreError,
-};
+pub use owner::{CanonicalBlock, IndexCoverage, OwnerHistory, OwnerStore, StoreError, ValueSource};
 
 mod executed;
 pub use executed::{

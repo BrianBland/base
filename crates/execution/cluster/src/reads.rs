@@ -1,81 +1,145 @@
-//! Read-only cursor routing over one sharded table: local MDBX for held keys, owners for the
-//! rest, with the cursor position kept here rather than in MDBX.
+//! Cursor routing over one sharded table, following the spec's [Read rule](crate#read-rule):
+//! local reads that see only the rows this node holds, local reads as MDBX has them, and exact
+//! reads of other rows from their owners. The cursor position is kept here rather than in MDBX.
 
-use std::{collections::VecDeque, mem, sync::Arc, time::Instant};
+use std::{mem, sync::Arc};
 
+use alloy_primitives::B256;
 use reth_db::{
     DatabaseError,
     common::{PairResult, ValueOnlyResult},
     cursor::{DbCursorRO, DbDupCursorRO},
     mdbx::{TransactionKind, cursor::Cursor},
-    table::{Decode, Decompress, DupSort, Encode, IntoVec, Table, TableRow},
+    table::{Compress, Decode, Decompress, DupSort, Encode, IntoVec, Table, TableRow},
 };
 
-use crate::{KeyPlacement, ReadSnapshot, Shard, ShardedTable, SplitCursor};
+use crate::{
+    ClusterNode, KeyPlacement, LocalReads, ReadSnapshot, Shard, ShardedTable, SplitCursor,
+};
 
 /// Where a [`ShardedReads`] cursor is.
 #[derive(Debug)]
 pub enum CursorPosition {
     /// Not positioned yet: `next` starts at the first entry.
     Unset,
-    /// At an encoded key read from local MDBX; the MDBX cursor is positioned there. For a
-    /// duplicate-key table every operation on this key is left to MDBX.
+    /// At a visible row of local MDBX; the MDBX cursor is positioned there.
     Local {
         /// Encoded key.
         key: Vec<u8>,
+        /// Encoded subkey, for a duplicate of a split contract.
+        subkey: Option<Vec<u8>>,
     },
-    /// At a duplicate of a split contract read from local MDBX; the [`SplitCursor`] is positioned
-    /// there.
+    /// At a visible duplicate of a split contract found by the [`SplitCursor`], which is
+    /// positioned there.
     LocalSplit {
         /// Encoded key.
         key: Vec<u8>,
         /// Encoded value.
         value: Vec<u8>,
     },
-    /// At an entry read from an owner, followed by the rest of its page.
+    /// At a row read from an owner; moving on from it is unsupported.
     Remote {
         /// Encoded key.
         key: Vec<u8>,
         /// Encoded value.
         value: Vec<u8>,
-        /// Entries of the page after this one, ascending.
-        rest: VecDeque<(Vec<u8>, Vec<u8>)>,
-        /// No entry of the shard (or duplicate of the key, or of the range of a split contract)
-        /// follows the page.
-        complete: bool,
     },
     /// A positioning call found nothing: `current` and `next` return nothing.
     Missed,
-    /// `next` ran past the last entry; `current` still returns that entry.
+    /// `next` or `next_dup` ran past the last visible entry; `current` still returns that entry.
     PastEnd {
-        /// The position of the last entry.
+        /// The position of the last visible entry.
         last: Box<Self>,
     },
+    /// A write moved the MDBX cursor: reads continue from wherever MDBX left it.
+    Detached,
 }
 
-/// An entry found by a [`ShardedReads`] cursor and the position it leaves the cursor at.
-pub type FoundEntry<T> = (TableRow<T>, CursorPosition);
+/// How a cursor operation reaches its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadMode {
+    /// Local MDBX as it is: the hashed tables and `Bytecodes` in a read-write transaction.
+    Raw,
+    /// Local MDBX, showing only the rows this node holds: the trie tables always, the hashed
+    /// tables inside a [`LocalReads`] scope.
+    Filtered,
+    /// Held rows from local MDBX, other rows as exact reads from their owners; ordered reads only
+    /// inside owned shards. The hashed tables and `Bytecodes` of a read-only transaction.
+    Remote,
+}
 
-/// Routes the reads of one read-only cursor over a sharded table, following the spec's
-/// [Read rule](crate#read-rule). The MDBX cursor of the same table is passed to every call;
-/// duplicates of split contracts are read locally through this type's own [`SplitCursor`].
+/// Where a row is for this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowPlace {
+    /// Held: in a shard (or range) this node owns, or replicated.
+    Held,
+    /// In this shard (or range of a split contract), which this node does not own.
+    Foreign(Shard),
+}
+
+/// A point read of a non-duplicate table, decided by the row's key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PointRead {
+    /// Read local MDBX.
+    Local,
+    /// The row is invisible here: absent.
+    Invisible,
+    /// The encoded value an owner returned.
+    Remote(Option<Vec<u8>>),
+}
+
+/// Routes the reads of one cursor over a sharded table. The MDBX cursor of the same table is
+/// passed to every call; duplicates of split contracts found by `seek_exact` past a range this
+/// node does not own are read through this type's own [`SplitCursor`].
 #[derive(Debug)]
 pub struct ShardedReads<K: TransactionKind> {
-    snapshot: Arc<ReadSnapshot>,
+    node: Arc<ClusterNode>,
     table: ShardedTable,
+    /// The snapshot of a read-only transaction; `None` in a read-write one.
+    snapshot: Option<Arc<ReadSnapshot>>,
     position: CursorPosition,
     split: Option<SplitCursor<K>>,
 }
 
 impl<K: TransactionKind> ShardedReads<K> {
-    /// A fresh cursor over `table` reading at `snapshot`. `split` is required to read a split
-    /// contract.
+    /// A fresh cursor over `table` of `node`, reading at `snapshot` in a read-only transaction.
+    /// `split` is required to read a split contract's duplicates by subkey.
     pub const fn new(
-        snapshot: Arc<ReadSnapshot>,
+        node: Arc<ClusterNode>,
         table: ShardedTable,
+        snapshot: Option<Arc<ReadSnapshot>>,
         split: Option<SplitCursor<K>>,
     ) -> Self {
-        Self { snapshot, table, position: CursorPosition::Unset, split }
+        Self { node, table, snapshot, position: CursorPosition::Unset, split }
+    }
+
+    /// This node.
+    pub const fn node(&self) -> &Arc<ClusterNode> {
+        &self.node
+    }
+
+    /// The table read.
+    pub const fn table(&self) -> ShardedTable {
+        self.table
+    }
+
+    /// How the next operation reaches its rows.
+    pub fn mode(&self) -> ReadMode {
+        match (self.table, &self.snapshot) {
+            (ShardedTable::AccountsTrie | ShardedTable::StoragesTrie, _) => ReadMode::Filtered,
+            (_, None) => ReadMode::Raw,
+            (ShardedTable::HashedAccounts | ShardedTable::HashedStorages, Some(_))
+                if LocalReads::is_active() =>
+            {
+                ReadMode::Filtered
+            }
+            (_, Some(_)) => ReadMode::Remote,
+        }
+    }
+
+    /// Marks that a write moved the MDBX cursor.
+    pub fn detach(&mut self) {
+        self.position = CursorPosition::Detached;
     }
 
     /// The error returned by an operation that is not supported on a sharded table.
@@ -86,8 +150,27 @@ impl<K: TransactionKind> ShardedReads<K> {
         ))
     }
 
+    fn not_held(&self, shard: Shard) -> DatabaseError {
+        self.unsupported(&format!(
+            "an ordered read reaching shard {:#04x}, which this node does not hold,",
+            shard.0
+        ))
+    }
+
+    fn storage_not_held(&self, address: &[u8]) -> DatabaseError {
+        self.unsupported(&format!(
+            "walking the storage of account {}, which this node does not hold and which has \
+             storage,",
+            B256::from_slice(address)
+        ))
+    }
+
     fn reject_duplicate(&self, operation: &str) -> Result<(), DatabaseError> {
         if self.table.is_duplicate() { Err(self.unsupported(operation)) } else { Ok(()) }
+    }
+
+    fn snapshot(&self) -> Result<&ReadSnapshot, DatabaseError> {
+        self.snapshot.as_deref().ok_or_else(|| self.unsupported("a remote read in a write"))
     }
 
     fn encode<T: Table>(key: &T::Key) -> Vec<u8> {
@@ -99,252 +182,326 @@ impl<K: TransactionKind> ShardedReads<K> {
     }
 
     fn owns(&self, shard: Shard) -> bool {
-        self.snapshot.node().cluster().owns(shard)
-    }
-
-    /// `DbCursorRO::first`.
-    pub fn first<T: Table>(&mut self, inner: &mut Cursor<K, T>) -> PairResult<T> {
-        self.reject_duplicate("first")?;
-        let found = self.find(inner, &self.table.first_key(), false)?;
-        Ok(self.settle::<T>(found))
-    }
-
-    /// `DbCursorRO::seek`.
-    pub fn seek<T: Table>(&mut self, inner: &mut Cursor<K, T>, key: T::Key) -> PairResult<T> {
-        self.reject_duplicate("seek")?;
-        let start = Self::encode::<T>(&key);
-        self.snapshot.node().holds(self.table, &start, &[])?;
-        let found = self.find(inner, &start, false)?;
-        Ok(self.settle::<T>(found))
-    }
-
-    /// Moves to the found entry, or to [`CursorPosition::Missed`] when there is none.
-    fn settle<T: Table>(&mut self, found: Option<FoundEntry<T>>) -> Option<TableRow<T>> {
-        let (row, position) = match found {
-            Some((row, position)) => (Some(row), position),
-            None => (None, CursorPosition::Missed),
-        };
-        self.position = position;
-        row
-    }
-
-    /// `DbCursorRO::next`.
-    pub fn next<T: Table>(&mut self, inner: &mut Cursor<K, T>) -> PairResult<T> {
-        self.reject_duplicate("next")?;
-        if let CursorPosition::Remote { key, value, rest, .. } = &mut self.position
-            && let Some((next_key, next_value)) = rest.pop_front()
-        {
-            let row = Self::decode::<T>(&next_key, &next_value)?;
-            *key = next_key;
-            *value = next_value;
-            return Ok(Some(row));
-        }
-        let position = mem::replace(&mut self.position, CursorPosition::Missed);
-        let found = match &position {
-            CursorPosition::Unset => return self.first(inner),
-            // `LocalSplit` is a duplicate position, and duplicate-key tables reject `next`.
-            CursorPosition::Missed
-            | CursorPosition::PastEnd { .. }
-            | CursorPosition::LocalSplit { .. } => {
-                self.position = position;
-                return Ok(None);
-            }
-            CursorPosition::Local { key } => {
-                let shard = Shard(key[0]);
-                if self.owns(shard) {
-                    match inner.next()? {
-                        Some((found_key, value)) => {
-                            let encoded = Self::encode::<T>(&found_key);
-                            if encoded[0] == shard.0 {
-                                Some(((found_key, value), CursorPosition::Local { key: encoded }))
-                            } else {
-                                self.find_after_shard(inner, shard)?
-                            }
-                        }
-                        None => self.find_after_shard(inner, shard)?,
-                    }
-                } else {
-                    // A replicated key in a shard read from owners.
-                    self.find(inner, key, true)?
-                }
-            }
-            CursorPosition::Remote { key, complete, .. } => {
-                let in_shard = if *complete { None } else { self.remote_page::<T>(key, true)? };
-                match in_shard {
-                    Some(found) => Some(found),
-                    None => self.find_after_shard(inner, Shard(key[0]))?,
-                }
-            }
-        };
-        Ok(match found {
-            Some((row, next)) => {
-                self.position = next;
-                Some(row)
-            }
-            None => {
-                self.position = CursorPosition::PastEnd { last: Box::new(position) };
-                None
-            }
-        })
-    }
-
-    /// `DbCursorRO::current`.
-    pub fn current<T: Table>(&mut self, inner: &mut Cursor<K, T>) -> PairResult<T> {
-        match &self.position {
-            CursorPosition::Local { .. } => inner.current(),
-            CursorPosition::Remote { key, value, .. }
-            | CursorPosition::LocalSplit { key, value } => Self::decode::<T>(key, value).map(Some),
-            CursorPosition::PastEnd { last } => match last.as_ref() {
-                // Later shards may have moved the MDBX cursor since.
-                CursorPosition::Local { key } => inner.seek_exact(T::Key::decode(key)?),
-                CursorPosition::Remote { key, value, .. }
-                | CursorPosition::LocalSplit { key, value } => {
-                    Self::decode::<T>(key, value).map(Some)
-                }
-                _ => Ok(None),
-            },
-            CursorPosition::Unset | CursorPosition::Missed => Ok(None),
-        }
-    }
-
-    /// `DbCursorRO::seek_exact`; for a duplicate-key table, the key's first duplicate.
-    pub fn seek_exact<T: Table>(&mut self, inner: &mut Cursor<K, T>, key: T::Key) -> PairResult<T> {
-        let encoded = Self::encode::<T>(&key);
-        if self.is_split(&encoded) {
-            let deadline = self.snapshot.split_read_deadline();
-            let first = self.table.first_subkey();
-            let found = self.find_split::<T>(&encoded, &first, false, deadline)?;
-            return Ok(self.settle::<T>(found));
-        }
-        if self.snapshot.node().holds_by_key(self.table, &encoded)? {
-            let row = inner.seek_exact(key)?;
-            self.position = if row.is_some() || self.table.is_duplicate() {
-                CursorPosition::Local { key: encoded }
-            } else {
-                CursorPosition::Missed
-            };
-            return Ok(row);
-        }
-        let found = if self.table.is_duplicate() {
-            self.remote_duplicates::<T>(encoded, &self.table.first_subkey(), false, None)?
-        } else {
-            match self.snapshot.get(self.table, &encoded)? {
-                Some(value) => {
-                    let row = Self::decode::<T>(&encoded, &value)?;
-                    let rest = VecDeque::new();
-                    Some((
-                        row,
-                        CursorPosition::Remote { key: encoded, value, rest, complete: false },
-                    ))
-                }
-                None => None,
-            }
-        };
-        Ok(self.settle::<T>(found))
-    }
-
-    /// `DbDupCursorRO::seek_by_key_subkey`.
-    pub fn seek_by_key_subkey<T: DupSort>(
-        &mut self,
-        inner: &mut Cursor<K, T>,
-        key: T::Key,
-        subkey: T::SubKey,
-    ) -> ValueOnlyResult<T> {
-        let encoded = Self::encode::<T>(&key);
-        if self.is_split(&encoded) {
-            let deadline = self.snapshot.split_read_deadline();
-            let subkey = subkey.encode().into_vec();
-            let found = self.find_split::<T>(&encoded, &subkey, false, deadline)?;
-            return Ok(self.settle::<T>(found).map(|(_, value)| value));
-        }
-        if self.snapshot.node().holds_by_key(self.table, &encoded)? {
-            self.position = CursorPosition::Local { key: encoded };
-            return inner.seek_by_key_subkey(key, subkey);
-        }
-        let subkey = subkey.encode().into_vec();
-        let found = self.remote_duplicates::<T>(encoded, &subkey, false, None)?;
-        Ok(self.settle::<T>(found).map(|(_, value)| value))
-    }
-
-    /// `DbDupCursorRO::next_dup`. For a split contract the next duplicate may be in a later range,
-    /// and the search for it is one split read with its own deadline.
-    pub fn next_dup<T: DupSort>(&mut self, inner: &mut Cursor<K, T>) -> PairResult<T> {
-        if let CursorPosition::Remote { key, value, rest, .. } = &mut self.position
-            && let Some((next_key, next_value)) = rest.pop_front()
-        {
-            let row = Self::decode::<T>(&next_key, &next_value)?;
-            *key = next_key;
-            *value = next_value;
-            return Ok(Some(row));
-        }
-        let mut position = mem::replace(&mut self.position, CursorPosition::Missed);
-        let mut unsplit_key_ended = false;
-        let found = match &position {
-            CursorPosition::Local { .. } => {
-                self.position = position;
-                return inner.next_dup();
-            }
-            CursorPosition::LocalSplit { key, value } => {
-                let deadline = self.snapshot.split_read_deadline();
-                self.next_local_split::<T>(key, value, deadline)?
-            }
-            CursorPosition::Remote { key, value, complete, .. } => {
-                let subkey = self.subkey_of(value)?;
-                let deadline = self.is_split(key).then(|| self.snapshot.split_read_deadline());
-                let in_page = if *complete {
-                    None
-                } else {
-                    self.remote_duplicates::<T>(key.clone(), subkey, true, deadline)?
-                };
-                match (in_page, deadline) {
-                    (Some(found), _) => Some(found),
-                    (None, Some(deadline)) => {
-                        self.find_split_after_range::<T>(key, Shard(subkey[0]), deadline)?
-                    }
-                    (None, None) => {
-                        unsplit_key_ended = true;
-                        None
-                    }
-                }
-            }
-            CursorPosition::Unset | CursorPosition::Missed | CursorPosition::PastEnd { .. } => {
-                self.position = position;
-                return Ok(None);
-            }
-        };
-        Ok(match found {
-            Some((row, next)) => {
-                self.position = next;
-                Some(row)
-            }
-            // The last remote duplicate stays current, as in an exhausted MDBX duplicate walk.
-            None if unsplit_key_ended => {
-                if let CursorPosition::Remote { complete, .. } = &mut position {
-                    *complete = true;
-                }
-                self.position = position;
-                None
-            }
-            None => {
-                self.position = CursorPosition::PastEnd { last: Box::new(position) };
-                None
-            }
-        })
+        self.node.cluster().owns(shard)
     }
 
     fn is_split(&self, key: &[u8]) -> bool {
-        self.snapshot.node().cluster().is_split(self.table, key)
+        self.node.cluster().is_split(self.table, key)
     }
 
+    fn place(&self, placement: Option<KeyPlacement>) -> Result<RowPlace, DatabaseError> {
+        match placement {
+            Some(KeyPlacement::Replicated) => Ok(RowPlace::Held),
+            Some(KeyPlacement::Shard(shard)) if self.owns(shard) => Ok(RowPlace::Held),
+            Some(KeyPlacement::Shard(shard)) => Ok(RowPlace::Foreign(shard)),
+            None => Err(DatabaseError::Other(format!("invalid {:?} key or subkey", self.table))),
+        }
+    }
+
+    /// Where the row with encoded `key` is, placed by key alone.
+    fn place_key(&self, key: &[u8]) -> Result<RowPlace, DatabaseError> {
+        self.place(self.table.placement(key))
+    }
+
+    /// Where the duplicate of a split contract with encoded `subkey` is.
+    fn place_subkey(&self, subkey: &[u8]) -> Result<RowPlace, DatabaseError> {
+        self.place(self.table.subkey_layout().and_then(|layout| layout.placement(subkey)))
+    }
+
+    /// The encoded subkey a duplicate value starts with.
     fn subkey_of<'a>(&self, value: &'a [u8]) -> Result<&'a [u8], DatabaseError> {
         self.table.subkey_of(value).ok_or_else(|| {
             DatabaseError::Other(format!("{:?} value shorter than its subkey", self.table))
         })
     }
 
-    /// Where a duplicate with encoded `subkey` of a split contract lives.
-    fn split_placement(&self, subkey: &[u8]) -> Option<KeyPlacement> {
-        self.table.subkey_layout().and_then(|layout| layout.placement(subkey))
+    fn value_subkey<T: Table>(&self, value: &T::Value) -> Result<Vec<u8>, DatabaseError> {
+        let mut encoded = Vec::new();
+        value.compress_to_buf(&mut encoded);
+        Ok(self.subkey_of(&encoded)?.to_vec())
+    }
+
+    /// The first encoded subkey of the range after `range`, or `None` after the last range.
+    fn next_range_start(&self, range: Shard) -> Option<Vec<u8>> {
+        let layout = self.table.subkey_layout()?;
+        range.0.checked_add(1).map(|next| layout.shard_start(Shard(next)))
+    }
+
+    fn require_owned(&self, from: Shard, to: Shard) -> Result<(), DatabaseError> {
+        let missing = (from.0..=to.0).map(Shard).find(|shard| !self.owns(*shard));
+        missing.map_or(Ok(()), |shard| Err(self.not_held(shard)))
+    }
+
+    /// Whether a row read from MDBX is visible here.
+    fn visible<T: Table>(&self, key: &T::Key, value: &T::Value) -> Result<bool, DatabaseError> {
+        let key = Self::encode::<T>(key);
+        let place = if self.is_split(&key) {
+            self.place_subkey(&self.value_subkey::<T>(value)?)?
+        } else {
+            self.place_key(&key)?
+        };
+        Ok(place == RowPlace::Held)
+    }
+
+    /// A point read of encoded `key` of a non-duplicate table.
+    pub fn point(&self, key: &[u8]) -> Result<PointRead, DatabaseError> {
+        let mode = self.mode();
+        if mode == ReadMode::Raw || self.place_key(key)? == RowPlace::Held {
+            return Ok(PointRead::Local);
+        }
+        match mode {
+            ReadMode::Filtered => Ok(PointRead::Invisible),
+            ReadMode::Raw | ReadMode::Remote => self.remote_value(key).map(PointRead::Remote),
+        }
+    }
+
+    /// The encoded value of `key` of a non-duplicate table from an owner.
+    fn remote_value(&self, key: &[u8]) -> Result<Option<Vec<u8>>, DatabaseError> {
+        match self.table {
+            ShardedTable::HashedAccounts => self.snapshot()?.account(B256::from_slice(key)),
+            ShardedTable::Bytecodes => self.snapshot()?.bytecode(key),
+            ShardedTable::HashedStorages
+            | ShardedTable::AccountsTrie
+            | ShardedTable::StoragesTrie => Err(self.unsupported("a remote read")),
+        }
+    }
+
+    /// Moves to a row read from an owner, or to [`CursorPosition::Missed`] when it is absent.
+    fn settle_remote<T: Table>(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) -> PairResult<T> {
+        let Some(value) = value else {
+            self.position = CursorPosition::Missed;
+            return Ok(None);
+        };
+        let row = Self::decode::<T>(&key, &value)?;
+        self.position = CursorPosition::Remote { key, value };
+        Ok(Some(row))
+    }
+
+    /// Moves to a row of local MDBX read with MDBX's own semantics.
+    fn settle_local<R>(&mut self, key: Vec<u8>, row: Option<R>) -> Option<R> {
+        self.position = match row {
+            Some(_) => CursorPosition::Local { key, subkey: None },
+            None => CursorPosition::Missed,
+        };
+        row
+    }
+
+    /// `DbCursorRO::first`.
+    pub fn first<T: Table>(&mut self, inner: &mut Cursor<K, T>) -> PairResult<T> {
+        if self.mode() == ReadMode::Raw {
+            return inner.first();
+        }
+        self.reject_duplicate("first")?;
+        let row = inner.first()?;
+        self.walk(inner, row, Shard(0))
+    }
+
+    /// `DbCursorRO::seek`.
+    pub fn seek<T: Table>(&mut self, inner: &mut Cursor<K, T>, key: T::Key) -> PairResult<T> {
+        if self.mode() == ReadMode::Raw {
+            return inner.seek(key);
+        }
+        self.reject_duplicate("seek")?;
+        let start = Self::encode::<T>(&key);
+        self.place_key(&start)?;
+        let row = inner.seek(key)?;
+        self.walk(inner, row, Shard(start[0]))
+    }
+
+    /// The first visible row from `row` on, for a walk that started in shard `start`. A filtered
+    /// walk seeks past every shard this node does not own; a remote-mode walk fails on reaching
+    /// one.
+    fn walk<T: Table>(
+        &mut self,
+        inner: &mut Cursor<K, T>,
+        mut row: Option<TableRow<T>>,
+        start: Shard,
+    ) -> PairResult<T> {
+        let remote = self.mode() == ReadMode::Remote;
+        loop {
+            let Some((key, value)) = row else {
+                if remote {
+                    self.require_owned(start, Shard(u8::MAX))?;
+                }
+                self.position = CursorPosition::Missed;
+                return Ok(None);
+            };
+            let encoded = Self::encode::<T>(&key);
+            match self.place_key(&encoded)? {
+                RowPlace::Held => {
+                    if remote {
+                        self.require_owned(start, Shard(encoded[0]))?;
+                    }
+                    self.position = CursorPosition::Local { key: encoded, subkey: None };
+                    return Ok(Some((key, value)));
+                }
+                RowPlace::Foreign(shard) if remote => return Err(self.not_held(shard)),
+                RowPlace::Foreign(shard) => {
+                    row = match shard.0.checked_add(1) {
+                        Some(next) => {
+                            let start = self.table.shard_start(Shard(next));
+                            inner.seek(T::Key::decode(&start)?)?
+                        }
+                        None => None,
+                    };
+                }
+            }
+        }
+    }
+
+    /// `DbCursorRO::next`.
+    pub fn next<T: Table>(&mut self, inner: &mut Cursor<K, T>) -> PairResult<T> {
+        if self.mode() == ReadMode::Raw {
+            return inner.next();
+        }
+        self.reject_duplicate("next")?;
+        match mem::replace(&mut self.position, CursorPosition::Missed) {
+            CursorPosition::Unset => self.first(inner),
+            CursorPosition::Local { key, subkey } => {
+                let row = inner.next()?;
+                let found = self.walk(inner, row, Shard(key[0]))?;
+                if found.is_none() {
+                    // The walk may have left MDBX past invisible rows; `current` needs the last
+                    // visible one.
+                    inner.seek_exact(T::Key::decode(&key)?)?;
+                    let last = Box::new(CursorPosition::Local { key, subkey });
+                    self.position = CursorPosition::PastEnd { last };
+                }
+                Ok(found)
+            }
+            CursorPosition::Detached => {
+                let row = inner.next()?;
+                self.walk(inner, row, Shard(0))
+            }
+            position @ CursorPosition::Remote { .. } => {
+                self.position = position;
+                Err(self.unsupported("next after a read from an owner"))
+            }
+            position => {
+                self.position = position;
+                Ok(None)
+            }
+        }
+    }
+
+    /// `DbCursorRO::current`.
+    pub fn current<T: Table>(&mut self, inner: &mut Cursor<K, T>) -> PairResult<T> {
+        if self.mode() == ReadMode::Raw {
+            return inner.current();
+        }
+        let position = match &self.position {
+            CursorPosition::PastEnd { last } => last.as_ref(),
+            position => position,
+        };
+        match position {
+            CursorPosition::Local { .. } => inner.current(),
+            CursorPosition::LocalSplit { key, value } | CursorPosition::Remote { key, value } => {
+                Self::decode::<T>(key, value).map(Some)
+            }
+            CursorPosition::Detached => match inner.current()? {
+                Some((key, value)) if self.visible::<T>(&key, &value)? => Ok(Some((key, value))),
+                _ => Ok(None),
+            },
+            CursorPosition::Unset | CursorPosition::Missed | CursorPosition::PastEnd { .. } => {
+                Ok(None)
+            }
+        }
+    }
+
+    /// `DbCursorRO::seek_exact`; for a duplicate-key table, the key's first visible duplicate.
+    pub fn seek_exact<T: Table>(&mut self, inner: &mut Cursor<K, T>, key: T::Key) -> PairResult<T> {
+        let mode = self.mode();
+        if mode == ReadMode::Raw {
+            return inner.seek_exact(key);
+        }
+        let encoded = Self::encode::<T>(&key);
+        if self.table.is_duplicate() {
+            return self.seek_exact_duplicate(inner, key, encoded, mode);
+        }
+        match (self.place_key(&encoded)?, mode) {
+            (RowPlace::Held, _) => {
+                let row = inner.seek_exact(key)?;
+                Ok(self.settle_local(encoded, row))
+            }
+            (RowPlace::Foreign(_), ReadMode::Filtered) => {
+                self.position = CursorPosition::Missed;
+                Ok(None)
+            }
+            (RowPlace::Foreign(_), ReadMode::Raw | ReadMode::Remote) => {
+                let value = self.remote_value(&encoded)?;
+                self.settle_remote::<T>(encoded, value)
+            }
+        }
+    }
+
+    fn seek_exact_duplicate<T: Table>(
+        &mut self,
+        inner: &mut Cursor<K, T>,
+        key: T::Key,
+        encoded: Vec<u8>,
+        mode: ReadMode,
+    ) -> PairResult<T> {
+        let split = self.is_split(&encoded);
+        if split && mode == ReadMode::Filtered {
+            return self.seek_exact_split(inner, key, encoded);
+        }
+        if split {
+            return Err(self.storage_not_held(&encoded));
+        }
+        match (self.place_key(&encoded)?, mode) {
+            (RowPlace::Held, _) => {
+                let row = inner.seek_exact(key)?;
+                Ok(self.settle_local(encoded, row))
+            }
+            (RowPlace::Foreign(_), ReadMode::Filtered) => {
+                self.position = CursorPosition::Missed;
+                Ok(None)
+            }
+            (RowPlace::Foreign(_), ReadMode::Raw | ReadMode::Remote) => self.probe(encoded),
+        }
+    }
+
+    /// The first-row probe of the storage of an account this node does not hold: nothing when
+    /// the account has no storage at `P`, otherwise an unsupported-operation error.
+    fn probe<R>(&mut self, address: Vec<u8>) -> Result<Option<R>, DatabaseError> {
+        if self.snapshot()?.has_storage(B256::from_slice(&address))? {
+            return Err(self.storage_not_held(&address));
+        }
+        self.position = CursorPosition::Missed;
+        Ok(None)
+    }
+
+    /// The first visible duplicate of split contract `key`: the first duplicate when it is held,
+    /// otherwise a search of the following ranges through the split cursor.
+    fn seek_exact_split<T: Table>(
+        &mut self,
+        inner: &mut Cursor<K, T>,
+        key: T::Key,
+        encoded: Vec<u8>,
+    ) -> PairResult<T> {
+        let Some((found_key, value)) = inner.seek_exact(key)? else {
+            self.position = CursorPosition::Missed;
+            return Ok(None);
+        };
+        let subkey = self.value_subkey::<T>(&value)?;
+        let range = match self.place_subkey(&subkey)? {
+            RowPlace::Held => {
+                self.position = CursorPosition::Local { key: encoded, subkey: Some(subkey) };
+                return Ok(Some((found_key, value)));
+            }
+            RowPlace::Foreign(range) => range,
+        };
+        let found = match self.next_range_start(range) {
+            Some(start) => self.split_from(&encoded, start)?,
+            None => None,
+        };
+        let Some(value) = found else {
+            self.position = CursorPosition::Missed;
+            return Ok(None);
+        };
+        let row = Self::decode::<T>(&encoded, &value)?;
+        self.position = CursorPosition::LocalSplit { key: encoded, value };
+        Ok(Some(row))
     }
 
     fn split_cursor(&mut self) -> Result<&mut SplitCursor<K>, DatabaseError> {
@@ -354,225 +511,213 @@ impl<K: TransactionKind> ShardedReads<K> {
         })
     }
 
-    /// The duplicate after the local duplicate `value` of split contract `key`: the next local
-    /// duplicate while it stays in the same range, otherwise a search of the following ranges.
-    fn next_local_split<T: Table>(
+    /// The encoded first visible duplicate of split contract `key` from the split cursor's
+    /// `found`, seeking past every range this node does not own.
+    fn split_visible(
         &mut self,
         key: &[u8],
-        value: &[u8],
-        deadline: Instant,
-    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
-        let subkey = self.subkey_of(value)?;
-        let range = match self.split_placement(subkey) {
-            Some(KeyPlacement::Shard(range)) => range,
-            _ => return self.find_split::<T>(key, subkey, true, deadline),
-        };
-        if let Some(next) = self.split_cursor()?.next_dup()?
-            && self.split_placement(self.subkey_of(&next)?) == Some(KeyPlacement::Shard(range))
-        {
-            let row = Self::decode::<T>(key, &next)?;
-            return Ok(Some((row, CursorPosition::LocalSplit { key: key.to_vec(), value: next })));
-        }
-        self.find_split_after_range::<T>(key, range, deadline)
-    }
-
-    /// The first duplicate of split contract `key` with subkey `>= start` (`> start` when
-    /// `after`), from `start`'s range on, with every remote read finished by `deadline`.
-    fn find_split<T: Table>(
-        &mut self,
-        key: &[u8],
-        start: &[u8],
-        after: bool,
-        deadline: Instant,
-    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
-        let range = Shard(*start.first().ok_or_else(|| self.unsupported("an empty subkey"))?);
-        let bound = Some((start, after));
-        if let Some(found) = self.find_split_in_range::<T>(key, range, bound, deadline)? {
-            return Ok(Some(found));
-        }
-        self.find_split_after_range::<T>(key, range, deadline)
-    }
-
-    /// The first duplicate of split contract `key` in the first non-empty range after `range`,
-    /// with every remote read finished by `deadline`.
-    fn find_split_after_range<T: Table>(
-        &mut self,
-        key: &[u8],
-        range: Shard,
-        deadline: Instant,
-    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
-        for next in (range.0..=u8::MAX).skip(1) {
-            if let Some(found) = self.find_split_in_range::<T>(key, Shard(next), None, deadline)? {
-                return Ok(Some(found));
+        mut found: Option<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>, DatabaseError> {
+        loop {
+            let Some(value) = found else { return Ok(None) };
+            match self.place_subkey(self.subkey_of(&value)?)? {
+                RowPlace::Held => return Ok(Some(value)),
+                RowPlace::Foreign(range) => {
+                    found = match self.next_range_start(range) {
+                        Some(start) => self.split_cursor()?.seek_by_key_subkey(key, &start)?,
+                        None => None,
+                    };
+                }
             }
         }
-        Ok(None)
     }
 
-    /// The first duplicate of split contract `key` in `range` at or after the bound: replicated
-    /// storage-trie paths first (local), then the range (local when owned, otherwise from an
-    /// owner by `deadline`, whose page ends at the range boundary).
-    fn find_split_in_range<T: Table>(
+    fn split_from(&mut self, key: &[u8], start: Vec<u8>) -> Result<Option<Vec<u8>>, DatabaseError> {
+        let found = self.split_cursor()?.seek_by_key_subkey(key, &start)?;
+        self.split_visible(key, found)
+    }
+
+    /// `DbDupCursorRO::seek_by_key_subkey`.
+    pub fn seek_by_key_subkey<T: DupSort>(
         &mut self,
-        key: &[u8],
-        range: Shard,
-        bound: Option<(&[u8], bool)>,
-        deadline: Instant,
-    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
-        let layout = self.table.subkey_layout().ok_or_else(|| self.unsupported("a split key"))?;
-        let beyond = |subkey: &[u8]| match bound {
-            None => true,
-            Some((start, true)) => subkey > start,
-            Some((start, false)) => subkey >= start,
-        };
-        for candidate in layout.replicated_keys(range) {
-            if beyond(&candidate)
-                && let Some(value) = self.split_cursor()?.seek_by_key_subkey(key, &candidate)?
-                && value.starts_with(&candidate)
+        inner: &mut Cursor<K, T>,
+        key: T::Key,
+        subkey: T::SubKey,
+    ) -> ValueOnlyResult<T> {
+        let mode = self.mode();
+        if mode == ReadMode::Raw {
+            return inner.seek_by_key_subkey(key, subkey);
+        }
+        let encoded = Self::encode::<T>(&key);
+        let encoded_subkey = subkey.clone().encode().into_vec();
+        let split = self.is_split(&encoded);
+        if mode == ReadMode::Filtered {
+            if split {
+                let found = inner.seek_by_key_subkey(key.clone(), subkey)?;
+                return self.typed_split_visible(inner, &key, encoded, found);
+            }
+            return match self.place_key(&encoded)? {
+                RowPlace::Held => {
+                    let found = inner.seek_by_key_subkey(key, subkey)?;
+                    Ok(self.settle_local(encoded, found))
+                }
+                RowPlace::Foreign(_) => {
+                    self.position = CursorPosition::Missed;
+                    Ok(None)
+                }
+            };
+        }
+        let probe = encoded_subkey.iter().all(|byte| *byte == 0);
+        if split {
+            if probe {
+                return Err(self.storage_not_held(&encoded));
+            }
+            return match self.place_subkey(&encoded_subkey)? {
+                RowPlace::Held => {
+                    let found = inner.seek_by_key_subkey(key, subkey)?;
+                    let exact = match found {
+                        Some(value) if self.value_subkey::<T>(&value)? == encoded_subkey => {
+                            Some(value)
+                        }
+                        _ => None,
+                    };
+                    self.position = match exact {
+                        Some(_) => {
+                            CursorPosition::Local { key: encoded, subkey: Some(encoded_subkey) }
+                        }
+                        None => CursorPosition::Missed,
+                    };
+                    Ok(exact)
+                }
+                RowPlace::Foreign(_) => self.remote_storage::<T>(encoded, encoded_subkey),
+            };
+        }
+        match self.place_key(&encoded)? {
+            RowPlace::Held => {
+                let found = inner.seek_by_key_subkey(key, subkey)?;
+                Ok(self.settle_local(encoded, found))
+            }
+            RowPlace::Foreign(_) if probe => self.probe(encoded),
+            RowPlace::Foreign(_) => self.remote_storage::<T>(encoded, encoded_subkey),
+        }
+    }
+
+    /// The storage entry of exactly `slot` of `address` from an owner.
+    fn remote_storage<T: DupSort>(
+        &mut self,
+        address: Vec<u8>,
+        slot: Vec<u8>,
+    ) -> ValueOnlyResult<T> {
+        let value =
+            self.snapshot()?.storage(B256::from_slice(&address), B256::from_slice(&slot))?;
+        Ok(self.settle_remote::<T>(address, value)?.map(|(_, value)| value))
+    }
+
+    /// The first visible duplicate of split contract `key` from the MDBX cursor's `found`,
+    /// seeking past every range this node does not own.
+    fn typed_split_visible<T: DupSort>(
+        &mut self,
+        inner: &mut Cursor<K, T>,
+        key: &T::Key,
+        encoded: Vec<u8>,
+        mut found: Option<T::Value>,
+    ) -> ValueOnlyResult<T> {
+        loop {
+            let Some(value) = found else {
+                self.position = CursorPosition::Missed;
+                return Ok(None);
+            };
+            let subkey = self.value_subkey::<T>(&value)?;
+            match self.place_subkey(&subkey)? {
+                RowPlace::Held => {
+                    self.position = CursorPosition::Local { key: encoded, subkey: Some(subkey) };
+                    return Ok(Some(value));
+                }
+                RowPlace::Foreign(range) => {
+                    found = match self.next_range_start(range) {
+                        Some(start) => {
+                            inner.seek_by_key_subkey(key.clone(), T::SubKey::decode(&start)?)?
+                        }
+                        None => None,
+                    };
+                }
+            }
+        }
+    }
+
+    /// `DbDupCursorRO::next_dup`.
+    pub fn next_dup<T: DupSort>(&mut self, inner: &mut Cursor<K, T>) -> PairResult<T> {
+        let mode = self.mode();
+        if mode == ReadMode::Raw {
+            return inner.next_dup();
+        }
+        match mem::replace(&mut self.position, CursorPosition::Missed) {
+            // Every duplicate of a key placed by key is visible: MDBX's own walk, which leaves
+            // the last duplicate current at the end.
+            position @ CursorPosition::Local { subkey: None, .. } => {
+                self.position = position;
+                inner.next_dup()
+            }
+            position @ (CursorPosition::Local { subkey: Some(_), .. }
+            | CursorPosition::LocalSplit { .. })
+                if mode == ReadMode::Remote =>
             {
-                let row = Self::decode::<T>(key, &value)?;
-                return Ok(Some((row, CursorPosition::LocalSplit { key: key.to_vec(), value })));
+                self.position = position;
+                Err(self.unsupported("next_dup of a split contract outside a LocalReads scope"))
             }
-        }
-
-        let floor = layout.shard_floor(range);
-        let (from, after) = match bound {
-            Some((start, after)) if start >= floor.as_slice() => (start.to_vec(), after),
-            _ => (floor, false),
-        };
-        if !self.owns(range) {
-            return self.remote_duplicates::<T>(key.to_vec(), &from, after, Some(deadline));
-        }
-        let split = self.split_cursor()?;
-        let mut value = split.seek_by_key_subkey(key, &from)?;
-        if after && value.as_ref().is_some_and(|value| value.starts_with(&from)) {
-            value = split.next_dup()?;
-        }
-        let Some(value) = value else { return Ok(None) };
-        if self.split_placement(self.subkey_of(&value)?) != Some(KeyPlacement::Shard(range)) {
-            return Ok(None);
-        }
-        let row = Self::decode::<T>(key, &value)?;
-        Ok(Some((row, CursorPosition::LocalSplit { key: key.to_vec(), value })))
-    }
-
-    /// The first entry with key `>= start` (`> start` when `after`), from `start`'s shard on.
-    fn find<T: Table>(
-        &self,
-        inner: &mut Cursor<K, T>,
-        start: &[u8],
-        after: bool,
-    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
-        let shard = Shard(start[0]);
-        if let Some(found) = self.find_in_shard(inner, shard, Some((start, after)))? {
-            return Ok(Some(found));
-        }
-        self.find_after_shard(inner, shard)
-    }
-
-    /// The first entry of the first non-empty shard after `shard`.
-    fn find_after_shard<T: Table>(
-        &self,
-        inner: &mut Cursor<K, T>,
-        shard: Shard,
-    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
-        for next in (shard.0..=u8::MAX).skip(1) {
-            if let Some(found) = self.find_in_shard(inner, Shard(next), None)? {
-                return Ok(Some(found));
+            CursorPosition::Local { key, subkey: Some(subkey) } => {
+                let typed_key = T::Key::decode(&key)?;
+                let found = inner.next_dup()?.map(|(_, value)| value);
+                let found = self.typed_split_visible(inner, &typed_key, key.clone(), found)?;
+                if found.is_none() {
+                    inner.seek_by_key_subkey(typed_key.clone(), T::SubKey::decode(&subkey)?)?;
+                    let last = Box::new(CursorPosition::Local { key, subkey: Some(subkey) });
+                    self.position = CursorPosition::PastEnd { last };
+                }
+                Ok(found.map(|value| (typed_key, value)))
             }
-        }
-        Ok(None)
-    }
-
-    /// The first entry of `shard` at or after the bound: replicated keys first (local), then
-    /// sharded keys (local when owned, otherwise from an owner).
-    fn find_in_shard<T: Table>(
-        &self,
-        inner: &mut Cursor<K, T>,
-        shard: Shard,
-        bound: Option<(&[u8], bool)>,
-    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
-        let beyond = |key: &[u8]| match bound {
-            None => true,
-            Some((start, true)) => key > start,
-            Some((start, false)) => key >= start,
-        };
-        for candidate in self.table.replicated_keys(shard) {
-            if beyond(&candidate)
-                && let Some(row) = inner.seek_exact(T::Key::decode(&candidate)?)?
-            {
-                return Ok(Some((row, CursorPosition::Local { key: candidate })));
+            CursorPosition::LocalSplit { key, value } => {
+                let next = self.split_cursor()?.next_dup()?;
+                match self.split_visible(&key, next)? {
+                    Some(next) => {
+                        let row = Self::decode::<T>(&key, &next)?;
+                        self.position = CursorPosition::LocalSplit { key, value: next };
+                        Ok(Some(row))
+                    }
+                    None => {
+                        let last = Box::new(CursorPosition::LocalSplit { key, value });
+                        self.position = CursorPosition::PastEnd { last };
+                        Ok(None)
+                    }
+                }
             }
-        }
-
-        let floor = self.table.shard_floor(shard);
-        let (from, after) = match bound {
-            Some((start, after)) if start >= floor.as_slice() => (start.to_vec(), after),
-            _ => (floor, false),
-        };
-        if !self.owns(shard) {
-            return self.remote_page::<T>(&from, after);
-        }
-        let mut row = inner.seek(T::Key::decode(&from)?)?;
-        if after && row.as_ref().is_some_and(|(key, _)| Self::encode::<T>(key) == from) {
-            row = inner.next()?;
-        }
-        Ok(row.and_then(|(key, value)| {
-            let encoded = Self::encode::<T>(&key);
-            (encoded[0] == shard.0)
-                .then_some(((key, value), CursorPosition::Local { key: encoded }))
-        }))
-    }
-
-    /// The first entry of an owner's `SeekGe` page from `from` (skipping `from` when `after`).
-    fn remote_page<T: Table>(
-        &self,
-        from: &[u8],
-        after: bool,
-    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
-        let page = self.snapshot.seek_ge(self.table, from)?;
-        let mut rest = VecDeque::from(page.entries);
-        if after && rest.front().is_some_and(|(key, _)| key.as_slice() == from) {
-            rest.pop_front();
-        }
-        self.first_of_page::<T>(rest, page.end_of_shard)
-    }
-
-    /// The first duplicate of an owner's `SeekDupGe` page of `key` from `subkey` (skipping
-    /// `subkey` when `after`), read by `deadline` when there is one.
-    fn remote_duplicates<T: Table>(
-        &self,
-        key: Vec<u8>,
-        subkey: &[u8],
-        after: bool,
-        deadline: Option<Instant>,
-    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
-        let limit = ReadSnapshot::PAGE_LEN;
-        let page = self.snapshot.seek_dup_ge(self.table, &key, subkey, limit, deadline)?;
-        let subkey_len = self.table.subkey_len();
-        let mut rest: VecDeque<_> =
-            page.values.into_iter().map(|value| (key.clone(), value)).collect();
-        if after && rest.front().is_some_and(|(_, value)| value.get(..subkey_len) == Some(subkey)) {
-            rest.pop_front();
-        }
-        self.first_of_page::<T>(rest, page.end_of_key)
-    }
-
-    fn first_of_page<T: Table>(
-        &self,
-        mut rest: VecDeque<(Vec<u8>, Vec<u8>)>,
-        complete: bool,
-    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
-        match rest.pop_front() {
-            Some((key, value)) => {
-                let row = Self::decode::<T>(&key, &value)?;
-                Ok(Some((row, CursorPosition::Remote { key, value, rest, complete })))
+            CursorPosition::Detached => match inner.next_dup()? {
+                Some((key, value)) if self.visible::<T>(&key, &value)? => {
+                    let encoded = Self::encode::<T>(&key);
+                    let subkey = if self.is_split(&encoded) {
+                        Some(self.value_subkey::<T>(&value)?)
+                    } else {
+                        None
+                    };
+                    self.position = CursorPosition::Local { key: encoded, subkey };
+                    Ok(Some((key, value)))
+                }
+                Some((key, value)) if self.is_split(&Self::encode::<T>(&key)) => {
+                    let encoded = Self::encode::<T>(&key);
+                    let found = self.typed_split_visible(inner, &key, encoded, Some(value))?;
+                    Ok(found.map(|value| (key, value)))
+                }
+                // A key placed by key whose duplicates are all invisible.
+                Some(_) | None => Ok(None),
+            },
+            position @ CursorPosition::Remote { .. } => {
+                self.position = position;
+                Err(self.unsupported("next_dup after a read from an owner"))
             }
-            None if complete => Ok(None),
-            None => Err(DatabaseError::Other(format!(
-                "an owner returned an empty, incomplete {:?} page",
-                self.table
-            ))),
+            position => {
+                self.position = position;
+                Ok(None)
+            }
         }
     }
 }

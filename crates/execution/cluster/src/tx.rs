@@ -9,8 +9,8 @@ use reth_db::{
 };
 
 use crate::{
-    ClusterNode, ClusteredCursor, CursorSharding, ReadSnapshot, ShardedReads, ShardedTable,
-    SplitCursor,
+    ClusterNode, ClusteredCursor, CursorSharding, PointRead, ReadSnapshot, ShardedReads,
+    ShardedTable, SplitCursor,
 };
 
 /// What a [`ClusteredTx`] does beyond forwarding to MDBX.
@@ -41,44 +41,46 @@ impl<K: TransactionKind> ClusteredTx<K> {
         Self { inner, sharding }
     }
 
-    /// How a cursor over `T` is sharded. A read-only cursor of a duplicate-key table gets a split
-    /// cursor of its own, opened on first use, when any contract's storage is split.
+    /// How a cursor over `T` is sharded. A cursor of a duplicate-key table gets a split cursor of
+    /// its own, opened on first use, when any contract's storage is split.
     fn cursor_sharding<T: Table>(&self) -> Result<CursorSharding<K>, DatabaseError> {
         let Some(table) = ShardedTable::from_table_name(T::NAME) else {
             return Ok(CursorSharding::PassThrough);
         };
-        Ok(match &self.sharding {
-            TxSharding::PassThrough => CursorSharding::PassThrough,
+        let (node, snapshot) = match &self.sharding {
+            TxSharding::PassThrough => return Ok(CursorSharding::PassThrough),
             TxSharding::Reads(snapshot) => {
-                let split = if snapshot.node().cluster().splits_storage() {
-                    SplitCursor::new(&self.inner, table)?
-                } else {
-                    None
-                };
-                CursorSharding::Reads(ShardedReads::new(Arc::clone(snapshot), table, split))
+                (Arc::clone(snapshot.node()), Some(Arc::clone(snapshot)))
             }
-            TxSharding::Writes(node) => CursorSharding::Writes { node: Arc::clone(node), table },
-        })
+            TxSharding::Writes(node) => (Arc::clone(node), None),
+        };
+        let split = if node.cluster().splits_storage() {
+            SplitCursor::new(&self.inner, table)?
+        } else {
+            None
+        };
+        Ok(CursorSharding::Sharded(ShardedReads::new(node, table, snapshot, split)))
     }
 
-    /// Reads the encoded `key` of a sharded table from an owner when this transaction reads at a
-    /// snapshot and this node does not hold the key; `None` means "read local MDBX".
-    fn remote_value<T: Table>(
+    /// Reads the value of `key` of a sharded table where the read rule says, or `None` to read
+    /// local MDBX.
+    fn sharded_get<T: Table>(
         &self,
-        key: &[u8],
+        key: impl FnOnce() -> Result<T::Key, DatabaseError>,
+        encoded: &[u8],
     ) -> Result<Option<Option<T::Value>>, DatabaseError> {
-        let TxSharding::Reads(snapshot) = &self.sharding else { return Ok(None) };
-        let Some(table) = ShardedTable::from_table_name(T::NAME) else { return Ok(None) };
-        if snapshot.node().cluster().is_split(table, key) {
-            // The first duplicate of a split contract may be in any range.
-            let first = self.cursor_read::<T>()?.seek_exact(T::Key::decode(key)?)?;
+        let CursorSharding::Sharded(reads) = self.cursor_sharding::<T>()? else { return Ok(None) };
+        if reads.table().is_duplicate() {
+            let first = self.cursor_read::<T>()?.seek_exact(key()?)?;
             return Ok(Some(first.map(|(_, value)| value)));
         }
-        if snapshot.node().holds_by_key(table, key)? {
-            return Ok(None);
+        match reads.point(encoded)? {
+            PointRead::Local => Ok(None),
+            PointRead::Invisible => Ok(Some(None)),
+            PointRead::Remote(value) => {
+                Ok(Some(value.map(|value| T::Value::decompress(&value)).transpose()?))
+            }
         }
-        let value = snapshot.value(table, key)?;
-        Ok(Some(value.map(|value| T::Value::decompress(&value)).transpose()?))
     }
 
     fn accepts_write<T: Table>(
@@ -95,10 +97,11 @@ impl<K: TransactionKind> DbTx for ClusteredTx<K> {
     type DupCursor<T: DupSort> = ClusteredCursor<K, T>;
 
     fn get<T: Table>(&self, key: T::Key) -> Result<Option<T::Value>, DatabaseError> {
-        if matches!(self.sharding, TxSharding::Reads(_))
-            && let Some(value) = self.remote_value::<T>(&key.clone().encode().into_vec())?
-        {
-            return Ok(value);
+        if !matches!(self.sharding, TxSharding::PassThrough) {
+            let encoded = key.clone().encode().into_vec();
+            if let Some(value) = self.sharded_get::<T>(|| Ok(key.clone()), &encoded)? {
+                return Ok(value);
+            }
         }
         self.inner.get::<T>(key)
     }
@@ -107,8 +110,11 @@ impl<K: TransactionKind> DbTx for ClusteredTx<K> {
         &self,
         key: &<T::Key as Encode>::Encoded,
     ) -> Result<Option<T::Value>, DatabaseError> {
-        if let Some(value) = self.remote_value::<T>(key.as_ref())? {
-            return Ok(value);
+        if !matches!(self.sharding, TxSharding::PassThrough) {
+            let decoded = || T::Key::decode(key.as_ref());
+            if let Some(value) = self.sharded_get::<T>(decoded, key.as_ref())? {
+                return Ok(value);
+            }
         }
         self.inner.get_by_encoded_key::<T>(key)
     }

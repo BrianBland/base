@@ -11,7 +11,7 @@ use std::{
 };
 
 use base_execution_cluster::{Cluster, ClusterConfig, NodeConfig, NodeId, OwnerServer, OwnerStore};
-use reth_db::mdbx::{RO, tx::Tx};
+use reth_db::test_utils::create_test_rw_db;
 
 /// How long dropping an owner server may take.
 const SERVER_STOP_LIMIT: Duration = Duration::from_millis(500);
@@ -38,7 +38,7 @@ fn serve() -> (SocketAddr, OwnerServer) {
         read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
     })
     .unwrap();
-    let store = Arc::new(OwnerStore::<Tx<RO>>::new(Arc::new(cluster), 160));
+    let store = Arc::new(OwnerStore::new(Arc::new(cluster), create_test_rw_db(), 160).unwrap());
     (address, OwnerServer::spawn(listener, store, Arc::default()).unwrap())
 }
 

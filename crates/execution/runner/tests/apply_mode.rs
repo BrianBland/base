@@ -42,7 +42,7 @@ use reth_db::{
     mdbx::{DatabaseArguments, RO, tx::Tx},
     table::Table,
     tables::{self, RawTable},
-    test_utils::tempdir_path,
+    test_utils::{create_test_rw_db, tempdir_path},
     transaction::DbTx,
 };
 use reth_node_builder::{NodeBuilder, NodeConfig};
@@ -543,8 +543,8 @@ async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
         apply_from: vec![],
         ..applier.cluster.cluster().config().clone()
     })?;
-    let corrupt_store: Arc<OwnerStore<Tx<RO>>> =
-        Arc::new(OwnerStore::new(Arc::new(corrupt_view), 160));
+    let corrupt_store =
+        Arc::new(OwnerStore::new(Arc::new(corrupt_view), create_test_rw_db(), 160)?);
     let corrupt_server =
         OwnerServer::spawn(corrupt_listener, corrupt_store, Arc::clone(&corrupt_results))?;
 

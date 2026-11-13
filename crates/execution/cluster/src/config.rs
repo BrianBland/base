@@ -34,13 +34,15 @@ pub struct ClusterConfig {
     /// Number of storage nodes that own each shard (`R`).
     #[serde(default = "ClusterConfig::default_replication")]
     pub replication: usize,
-    /// Number of most recent blocks an owner can serve reads as of (`W`).
+    /// Depth of an owner's history index in blocks (`W`): an owner serves reads as of its last
+    /// `W` persisted blocks and the blocks above. Must be the same on every node.
     #[serde(default = "ClusterConfig::default_retention_blocks")]
     pub retention_blocks: u64,
     /// Every node of the cluster, including this one.
     pub nodes: Vec<NodeConfig>,
     /// The nodes this node asks, in order, for the execution results of new payloads instead of
-    /// executing them (apply mode). Empty: this node executes.
+    /// executing them (apply mode). Empty: this node executes. Only a node that stores nothing
+    /// may apply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub apply_from: Vec<NodeId>,
     /// Large contracts whose storage is split over all shards by subkey: 20-byte addresses,
@@ -60,8 +62,14 @@ impl ClusterConfig {
     /// Default replication factor: one owner of each shard may be down.
     pub const DEFAULT_REPLICATION: usize = 2;
 
-    /// Smallest and default retention window `W`: Base's persistence backpressure threshold.
+    /// Smallest history window `W`: Base's persistence backpressure threshold, so an owner always
+    /// covers the blocks a peer may persist before it does.
     pub const MIN_RETENTION_BLOCKS: u64 = 160;
+
+    /// Default history window `W`: 30 000 blocks, about 17 hours of Base blocks. Nodes may be
+    /// this far apart (after a restart, for example) and still read each other; the index costs
+    /// memory in proportion to the rows changed in that many blocks.
+    pub const DEFAULT_RETENTION_BLOCKS: u64 = 30_000;
 
     /// Default `read_retry_secs`: [`ClientOptions::DEFAULT_RETRY_FOR`].
     pub const DEFAULT_READ_RETRY_SECS: u64 = ClientOptions::DEFAULT_RETRY_FOR.as_secs();
@@ -71,7 +79,7 @@ impl ClusterConfig {
     }
 
     const fn default_retention_blocks() -> u64 {
-        Self::MIN_RETENTION_BLOCKS
+        Self::DEFAULT_RETENTION_BLOCKS
     }
 
     const fn default_read_retry_secs() -> u64 {
@@ -116,6 +124,12 @@ pub enum ConfigError {
     /// `apply_from` lists this node.
     #[error("apply_from lists this node {0:?}")]
     ApplyFromSelf(NodeId),
+    /// `apply_from` is set on a node that stores shards, whose trie rows an executor's result
+    /// does not carry.
+    #[error(
+        "apply_from is set on {0:?}, which stores shards; only a node with storage = false may apply"
+    )]
+    ApplyOnStoringNode(NodeId),
     /// A `split_storage` entry is neither a 20-byte address nor a 32-byte hashed address.
     #[error("split_storage entry {0} is neither a 20-byte address nor a 32-byte hashed address")]
     InvalidSplitStorage(Bytes),
@@ -164,6 +178,9 @@ impl Cluster {
         }
         if config.apply_from.contains(&config.node_id) {
             return Err(ConfigError::ApplyFromSelf(config.node_id));
+        }
+        if !config.apply_from.is_empty() && storage_nodes.contains(&config.node_id) {
+            return Err(ConfigError::ApplyOnStoringNode(config.node_id));
         }
         if config.read_retry_secs == 0 {
             return Err(ConfigError::ZeroReadRetry);
@@ -295,7 +312,7 @@ mod tests {
         let cluster = Cluster::load(&path).unwrap();
         assert_eq!(cluster.node_id(), NodeId(3));
         assert_eq!(cluster.config().replication, ClusterConfig::DEFAULT_REPLICATION);
-        assert_eq!(cluster.config().retention_blocks, ClusterConfig::MIN_RETENTION_BLOCKS);
+        assert_eq!(cluster.config().retention_blocks, ClusterConfig::DEFAULT_RETENTION_BLOCKS);
         assert_eq!(cluster.address(NodeId(2)), Some("127.0.0.1:9002".parse().unwrap()));
         assert!(cluster.config().nodes[0].storage);
         assert_eq!(cluster.config().client_options().retry_for, ClientOptions::DEFAULT_RETRY_FOR);
@@ -365,6 +382,9 @@ mod tests {
 
         let from_self = THREE_NODES.replace("node_id = 3", "node_id = 3\napply_from = [3]");
         assert!(matches!(parse(&from_self), Err(ConfigError::ApplyFromSelf(NodeId(3)))));
+
+        let storing_applier = THREE_NODES.replace("node_id = 3", "node_id = 1\napply_from = [2]");
+        assert!(matches!(parse(&storing_applier), Err(ConfigError::ApplyOnStoringNode(NodeId(1)))));
 
         let short_entry = THREE_NODES.replace(
             "node_id = 3",

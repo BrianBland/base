@@ -18,7 +18,8 @@ pub struct SnapshotId {
 }
 
 /// A read of one sharded table as of a snapshot, or a request for a block's execution result
-/// ([`Query::ExecutedBlock`], which ignores the snapshot and the table).
+/// ([`Query::ExecutedBlock`]) or an owner's servable range ([`Query::Status`]), which ignore the
+/// snapshot and the table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     /// The block the read is answered as of.
@@ -30,15 +31,19 @@ pub struct Request {
 }
 
 /// The read operation. Keys, subkeys and values are the encoded bytes MDBX stores.
+///
+/// New variants are appended at the end so the encoding of the older ones never shifts. An owner
+/// refuses [`Self::Get`] of a table other than `Bytecodes`, [`Self::SeekGe`] and
+/// [`Self::SeekDupGe`] with [`ReadError::Unsupported`]: they are kept only so that a node of the
+/// previous version is refused instead of misread.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Query {
-    /// The value of exactly `key`. Tables: `HashedAccounts`, `AccountsTrie`, `Bytecodes`.
+    /// The value of exactly `key`. Served for `Bytecodes` only.
     Get {
         /// Encoded key.
         key: Vec<u8>,
     },
-    /// Up to `limit` entries with key `>= key`, ascending, within the key's shard.
-    /// Tables: `HashedAccounts`, `AccountsTrie`.
+    /// Up to `limit` entries with key `>= key`, ascending, within the key's shard. Refused.
     SeekGe {
         /// Encoded key to start from.
         key: Vec<u8>,
@@ -46,7 +51,7 @@ pub enum Query {
         limit: u32,
     },
     /// Up to `limit` duplicate values of exactly `key` with subkey `>= subkey`, ascending.
-    /// Tables: `HashedStorages`, `StoragesTrie`.
+    /// Refused.
     SeekDupGe {
         /// Encoded key.
         key: Vec<u8>,
@@ -62,9 +67,30 @@ pub enum Query {
         /// Hash of the block.
         hash: B256,
     },
+    /// The encoded account of hashed `address` at the snapshot. Table: `HashedAccounts`.
+    AccountValue {
+        /// Hashed address.
+        address: B256,
+    },
+    /// The encoded storage entry of exactly hashed `slot` of hashed `address` at the snapshot.
+    /// Table: `HashedStorages`.
+    StorageValue {
+        /// Hashed address.
+        address: B256,
+        /// Hashed slot.
+        slot: B256,
+    },
+    /// Whether hashed `address` has any storage at the snapshot. Table: `HashedStorages`.
+    HasStorage {
+        /// Hashed address.
+        address: B256,
+    },
+    /// The range of blocks the owner can answer state reads as of; the snapshot and table of the
+    /// request are ignored.
+    Status,
 }
 
-/// Entries returned by [`Query::SeekGe`].
+/// Entries of the refused [`Query::SeekGe`]; kept for the encoding of [`Response`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardEntries {
     /// Encoded `(key, value)` pairs, ascending by key.
@@ -73,7 +99,7 @@ pub struct ShardEntries {
     pub end_of_shard: bool,
 }
 
-/// Duplicate values returned by [`Query::SeekDupGe`].
+/// Duplicate values of the refused [`Query::SeekDupGe`]; kept for the encoding of [`Response`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DuplicateValues {
     /// Encoded values (each starting with its subkey), ascending by subkey.
@@ -82,10 +108,11 @@ pub struct DuplicateValues {
     pub end_of_key: bool,
 }
 
-/// A successful answer to a [`Request`].
+/// A successful answer to a [`Request`]. New variants are appended at the end.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
-    /// Answer to [`Query::Get`]: the encoded value, or `None` when absent.
+    /// Answer to [`Query::Get`], [`Query::AccountValue`] and [`Query::StorageValue`]: the encoded
+    /// value, or `None` when absent.
     Value(Option<Vec<u8>>),
     /// Answer to [`Query::SeekGe`].
     Entries(ShardEntries),
@@ -93,6 +120,10 @@ pub enum Response {
     Duplicates(DuplicateValues),
     /// Answer to [`Query::ExecutedBlock`]: the encoded execution result.
     ExecutedBlock(Bytes),
+    /// Answer to [`Query::HasStorage`].
+    HasStorage(bool),
+    /// Answer to [`Query::Status`]: the servable range, or `None` when the owner can serve none.
+    Status(Option<ServableRange>),
 }
 
 /// Inclusive range of blocks an owner can answer as of.
@@ -107,13 +138,15 @@ pub struct ServableRange {
 /// An owner's refusal to answer a [`Request`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize, Deserialize)]
 pub enum ReadError {
-    /// The owner cannot reproduce the snapshot: it is behind, has discarded it, or has a gap.
+    /// The owner cannot reproduce the snapshot: it is behind, the snapshot is below its history,
+    /// or it has a gap.
     #[error("snapshot unavailable, servable range {servable:?}")]
     SnapshotUnavailable {
         /// Blocks the owner can serve, or `None` when it can serve none.
         servable: Option<ServableRange>,
     },
-    /// The owner's block at the snapshot's number has a different hash.
+    /// The owner's block at the snapshot's number has a different hash, or the owner stopped
+    /// serving after a reorg of its persisted blocks.
     #[error("owner is on a different fork")]
     WrongFork,
     /// The key is in a shard the owner does not own.

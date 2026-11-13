@@ -8,12 +8,9 @@ use std::{
 use alloy_primitives::B256;
 use reth_db::DatabaseError;
 
-use crate::{
-    ClientError, ClusterNode, DuplicateValues, RemoteReadKind, ShardEntries, ShardedTable,
-    SnapshotId,
-};
+use crate::{ClientError, ClusterNode, RemoteReadKind, SnapshotId};
 
-/// The persisted tip `P` of one read-only transaction, and reads of other nodes' shards as of
+/// The persisted tip `P` of one read-only transaction, and exact reads of other nodes' rows as of
 /// it. Shared by the transaction and its cursors.
 #[derive(Debug)]
 pub struct ReadSnapshot {
@@ -23,9 +20,6 @@ pub struct ReadSnapshot {
 }
 
 impl ReadSnapshot {
-    /// Entries asked for per remote `SeekGe` or `SeekDupGe`.
-    pub const PAGE_LEN: u32 = 64;
-
     /// A snapshot at block `number`, the `Finish` checkpoint of the transaction.
     pub const fn new(node: Arc<ClusterNode>, number: u64) -> Self {
         Self { node, number, hash: OnceLock::new() }
@@ -37,27 +31,18 @@ impl ReadSnapshot {
     }
 
     /// This node.
-    pub fn node(&self) -> &ClusterNode {
+    pub const fn node(&self) -> &Arc<ClusterNode> {
         &self.node
-    }
-
-    /// The deadline of one read of a split contract starting now, across every range it visits,
-    /// owner it asks, connection it opens and frame it exchanges: the retry budget of one remote
-    /// read ([`ClientOptions::retry_for`](crate::ClientOptions::retry_for)). Running out of it is
-    /// an error, never "absent".
-    pub fn split_read_deadline(&self) -> Instant {
-        Instant::now() + self.node.client().options().retry_for
     }
 
     /// `P` with its hash, looked up once per transaction when the node knows it.
     fn id(&self) -> SnapshotId {
-        let hash = *self.hash.get_or_init(|| self.node.block_hash(self.number));
+        let hash = *self.hash.get_or_init(|| self.node.owner_store().block_hash(self.number));
         SnapshotId { number: self.number, hash }
     }
 
     fn remote<R>(
         &self,
-        table: ShardedTable,
         kind: RemoteReadKind,
         read: impl FnOnce(SnapshotId) -> Result<R, ClientError>,
     ) -> Result<R, DatabaseError> {
@@ -67,48 +52,36 @@ impl ReadSnapshot {
         self.node.client().remote_read_stats().record(kind, started.elapsed(), result.is_err());
         result.map_err(|error| {
             DatabaseError::Other(format!(
-                "cluster read of {table:?} at block {} failed: {error}",
+                "cluster {kind:?} read at block {} failed: {error}",
                 self.number
             ))
         })
     }
 
-    /// The encoded value of `key` in `table` at `P`, read from an owner.
-    pub fn get(&self, table: ShardedTable, key: &[u8]) -> Result<Option<Vec<u8>>, DatabaseError> {
-        self.remote(table, RemoteReadKind::Get, |snapshot| {
-            self.node.client().get(snapshot, table, key)
+    /// The encoded account at hashed `address` at `P`, read from an owner.
+    pub fn account(&self, address: B256) -> Result<Option<Vec<u8>>, DatabaseError> {
+        self.remote(RemoteReadKind::Account, |snapshot| {
+            self.node.client().account(snapshot, address)
         })
     }
 
-    /// A page of `key`'s shard with keys `>= key` at `P`, read from an owner.
-    pub fn seek_ge(&self, table: ShardedTable, key: &[u8]) -> Result<ShardEntries, DatabaseError> {
-        self.remote(table, RemoteReadKind::Seek, |snapshot| {
-            self.node.client().seek_ge(snapshot, table, key, Self::PAGE_LEN)
+    /// The encoded storage entry of exactly hashed `slot` of hashed `address` at `P`, read from
+    /// an owner of the row.
+    pub fn storage(&self, address: B256, slot: B256) -> Result<Option<Vec<u8>>, DatabaseError> {
+        self.remote(RemoteReadKind::Storage, |snapshot| {
+            self.node.client().storage(snapshot, address, slot)
         })
     }
 
-    /// The encoded value of `key` in `table` at `P`, read from an owner; for a duplicate-key
-    /// table, the key's first duplicate.
-    pub fn value(&self, table: ShardedTable, key: &[u8]) -> Result<Option<Vec<u8>>, DatabaseError> {
-        if table.is_duplicate() {
-            let first = self.seek_dup_ge(table, key, &table.first_subkey(), 1, None)?;
-            return Ok(first.values.into_iter().next());
-        }
-        self.get(table, key)
+    /// Whether hashed `address` has any storage at `P`, read from an owner.
+    pub fn has_storage(&self, address: B256) -> Result<bool, DatabaseError> {
+        self.remote(RemoteReadKind::StorageProbe, |snapshot| {
+            self.node.client().has_storage(snapshot, address)
+        })
     }
 
-    /// Up to `limit` duplicates of `key` with subkeys `>= subkey` at `P`, read from an owner, by
-    /// `deadline` when there is one.
-    pub fn seek_dup_ge(
-        &self,
-        table: ShardedTable,
-        key: &[u8],
-        subkey: &[u8],
-        limit: u32,
-        deadline: Option<Instant>,
-    ) -> Result<DuplicateValues, DatabaseError> {
-        self.remote(table, RemoteReadKind::DuplicateSeek, |snapshot| {
-            self.node.client().seek_dup_ge(snapshot, table, key, subkey, limit, deadline)
-        })
+    /// The encoded bytecode with hash `key`, read from an owner.
+    pub fn bytecode(&self, key: &[u8]) -> Result<Option<Vec<u8>>, DatabaseError> {
+        self.remote(RemoteReadKind::Bytecode, |snapshot| self.node.client().bytecode(snapshot, key))
     }
 }

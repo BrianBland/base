@@ -1,7 +1,4 @@
-use std::{
-    ops::{Bound, RangeBounds},
-    sync::Arc,
-};
+use std::ops::{Bound, RangeBounds};
 
 use reth_db::{
     DatabaseError,
@@ -14,23 +11,16 @@ use reth_db::{
     table::{Compress, DupSort, Encode, IntoVec, Table},
 };
 
-use crate::{ClusterNode, ShardedReads, ShardedTable};
+use crate::{ReadMode, ShardedReads};
 
 /// What a [`ClusteredCursor`] does beyond forwarding to MDBX.
 #[derive(Debug)]
 pub enum CursorSharding<K: TransactionKind> {
     /// Forward everything: the table is not sharded or the database is a pass-through.
     PassThrough,
-    /// Route reads: a read-only cursor of a clustered database over a sharded table.
-    Reads(ShardedReads<K>),
-    /// Drop writes to keys this node does not hold: a read-write cursor of a clustered database
-    /// over a sharded table. Reads stay local.
-    Writes {
-        /// This node.
-        node: Arc<ClusterNode>,
-        /// The table written.
-        table: ShardedTable,
-    },
+    /// Route reads and drop writes to rows this node does not hold: a cursor of a clustered
+    /// database over a sharded table.
+    Sharded(ShardedReads<K>),
 }
 
 impl<K: TransactionKind> CursorSharding<K> {
@@ -41,14 +31,22 @@ impl<K: TransactionKind> CursorSharding<K> {
         key: &T::Key,
         value: &T::Value,
     ) -> Result<bool, DatabaseError> {
-        let Self::Writes { node, table } = self else { return Ok(true) };
+        let Self::Sharded(reads) = self else { return Ok(true) };
+        let (node, table) = (reads.node(), reads.table());
         let key = key.clone().encode().into_vec();
-        if !node.cluster().is_split(*table, &key) {
-            return node.holds(*table, &key, &[]);
+        if !node.cluster().is_split(table, &key) {
+            return node.holds(table, &key, &[]);
         }
         let mut encoded = Vec::new();
         value.compress_to_buf(&mut encoded);
-        node.holds(*table, &key, table.subkey_of(&encoded).unwrap_or_default())
+        node.holds(table, &key, table.subkey_of(&encoded).unwrap_or_default())
+    }
+
+    /// Notes that a write moved the MDBX cursor.
+    fn detach(&mut self) {
+        if let Self::Sharded(reads) = self {
+            reads.detach();
+        }
     }
 }
 
@@ -73,49 +71,53 @@ impl<K: TransactionKind, T: Table> ClusteredCursor<K, T> {
 impl<K: TransactionKind, T: Table> DbCursorRO<T> for ClusteredCursor<K, T> {
     fn first(&mut self) -> PairResult<T> {
         match &mut self.sharding {
-            CursorSharding::Reads(reads) => reads.first(&mut self.inner),
+            CursorSharding::Sharded(reads) => reads.first(&mut self.inner),
             _ => self.inner.first(),
         }
     }
 
     fn seek_exact(&mut self, key: T::Key) -> PairResult<T> {
         match &mut self.sharding {
-            CursorSharding::Reads(reads) => reads.seek_exact(&mut self.inner, key),
+            CursorSharding::Sharded(reads) => reads.seek_exact(&mut self.inner, key),
             _ => self.inner.seek_exact(key),
         }
     }
 
     fn seek(&mut self, key: T::Key) -> PairResult<T> {
         match &mut self.sharding {
-            CursorSharding::Reads(reads) => reads.seek(&mut self.inner, key),
+            CursorSharding::Sharded(reads) => reads.seek(&mut self.inner, key),
             _ => self.inner.seek(key),
         }
     }
 
     fn next(&mut self) -> PairResult<T> {
         match &mut self.sharding {
-            CursorSharding::Reads(reads) => reads.next(&mut self.inner),
+            CursorSharding::Sharded(reads) => reads.next(&mut self.inner),
             _ => self.inner.next(),
         }
     }
 
     fn prev(&mut self) -> PairResult<T> {
         match &self.sharding {
-            CursorSharding::Reads(reads) => Err(reads.unsupported("prev")),
+            CursorSharding::Sharded(reads) if reads.mode() != ReadMode::Raw => {
+                Err(reads.unsupported("prev"))
+            }
             _ => self.inner.prev(),
         }
     }
 
     fn last(&mut self) -> PairResult<T> {
         match &self.sharding {
-            CursorSharding::Reads(reads) => Err(reads.unsupported("last")),
+            CursorSharding::Sharded(reads) if reads.mode() != ReadMode::Raw => {
+                Err(reads.unsupported("last"))
+            }
             _ => self.inner.last(),
         }
     }
 
     fn current(&mut self) -> PairResult<T> {
         match &mut self.sharding {
-            CursorSharding::Reads(reads) => reads.current(&mut self.inner),
+            CursorSharding::Sharded(reads) => reads.current(&mut self.inner),
             _ => self.inner.current(),
         }
     }
@@ -160,35 +162,41 @@ impl<K: TransactionKind, T: Table> DbCursorRO<T> for ClusteredCursor<K, T> {
 impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for ClusteredCursor<K, T> {
     fn prev_dup(&mut self) -> PairResult<T> {
         match &self.sharding {
-            CursorSharding::Reads(reads) => Err(reads.unsupported("prev_dup")),
+            CursorSharding::Sharded(reads) if reads.mode() != ReadMode::Raw => {
+                Err(reads.unsupported("prev_dup"))
+            }
             _ => self.inner.prev_dup(),
         }
     }
 
     fn next_dup(&mut self) -> PairResult<T> {
         match &mut self.sharding {
-            CursorSharding::Reads(reads) => reads.next_dup(&mut self.inner),
+            CursorSharding::Sharded(reads) => reads.next_dup(&mut self.inner),
             _ => self.inner.next_dup(),
         }
     }
 
     fn last_dup(&mut self) -> ValueOnlyResult<T> {
         match &self.sharding {
-            CursorSharding::Reads(reads) => Err(reads.unsupported("last_dup")),
+            CursorSharding::Sharded(reads) if reads.mode() != ReadMode::Raw => {
+                Err(reads.unsupported("last_dup"))
+            }
             _ => self.inner.last_dup(),
         }
     }
 
     fn next_no_dup(&mut self) -> PairResult<T> {
         match &self.sharding {
-            CursorSharding::Reads(reads) => Err(reads.unsupported("next_no_dup")),
+            CursorSharding::Sharded(reads) if reads.mode() != ReadMode::Raw => {
+                Err(reads.unsupported("next_no_dup"))
+            }
             _ => self.inner.next_no_dup(),
         }
     }
 
     fn next_dup_val(&mut self) -> ValueOnlyResult<T> {
         match &mut self.sharding {
-            CursorSharding::Reads(reads) => {
+            CursorSharding::Sharded(reads) => {
                 reads.next_dup(&mut self.inner).map(|row| row.map(|(_, value)| value))
             }
             _ => self.inner.next_dup_val(),
@@ -197,7 +205,9 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for ClusteredCursor<K, T> 
 
     fn seek_by_key_subkey(&mut self, key: T::Key, subkey: T::SubKey) -> ValueOnlyResult<T> {
         match &mut self.sharding {
-            CursorSharding::Reads(reads) => reads.seek_by_key_subkey(&mut self.inner, key, subkey),
+            CursorSharding::Sharded(reads) => {
+                reads.seek_by_key_subkey(&mut self.inner, key, subkey)
+            }
             _ => self.inner.seek_by_key_subkey(key, subkey),
         }
     }
@@ -231,6 +241,7 @@ impl<T: Table> DbCursorRW<T> for ClusteredCursor<RW, T> {
         if !self.sharding.accepts_write::<T>(&key, value)? {
             return Ok(());
         }
+        self.sharding.detach();
         self.inner.upsert(key, value)
     }
 
@@ -238,6 +249,7 @@ impl<T: Table> DbCursorRW<T> for ClusteredCursor<RW, T> {
         if !self.sharding.accepts_write::<T>(&key, value)? {
             return Ok(());
         }
+        self.sharding.detach();
         self.inner.insert(key, value)
     }
 
@@ -245,16 +257,19 @@ impl<T: Table> DbCursorRW<T> for ClusteredCursor<RW, T> {
         if !self.sharding.accepts_write::<T>(&key, value)? {
             return Ok(());
         }
+        self.sharding.detach();
         self.inner.append(key, value)
     }
 
     fn delete_current(&mut self) -> Result<(), DatabaseError> {
+        self.sharding.detach();
         self.inner.delete_current()
     }
 }
 
 impl<T: DupSort> DbDupCursorRW<T> for ClusteredCursor<RW, T> {
     fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError> {
+        self.sharding.detach();
         self.inner.delete_current_duplicates()
     }
 
@@ -262,6 +277,7 @@ impl<T: DupSort> DbDupCursorRW<T> for ClusteredCursor<RW, T> {
         if !self.sharding.accepts_write::<T>(&key, &value)? {
             return Ok(());
         }
+        self.sharding.detach();
         self.inner.append_dup(key, value)
     }
 }

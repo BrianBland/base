@@ -1,4 +1,5 @@
-//! Counts of this node's remote reads and apply-mode outcomes, and their periodic log lines.
+//! Counts of this node's remote reads, owner answers and apply-mode outcomes, and their periodic
+//! log lines.
 
 use std::{
     io,
@@ -13,26 +14,32 @@ use std::{
 use metrics::Counter;
 use tracing::info;
 
+use crate::ServableRange;
+
 /// The query a remote read sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteReadKind {
-    /// `Get`.
-    Get,
-    /// `SeekGe`.
-    Seek,
-    /// `SeekDupGe`.
-    DuplicateSeek,
+    /// `AccountValue`.
+    Account,
+    /// `StorageValue`.
+    Storage,
+    /// `HasStorage`.
+    StorageProbe,
+    /// `Get` of a bytecode.
+    Bytecode,
 }
 
 /// Remote reads counted since the node started.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RemoteReadCounts {
-    /// `Get` reads.
-    pub gets: u64,
-    /// `SeekGe` reads.
-    pub seeks: u64,
-    /// `SeekDupGe` reads.
-    pub duplicate_seeks: u64,
+    /// `AccountValue` reads.
+    pub accounts: u64,
+    /// `StorageValue` reads.
+    pub storages: u64,
+    /// `HasStorage` reads.
+    pub storage_probes: u64,
+    /// Bytecode reads.
+    pub bytecodes: u64,
     /// Reads of any kind that failed after every owner was tried.
     pub failures: u64,
     /// Reads that waited longer than [`ClusterClient::SLOW_WAIT`](crate::ClusterClient::SLOW_WAIT)
@@ -45,15 +52,16 @@ pub struct RemoteReadCounts {
 impl RemoteReadCounts {
     /// Reads of every kind.
     pub const fn total(&self) -> u64 {
-        self.gets + self.seeks + self.duplicate_seeks
+        self.accounts + self.storages + self.storage_probes + self.bytecodes
     }
 
     /// The reads counted since `earlier`.
     pub const fn since(&self, earlier: &Self) -> Self {
         Self {
-            gets: self.gets - earlier.gets,
-            seeks: self.seeks - earlier.seeks,
-            duplicate_seeks: self.duplicate_seeks - earlier.duplicate_seeks,
+            accounts: self.accounts - earlier.accounts,
+            storages: self.storages - earlier.storages,
+            storage_probes: self.storage_probes - earlier.storage_probes,
+            bytecodes: self.bytecodes - earlier.bytecodes,
             failures: self.failures - earlier.failures,
             waits: self.waits - earlier.waits,
             elapsed: self.elapsed.saturating_sub(earlier.elapsed),
@@ -65,9 +73,10 @@ impl RemoteReadCounts {
 /// `base_cluster_remote_reads` and `base_cluster_remote_read_failures`.
 #[derive(Debug)]
 pub struct RemoteReadStats {
-    gets: AtomicU64,
-    seeks: AtomicU64,
-    duplicate_seeks: AtomicU64,
+    accounts: AtomicU64,
+    storages: AtomicU64,
+    storage_probes: AtomicU64,
+    bytecodes: AtomicU64,
     failures: AtomicU64,
     waits: AtomicU64,
     elapsed_nanos: AtomicU64,
@@ -78,9 +87,10 @@ pub struct RemoteReadStats {
 impl Default for RemoteReadStats {
     fn default() -> Self {
         Self {
-            gets: AtomicU64::new(0),
-            seeks: AtomicU64::new(0),
-            duplicate_seeks: AtomicU64::new(0),
+            accounts: AtomicU64::new(0),
+            storages: AtomicU64::new(0),
+            storage_probes: AtomicU64::new(0),
+            bytecodes: AtomicU64::new(0),
             failures: AtomicU64::new(0),
             waits: AtomicU64::new(0),
             elapsed_nanos: AtomicU64::new(0),
@@ -97,9 +107,10 @@ impl RemoteReadStats {
     /// Counts one remote read of `kind` that took `elapsed`, and a failure when it `failed`.
     pub fn record(&self, kind: RemoteReadKind, elapsed: Duration, failed: bool) {
         let counter = match kind {
-            RemoteReadKind::Get => &self.gets,
-            RemoteReadKind::Seek => &self.seeks,
-            RemoteReadKind::DuplicateSeek => &self.duplicate_seeks,
+            RemoteReadKind::Account => &self.accounts,
+            RemoteReadKind::Storage => &self.storages,
+            RemoteReadKind::StorageProbe => &self.storage_probes,
+            RemoteReadKind::Bytecode => &self.bytecodes,
         };
         counter.fetch_add(1, Ordering::Relaxed);
         let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
@@ -119,9 +130,10 @@ impl RemoteReadStats {
     /// The reads counted so far.
     pub fn counts(&self) -> RemoteReadCounts {
         RemoteReadCounts {
-            gets: self.gets.load(Ordering::Relaxed),
-            seeks: self.seeks.load(Ordering::Relaxed),
-            duplicate_seeks: self.duplicate_seeks.load(Ordering::Relaxed),
+            accounts: self.accounts.load(Ordering::Relaxed),
+            storages: self.storages.load(Ordering::Relaxed),
+            storage_probes: self.storage_probes.load(Ordering::Relaxed),
+            bytecodes: self.bytecodes.load(Ordering::Relaxed),
             failures: self.failures.load(Ordering::Relaxed),
             waits: self.waits.load(Ordering::Relaxed),
             elapsed: Duration::from_nanos(self.elapsed_nanos.load(Ordering::Relaxed)),
@@ -146,15 +158,118 @@ impl RemoteReadStats {
             let new = counts.since(&logged);
             if new.total() > 0 {
                 info!(
-                    gets = new.gets,
-                    seeks = new.seeks,
-                    duplicate_seeks = new.duplicate_seeks,
+                    accounts = new.accounts,
+                    storages = new.storages,
+                    storage_probes = new.storage_probes,
+                    bytecodes = new.bytecodes,
                     failures = new.failures,
                     waits = new.waits,
                     elapsed = ?new.elapsed,
                     "cluster remote reads"
                 );
             }
+            logged = counts;
+        }
+    }
+}
+
+/// How an owner answered one state read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerAnswer {
+    /// Answered with a value.
+    Served,
+    /// Refused because the owner has not reached the requested block.
+    Behind,
+    /// Refused for any other reason.
+    Refused,
+}
+
+/// An owner's answers counted since the node started, and its history at the last change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnerCounts {
+    /// Reads answered with a value.
+    pub served: u64,
+    /// Reads refused because the owner was behind.
+    pub behind: u64,
+    /// Reads refused for any other reason.
+    pub refused: u64,
+    /// Entries of the history index.
+    pub entries: u64,
+    /// Lowest servable block, or `None` when nothing is servable.
+    pub lowest: Option<u64>,
+    /// Highest servable block, or `None` when nothing is servable.
+    pub highest: Option<u64>,
+}
+
+/// Lock-free counters of an owner's answers and a snapshot of its history, for the periodic
+/// `cluster owner` log line.
+#[derive(Debug, Default)]
+pub struct OwnerStats {
+    served: AtomicU64,
+    behind: AtomicU64,
+    refused: AtomicU64,
+    entries: AtomicU64,
+    /// Lowest and highest servable block plus one; 0 means none.
+    lowest: AtomicU64,
+    highest: AtomicU64,
+}
+
+impl OwnerStats {
+    /// Counts one answer.
+    pub fn record(&self, answer: OwnerAnswer) {
+        let counter = match answer {
+            OwnerAnswer::Served => &self.served,
+            OwnerAnswer::Behind => &self.behind,
+            OwnerAnswer::Refused => &self.refused,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records the history's entry count and servable range.
+    pub fn record_history(&self, entries: usize, servable: Option<ServableRange>) {
+        let plus_one = |block: Option<u64>| block.map_or(0, |block| block.saturating_add(1));
+        self.entries.store(entries as u64, Ordering::Relaxed);
+        self.lowest.store(plus_one(servable.map(|range| range.lowest)), Ordering::Relaxed);
+        self.highest.store(plus_one(servable.map(|range| range.highest)), Ordering::Relaxed);
+    }
+
+    /// The answers counted so far and the history last recorded.
+    pub fn counts(&self) -> OwnerCounts {
+        let block = |plus_one: u64| plus_one.checked_sub(1);
+        OwnerCounts {
+            served: self.served.load(Ordering::Relaxed),
+            behind: self.behind.load(Ordering::Relaxed),
+            refused: self.refused.load(Ordering::Relaxed),
+            entries: self.entries.load(Ordering::Relaxed),
+            lowest: block(self.lowest.load(Ordering::Relaxed)),
+            highest: block(self.highest.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Logs the answers of each `interval` and the history, on a background thread that exits
+    /// at the first interval after the stats are dropped.
+    pub fn spawn_logger(self: &Arc<Self>, interval: Duration) -> io::Result<JoinHandle<()>> {
+        let stats = Arc::downgrade(self);
+        std::thread::Builder::new()
+            .name("cluster-owner-stats".into())
+            .spawn(move || Self::log_every(&stats, interval))
+    }
+
+    fn log_every(stats: &Weak<Self>, interval: Duration) {
+        let mut logged = OwnerCounts::default();
+        loop {
+            std::thread::sleep(interval);
+            let Some(stats) = stats.upgrade() else { return };
+            let counts = stats.counts();
+            info!(
+                served = counts.served - logged.served,
+                behind = counts.behind - logged.behind,
+                refused = counts.refused - logged.refused,
+                entries = counts.entries,
+                lowest = ?counts.lowest,
+                highest = ?counts.highest,
+                "cluster owner"
+            );
             logged = counts;
         }
     }

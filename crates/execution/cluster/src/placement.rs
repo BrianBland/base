@@ -180,6 +180,12 @@ impl ShardedTable {
         root.into_iter().chain(one_nibble).collect()
     }
 
+    /// The smallest encoded key inside `shard`'s byte range: its first replicated key when it has
+    /// one, otherwise [`Self::shard_floor`]. A seek to it lands on the shard's first row.
+    pub fn shard_start(self, shard: Shard) -> Vec<u8> {
+        self.replicated_keys(shard).into_iter().next().unwrap_or_else(|| self.shard_floor(shard))
+    }
+
     /// Returns the nibble count of an encoded packed trie path, or `None` when `path` is not the
     /// canonical encoding of a path: wrong length, too many nibbles, or nonzero padding.
     pub fn packed_path_nibbles(path: &[u8]) -> Option<u8> {
