@@ -35,7 +35,8 @@ pub use config::{Cluster, ClusterConfig, ConfigError, NodeConfig};
 
 mod bootstrap;
 pub use bootstrap::{
-    BatchLimit, Bootstrap, BootstrapError, BootstrapReport, BootstrapTarget, RowCount, TableCopy,
+    BatchLimit, Bootstrap, BootstrapError, BootstrapReport, BootstrapTarget, RowBatch, RowCount,
+    TableCopy,
 };
 
 mod storage_report;

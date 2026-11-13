@@ -6,6 +6,11 @@ use std::{
     collections::HashSet,
     fmt,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, SyncSender},
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -13,10 +18,7 @@ use alloy_primitives::Bytes;
 use reth_db::{
     DatabaseEnv, DatabaseEnvKind, DatabaseError, create_db, is_database_empty,
     lockfile::StorageLock,
-    mdbx::{
-        Cursor, DatabaseArguments, MaxReadTransactionDuration, RO, RW, SyncMode, Transaction,
-        WriteFlags, ffi::MDBX_dbi,
-    },
+    mdbx::{DatabaseArguments, MaxReadTransactionDuration, RO, SyncMode, Transaction, WriteFlags},
     table::Table,
     tables::{self, Tables},
 };
@@ -24,7 +26,7 @@ use reth_stages_types::StageId;
 use thiserror::Error;
 use tracing::info;
 
-use crate::{Cluster, KeyPlacement, NodeId, ShardedTable, StorageCounter, StorageReport};
+use crate::{Cluster, KeyPlacement, NodeId, Shard, ShardedTable, StorageCounter, StorageReport};
 
 /// Why a bootstrap or a storage report failed or was refused.
 #[derive(Debug, Error)]
@@ -78,13 +80,13 @@ pub enum BootstrapError {
     Mdbx(#[from] reth_db::mdbx::Error),
 }
 
-/// When the destinations commit: once the rows, or the encoded bytes, written to all of them
-/// together since the last commit reach a limit.
+/// When a destination commits: once the rows, or the encoded bytes, written to it since its last
+/// commit reach a limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchLimit {
-    /// Rows written to all destinations since the last commit.
+    /// Rows written to the destination since its last commit.
     pub rows: u64,
-    /// Key and value bytes written to all destinations since the last commit.
+    /// Key and value bytes written to the destination since its last commit.
     pub bytes: u64,
 }
 
@@ -92,6 +94,57 @@ impl BatchLimit {
     /// 100 000 rows or 256 mebibytes: short enough to bound the memory of a write transaction's dirty
     /// pages, long enough that commits do not dominate.
     pub const DEFAULT: Self = Self { rows: 100_000, bytes: 256 << 20 };
+}
+
+/// Consecutive rows of one table read from the source, each with where it lives: what the reader
+/// hands every destination's writer at once, shared.
+#[derive(Debug, Default)]
+pub struct RowBatch {
+    /// The rows' keys and values, back to back.
+    bytes: Vec<u8>,
+    /// For each row, the end offsets of its key and value in `bytes`, and its placement.
+    rows: Vec<(usize, usize, KeyPlacement)>,
+}
+
+impl RowBatch {
+    /// Rows at which a batch is full.
+    pub const MAX_ROWS: usize = 16 * 1024;
+    /// Key and value bytes at which a batch is full; a single larger row makes a batch of its own.
+    pub const MAX_BYTES: usize = 1 << 20;
+
+    /// An empty batch with room for a full one.
+    pub fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(Self::MAX_BYTES),
+            rows: Vec::with_capacity(Self::MAX_ROWS),
+        }
+    }
+
+    /// Adds a row at the end.
+    pub fn push(&mut self, key: &[u8], value: &[u8], placement: KeyPlacement) {
+        self.bytes.extend_from_slice(key);
+        let key_end = self.bytes.len();
+        self.bytes.extend_from_slice(value);
+        self.rows.push((key_end, self.bytes.len(), placement));
+    }
+
+    /// Whether the batch holds [`Self::MAX_ROWS`] rows or [`Self::MAX_BYTES`] bytes.
+    pub const fn is_full(&self) -> bool {
+        self.rows.len() >= Self::MAX_ROWS || self.bytes.len() >= Self::MAX_BYTES
+    }
+
+    /// Whether the batch holds no row.
+    pub const fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The rows in order: key, value, and placement.
+    pub fn rows(&self) -> impl Iterator<Item = (&[u8], &[u8], KeyPlacement)> {
+        let starts = std::iter::once(0).chain(self.rows.iter().map(|(_, value_end, _)| *value_end));
+        starts.zip(&self.rows).map(|(start, (key_end, value_end, placement))| {
+            (&self.bytes[start..*key_end], &self.bytes[*key_end..*value_end], *placement)
+        })
+    }
 }
 
 /// One node to bootstrap: its cluster view and the database directory to create.
@@ -209,6 +262,9 @@ pub struct Bootstrap {
 impl Bootstrap {
     /// Rows of one table between progress logs.
     pub const PROGRESS_ROWS: u64 = 10_000_000;
+    /// Row batches queued for each destination's writer: with [`RowBatch::MAX_BYTES`], bounds the
+    /// rows in flight between the reader and the writers.
+    pub const QUEUED_BATCHES: usize = 8;
 
     /// A bootstrap of `targets`, refused when there are none, when two share a destination or a
     /// node, or when their configs differ in more than `node_id` and `apply_from`.
@@ -243,7 +299,7 @@ impl Bootstrap {
             && a.split_storage() == b.split_storage()
     }
 
-    /// Commits the destinations at `batch` instead of [`BatchLimit::DEFAULT`].
+    /// Commits each destination at `batch` instead of [`BatchLimit::DEFAULT`].
     pub const fn with_batch_limit(mut self, batch: BatchLimit) -> Self {
         self.batch = batch;
         self
@@ -321,9 +377,10 @@ impl Bootstrap {
         Ok(report)
     }
 
-    /// Copies `table` from the source transaction to every destination, in source order, in
-    /// append mode, committing all destinations together at the batch limit. Keeps a row of a
-    /// sharded table only on the destinations whose node holds it.
+    /// Copies `table` from the source transaction to every destination, in source order: this
+    /// thread reads and places each row once, and one writer thread per destination appends the
+    /// rows its node holds. The first error of a writer, else of the reader, is returned; a
+    /// failed writer stops the reader, and the reader stopping stops the writers.
     fn copy_table(
         &self,
         source: &Transaction<RO>,
@@ -333,30 +390,62 @@ impl Bootstrap {
     ) -> Result<TableCopy, BootstrapError> {
         let name = table.name();
         let sharded = ShardedTable::from_table_name(name);
-        let counts_storage = sharded == Some(ShardedTable::HashedStorages);
-        let dupsort = table.is_dupsort();
-        let placement = &self.targets[0].cluster;
-        let mut copy = TableCopy {
-            table: name,
-            sharded: sharded.is_some(),
-            read: RowCount::default(),
-            written: vec![RowCount::default(); destinations.len()],
-        };
         info!(table = name, "copying table");
+        let (read, written) = thread::scope(|scope| {
+            let (senders, writers): (Vec<_>, Vec<_>) = destinations
+                .iter()
+                .zip(&self.targets)
+                .map(|(env, target)| {
+                    let (sender, batches) = mpsc::sync_channel(Self::QUEUED_BATCHES);
+                    let writer =
+                        scope.spawn(move || self.write_table(env, &target.cluster, table, batches));
+                    (sender, writer)
+                })
+                .unzip();
+            let read = self.read_table(source, name, sharded, storage, &senders);
+            drop(senders);
+            let written = writers
+                .into_iter()
+                .map(|writer| {
+                    writer.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect::<Result<Vec<_>, _>>();
+            (read, written)
+        });
+        let copy =
+            TableCopy { table: name, sharded: sharded.is_some(), written: written?, read: read? };
+        info!(
+            table = name,
+            rows_read = copy.read.rows,
+            rows_written = ?copy.written.iter().map(|written| written.rows).collect::<Vec<_>>(),
+            "table copied"
+        );
+        Ok(copy)
+    }
 
+    /// Reads table `name` from the source in order, places each row of a sharded table, and
+    /// sends the rows in batches to every writer. Stops early, without error, when a writer has
+    /// stopped: that writer's outcome is the copy's.
+    fn read_table(
+        &self,
+        source: &Transaction<RO>,
+        name: &'static str,
+        sharded: Option<ShardedTable>,
+        storage: &mut StorageCounter,
+        writers: &[SyncSender<Arc<RowBatch>>],
+    ) -> Result<RowCount, BootstrapError> {
+        let counts_storage = sharded == Some(ShardedTable::HashedStorages);
+        let placement = &self.targets[0].cluster;
+        let send = |batch: RowBatch| {
+            let batch = Arc::new(batch);
+            writers.iter().all(|writer| writer.send(Arc::clone(&batch)).is_ok())
+        };
+        let mut read = RowCount::default();
+        let mut batch = RowBatch::new();
         let mut reader = source.cursor(source.open_db(Some(name))?.dbi())?;
-        let mut txns =
-            destinations.iter().map(|env| env.begin_rw_txn()).collect::<Result<Vec<_>, _>>()?;
-        let dbis = txns
-            .iter()
-            .map(|txn| txn.open_db(Some(name)).map(|db| db.dbi()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut writers = Self::writers(&txns, &dbis)?;
-        let mut pending = RowCount::default();
-
         let mut row = reader.first::<Cow<'_, [u8]>, Cow<'_, [u8]>>()?;
         while let Some((key, value)) = row {
-            copy.read.add(&key, &value);
+            read.add(&key, &value);
             let placed = match sharded {
                 None => KeyPlacement::Replicated,
                 Some(sharded) => {
@@ -372,60 +461,100 @@ impl Bootstrap {
             if counts_storage {
                 storage.count(StorageCounter::address(&key)?);
             }
-            for ((target, writer), written) in
-                self.targets.iter().zip(&mut writers).zip(&mut copy.written)
-            {
-                let holds = match placed {
-                    KeyPlacement::Replicated => true,
-                    KeyPlacement::Shard(shard) => target.cluster.owns(shard),
-                };
-                if holds {
-                    let append = if dupsort { WriteFlags::APPEND_DUP } else { WriteFlags::APPEND };
-                    writer.put(&key, &value, append)?;
-                    written.add(&key, &value);
-                    pending.add(&key, &value);
-                }
+            batch.push(&key, &value, placed);
+            if batch.is_full() && !send(std::mem::replace(&mut batch, RowBatch::new())) {
+                return Ok(read);
             }
-            if pending.rows >= self.batch.rows || pending.bytes >= self.batch.bytes {
-                drop(writers);
-                for txn in txns {
-                    txn.commit()?;
-                }
-                txns = destinations
-                    .iter()
-                    .map(|env| env.begin_rw_txn())
-                    .collect::<Result<Vec<_>, _>>()?;
-                writers = Self::writers(&txns, &dbis)?;
-                pending = RowCount::default();
-            }
-            if copy.read.rows.is_multiple_of(Self::PROGRESS_ROWS) {
-                info!(
-                    table = name,
-                    rows_read = copy.read.rows,
-                    rows_written = ?copy.written.iter().map(|written| written.rows).collect::<Vec<_>>(),
-                    "copying table"
-                );
+            if read.rows.is_multiple_of(Self::PROGRESS_ROWS) {
+                info!(table = name, rows_read = read.rows, "copying table");
             }
             row = reader.next()?;
         }
-        drop(writers);
-        for txn in txns {
-            txn.commit()?;
+        if !batch.is_empty() {
+            send(batch);
         }
-        info!(
-            table = name,
-            rows_read = copy.read.rows,
-            rows_written = ?copy.written.iter().map(|written| written.rows).collect::<Vec<_>>(),
-            "table copied"
-        );
-        Ok(copy)
+        Ok(read)
     }
 
-    /// A cursor of each destination's write transaction on its table `dbis[i]`.
-    fn writers(
-        txns: &[Transaction<RW>],
-        dbis: &[MDBX_dbi],
-    ) -> Result<Vec<Cursor<RW>>, BootstrapError> {
-        Ok(txns.iter().zip(dbis).map(|(txn, dbi)| txn.cursor(*dbi)).collect::<Result<_, _>>()?)
+    /// Appends the rows of `table` that `cluster`'s node holds, from `batches` until the reader
+    /// closes them, to the destination `env` in append mode, committing at the batch limit and
+    /// at the end.
+    fn write_table(
+        &self,
+        env: &DatabaseEnv,
+        cluster: &Cluster,
+        table: Tables,
+        batches: Receiver<Arc<RowBatch>>,
+    ) -> Result<RowCount, BootstrapError> {
+        let mut owned = [false; Shard::COUNT];
+        for shard in Shard::all() {
+            owned[usize::from(shard.0)] = cluster.owns(shard);
+        }
+        let dupsort = table.is_dupsort();
+        let mut txn = env.begin_rw_txn()?;
+        let dbi = txn.open_db(Some(table.name()))?.dbi();
+        let mut cursor = txn.cursor(dbi)?;
+        let mut written = RowCount::default();
+        let mut pending = RowCount::default();
+        for batch in batches {
+            for (key, value, placement) in batch.rows() {
+                let holds = match placement {
+                    KeyPlacement::Replicated => true,
+                    KeyPlacement::Shard(shard) => owned[usize::from(shard.0)],
+                };
+                if !holds {
+                    continue;
+                }
+                let append = if dupsort { WriteFlags::APPEND_DUP } else { WriteFlags::APPEND };
+                cursor.put(key, value, append)?;
+                written.add(key, value);
+                pending.add(key, value);
+                if pending.rows >= self.batch.rows || pending.bytes >= self.batch.bytes {
+                    drop(cursor);
+                    txn.commit()?;
+                    txn = env.begin_rw_txn()?;
+                    cursor = txn.cursor(dbi)?;
+                    pending = RowCount::default();
+                }
+            }
+        }
+        drop(cursor);
+        txn.commit()?;
+        Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_batch_returns_its_rows_in_order_and_fills_at_its_limits() {
+        let mut batch = RowBatch::new();
+        assert!(batch.is_empty());
+        let row = |index: usize| {
+            let key = index.to_be_bytes().to_vec();
+            let value = vec![index as u8; index % 5];
+            let placement = if index.is_multiple_of(3) {
+                KeyPlacement::Replicated
+            } else {
+                KeyPlacement::Shard(Shard(index as u8))
+            };
+            (key, value, placement)
+        };
+        let mut pushed = 0;
+        while !batch.is_full() {
+            let (key, value, placement) = row(pushed);
+            batch.push(&key, &value, placement);
+            pushed += 1;
+        }
+        assert_eq!(pushed, RowBatch::MAX_ROWS);
+        let rows: Vec<_> = batch.rows().map(|(k, v, p)| (k.to_vec(), v.to_vec(), p)).collect();
+        assert_eq!(rows, (0..pushed).map(row).collect::<Vec<_>>());
+
+        let mut large = RowBatch::new();
+        large.push(&[1], &vec![7; RowBatch::MAX_BYTES], KeyPlacement::Replicated);
+        assert!(large.is_full(), "a row of the byte limit fills a batch on its own");
+        assert_eq!(large.rows().count(), 1);
     }
 }

@@ -382,10 +382,14 @@ exactly as one started on a full copy.
 - A row of a sharded table that cannot be placed (a key or split-contract subkey of the wrong
   encoding) stops the copy with an error; nothing is dropped silently.
 - Rows move as raw bytes in source order, in MDBX append mode, from one read transaction of the
-  source (long-read safety disabled; the source is stopped). Each row is placed once and
-  appended to every destination whose node holds it. The destinations commit together once the
-  rows or bytes written to all of them since the last commit reach 100 000 rows or 256
-  mebibytes, with MDBX's `SafeNoSync` sync mode, and are synced to disk once at the end. An
+  source (long-read safety disabled; the source is stopped). One thread reads and places each
+  row once and hands the rows, in shared batches of up to 16 384 rows or 1 mebibyte, to one
+  writer thread per destination, which appends those its node holds; so a run uses one thread
+  per destination plus the reader. Each writer's queue holds at most 8 batches, so about 10
+  mebibytes of rows are in flight whatever the number of destinations; the slowest destination
+  sets the pace. Each destination commits once the rows or bytes written to it since its last commit
+  reach 100 000 rows or 256 mebibytes, with MDBX's `SafeNoSync` sync mode, and all are synced
+  to disk once at the end. The first error of any writer, else of the reader, stops the run. An
   interrupted run leaves partial databases: delete every `<to>/db` and run again; there is no
   resume.
 - It logs each table at start and finish (rows read, and rows written per destination) and every

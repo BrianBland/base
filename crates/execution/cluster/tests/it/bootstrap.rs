@@ -15,7 +15,10 @@ use base_execution_cluster::{
 };
 use rand::{Rng, rngs::StdRng};
 use reth_chainspec::MAINNET;
-use reth_db::{ClientVersion, DatabaseEnv, DatabaseEnvKind, init_db, mdbx::DatabaseArguments};
+use reth_db::{
+    ClientVersion, DatabaseEnv, DatabaseEnvKind, init_db,
+    mdbx::{DatabaseArguments, WriteFlags},
+};
 use reth_db_api::{
     Database,
     models::StorageSettings,
@@ -441,4 +444,99 @@ fn storage_report_lists_the_contracts_with_the_most_rows() {
     assert_eq!(summary.storage.top[..3], report.top[..]);
     let storage = summary.storage.to_string();
     assert!(summary.to_string().ends_with(&storage), "the summary ends with the storage report");
+}
+
+/// Rows of the throughput benchmark's unsharded table, written to every destination, at scale 1.
+const BENCH_UNSHARDED_ROWS: u64 = 2_000_000;
+/// Rows of the throughput benchmark's `HashedStorages` at scale 1, 99.7% of them in one split
+/// contract.
+const BENCH_STORAGE_ROWS: u64 = 4_000_000;
+/// Multiplies the benchmark's row counts.
+const BENCH_SCALE_VAR: &str = "BOOTSTRAP_BENCH_SCALE";
+
+/// The 32-byte key at position `index` of `count` ascending keys spread evenly over the key
+/// space, so that they fall in every shard.
+fn spread_key(index: u64, count: u64, tag: u8) -> [u8; 32] {
+    let mut key = [tag; 32];
+    key[..8].copy_from_slice(&(index * (u64::MAX / count)).to_be_bytes());
+    key
+}
+
+/// A finished full node's `db` whose only non-empty table besides the stage checkpoints is
+/// `table`, holding `rows` (ascending raw key and value pairs).
+fn bench_source(table: &str, rows: impl Iterator<Item = (Vec<u8>, Vec<u8>)>) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let env = init_db(dir.path().join("db"), DatabaseArguments::default()).unwrap();
+    {
+        let tx = env.tx_mut().unwrap();
+        tx.put::<tables::StageCheckpoints>(StageId::Finish.to_string(), StageCheckpoint::new(1))
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    let txn = env.begin_rw_txn().unwrap();
+    let mut cursor = txn.cursor(txn.open_db(Some(table)).unwrap().dbi()).unwrap();
+    for (key, value) in rows {
+        cursor.put(&key, &value, WriteFlags::APPEND_DUP).unwrap();
+    }
+    drop(cursor);
+    txn.commit().unwrap();
+    dir
+}
+
+/// Bootstraps all five nodes from `source` and prints the source rows per second of `table`.
+fn bench_run(source: &TempDir, table: &str, split: &[B256]) {
+    let dir = TempDir::new().unwrap();
+    let started = std::time::Instant::now();
+    let report = Bootstrap::new(targets(dir.path(), &ALL_NODES, split))
+        .unwrap()
+        .run(&source.path().join("db"))
+        .unwrap();
+    let elapsed = started.elapsed();
+    let copy = report.tables.iter().find(|copy| copy.table == table).unwrap();
+    let appends: u64 = copy.written.iter().map(|written| written.rows).sum();
+    let busiest = copy.written.iter().map(|written| written.rows).max().unwrap();
+    println!(
+        "{table}: {} source rows, {appends} appends (at most {busiest} to one destination) in \
+         {elapsed:.2?}: {:.0} source rows/s, {:.0} appends/s",
+        copy.read.rows,
+        copy.read.rows as f64 / elapsed.as_secs_f64(),
+        appends as f64 / elapsed.as_secs_f64(),
+    );
+}
+
+/// Throughput of a bootstrap of five nodes from a source shaped like a real one: an unsharded
+/// table written to every destination, and `HashedStorages` with one split contract holding
+/// 99.7% of its rows. Run in release mode with
+/// `cargo test --release -p base-execution-cluster bootstrap_throughput -- --ignored --nocapture`.
+#[test]
+#[ignore = "benchmark: run in release mode with --ignored --nocapture"]
+fn bootstrap_throughput() {
+    let scale = std::env::var(BENCH_SCALE_VAR).map_or(1, |scale| scale.parse::<u64>().unwrap());
+    let unsharded_rows = BENCH_UNSHARDED_ROWS * scale;
+    let unsharded = bench_source(
+        tables::HeaderNumbers::NAME,
+        (0..unsharded_rows).map(|index| {
+            (spread_key(index, unsharded_rows, 0x11).to_vec(), index.to_be_bytes().to_vec())
+        }),
+    );
+    bench_run(&unsharded, tables::HeaderNumbers::NAME, &[]);
+    drop(unsharded);
+
+    let storage_rows = BENCH_STORAGE_ROWS * scale;
+    let small_contracts = storage_rows * 3 / 1000;
+    let large_rows = storage_rows - small_contracts;
+    let large_index = small_contracts / 2;
+    let small = |index: u64| spread_key(index, small_contracts, 0x55).to_vec();
+    let slot = |index: u64, count: u64| {
+        let mut value = spread_key(index, count, 0x33).to_vec();
+        value.extend_from_slice(&index.to_be_bytes());
+        value
+    };
+    let large = B256::from(spread_key(large_index, small_contracts, 0x77));
+    let rows = (0..=large_index)
+        .map(|index| (small(index), slot(0, 1)))
+        .chain((0..large_rows).map(|index| (large.to_vec(), slot(index, large_rows))))
+        .chain((large_index + 1..small_contracts).map(|index| (small(index), slot(0, 1))));
+    let storage = bench_source(tables::HashedStorages::NAME, rows);
+    bench_run(&storage, tables::HashedStorages::NAME, &[large]);
 }
