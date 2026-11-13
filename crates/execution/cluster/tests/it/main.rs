@@ -7,3 +7,4 @@ mod common;
 mod executed;
 mod owner_store;
 mod protocol;
+mod trie_slice;

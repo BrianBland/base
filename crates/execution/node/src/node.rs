@@ -75,7 +75,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::{
     BaseEngineApiBuilder, BaseEngineTypes, BaseStorage,
     args::{RollupArgs, TxpoolOrdering},
-    engine::BaseEngineValidator,
+    engine::{BaseEngineValidator, MessagePasserRootCheck},
 };
 
 /// Discovery v5 protocol version for Base.
@@ -1379,7 +1379,16 @@ where
 /// Builder for [`BaseEngineValidator`].
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
-pub struct BasePayloadValidatorBuilder;
+pub struct BasePayloadValidatorBuilder {
+    message_passer_root: MessagePasserRootCheck,
+}
+
+impl BasePayloadValidatorBuilder {
+    /// Builds validators that check the message-passer storage root as `check` says.
+    pub const fn with_message_passer_root(check: MessagePasserRootCheck) -> Self {
+        Self { message_passer_root: check }
+    }
+}
 
 impl<Node> PayloadValidatorBuilder<Node> for BasePayloadValidatorBuilder
 where
@@ -1397,7 +1406,8 @@ where
     >;
 
     async fn build(self, ctx: &AddOnsContext<'_, Node>) -> eyre::Result<Self::Validator> {
-        Ok(BaseEngineValidator::new::<KeccakKeyHasher>(Arc::clone(&ctx.config.chain)))
+        Ok(BaseEngineValidator::new::<KeccakKeyHasher>(Arc::clone(&ctx.config.chain))
+            .with_message_passer_root(self.message_passer_root))
     }
 }
 

@@ -5094,6 +5094,7 @@ dependencies = [
  "reth-consensus",
  "reth-db",
  "reth-engine-tree",
+ "reth-evm",
  "reth-exex",
  "reth-ipc",
  "reth-network-p2p",

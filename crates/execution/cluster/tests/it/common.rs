@@ -26,7 +26,7 @@ use reth_db_api::{
 use reth_primitives_traits::Account;
 use reth_provider::{
     ProviderFactory, ProviderResult, StageCheckpointWriter, StateWriteConfig, StateWriter,
-    StorageSettingsCache,
+    StorageSettingsCache, TrieWriter,
     test_utils::{MockNodeTypesWithDB, create_test_provider_factory},
 };
 use reth_stages_types::{StageCheckpoint, StageId};
@@ -64,6 +64,14 @@ pub(crate) fn factory() -> TestFactory {
 /// A read snapshot of `factory`'s current state.
 pub(crate) fn snapshot(factory: &TestFactory) -> TestTx {
     factory.db_ref().tx().unwrap()
+}
+
+/// Writes `updates` with reth's writers in one committed transaction.
+pub(crate) fn write(factory: &TestFactory, updates: &BlockUpdates) {
+    let provider = factory.provider_rw().unwrap();
+    provider.write_hashed_state(&updates.hashed_state).unwrap();
+    provider.write_trie_updates_sorted(&updates.trie_updates).unwrap();
+    provider.commit().unwrap();
 }
 
 /// Three storage nodes, `R = 2`, seen from `node_id`.

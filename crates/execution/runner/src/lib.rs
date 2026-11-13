@@ -22,6 +22,9 @@ pub use cluster::ClusterFeed;
 mod apply;
 pub use apply::{ApplyEngineValidator, ApplyEngineValidatorBuilder, ApplyError, BlockApplier};
 
+mod root;
+pub use root::ClusterStateRoot;
+
 mod service;
 pub use service::{DefaultPayloadServiceBuilder, PayloadServiceBuilder};
 

@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::{fmt, marker::PhantomData, sync::Arc};
 
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{B256, Bytes};
@@ -80,11 +80,37 @@ where
     type ExecutionPayloadEnvelopeV6 = BaseExecutionPayloadEnvelopeV5;
 }
 
+/// Whether the Isthmus L2-to-L1 message-passer storage root is compared with the header's
+/// `withdrawals_root` after execution.
+#[derive(Clone, Default)]
+pub enum MessagePasserRootCheck {
+    /// Compare it.
+    #[default]
+    Verify,
+    /// Check only that the header carries the field and call `on_skip`: the node cannot compute
+    /// the contract's storage root from the trie rows it keeps (a clustered node that does not
+    /// hold that storage trie).
+    Skip {
+        /// Called once per skipped comparison.
+        on_skip: Arc<dyn Fn() + Send + Sync>,
+    },
+}
+
+impl fmt::Debug for MessagePasserRootCheck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Verify => f.write_str("Verify"),
+            Self::Skip { .. } => f.write_str("Skip"),
+        }
+    }
+}
+
 /// Validator for Base engine API.
 #[derive(Debug)]
 pub struct BaseEngineValidator<Tx, ChainSpec> {
     inner: BaseExecutionPayloadValidator<ChainSpec>,
     hashed_addr_l2tol1_msg_passer: B256,
+    message_passer_root: MessagePasserRootCheck,
     phantom: PhantomData<Tx>,
 }
 
@@ -95,8 +121,15 @@ impl<Tx, ChainSpec> BaseEngineValidator<Tx, ChainSpec> {
         Self {
             inner: BaseExecutionPayloadValidator::new(chain_spec),
             hashed_addr_l2tol1_msg_passer,
+            message_passer_root: MessagePasserRootCheck::Verify,
             phantom: PhantomData,
         }
+    }
+
+    /// Sets whether the message-passer storage root is compared after execution.
+    pub fn with_message_passer_root(mut self, check: MessagePasserRootCheck) -> Self {
+        self.message_passer_root = check;
+        self
     }
 }
 
@@ -108,6 +141,7 @@ where
         Self {
             inner: BaseExecutionPayloadValidator::new(self.inner.clone()),
             hashed_addr_l2tol1_msg_passer: self.hashed_addr_l2tol1_msg_passer,
+            message_passer_root: self.message_passer_root.clone(),
             phantom: Default::default(),
         }
     }
@@ -169,8 +203,18 @@ where
         }
 
         let parent_state = parent_state()?;
-        let state_updates = state_updates();
-        self.validate_isthmus_post_execution(state_updates, parent_state.as_ref(), block.header())?;
+        match &self.message_passer_root {
+            MessagePasserRootCheck::Verify => self.validate_isthmus_post_execution(
+                state_updates(),
+                parent_state.as_ref(),
+                block.header(),
+            )?,
+            MessagePasserRootCheck::Skip { on_skip } => {
+                isthmus::ensure_withdrawals_storage_root_is_some(block.header())
+                    .map_err(ConsensusError::other)?;
+                on_skip();
+            }
+        }
 
         if !self
             .chain_spec()
@@ -1033,5 +1077,100 @@ mod tests {
             base_consensus_error(&error),
             Some(BaseConsensusError::L2WithdrawalsRootMismatch { .. })
         ));
+    }
+
+    fn skipping_validator(
+        skips: &Arc<std::sync::atomic::AtomicU64>,
+    ) -> BaseEngineValidator<BaseTxEnvelope, BaseChainSpec> {
+        let skips = Arc::clone(skips);
+        denim_validator().with_message_passer_root(MessagePasserRootCheck::Skip {
+            on_skip: Arc::new(move || {
+                skips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }),
+        })
+    }
+
+    #[test]
+    fn post_execution_skips_and_counts_the_message_passer_root_when_told_to() {
+        let skips = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let block = base_time_block(DENIM_TIMESTAMP, 0, B256::repeat_byte(0x42));
+        let parent = SealedHeader::seal_slow(Header {
+            timestamp: DENIM_TIMESTAMP - 1,
+            ..Default::default()
+        });
+        let state_updates = HashedPostState::default();
+
+        PayloadValidator::<BaseEngineTypes>::validate_block_post_execution_with_hashed_state(
+            &skipping_validator(&skips),
+            || &state_updates,
+            &block,
+            &parent,
+            || Ok(Box::new(parent_state(0))),
+        )
+        .unwrap();
+
+        assert_eq!(skips.load(std::sync::atomic::Ordering::Relaxed), 1);
+        PayloadValidator::<BaseEngineTypes>::validate_block_post_execution_with_hashed_state(
+            &denim_validator(),
+            || &state_updates,
+            &block,
+            &parent,
+            || Ok(Box::new(parent_state(0))),
+        )
+        .expect_err("a verifying validator rejects the wrong root");
+    }
+
+    #[test]
+    fn post_execution_skipping_the_message_passer_root_still_requires_the_field() {
+        let skips = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut block = post_execution_block(EMPTY_ROOT_HASH).into_block();
+        block.header.withdrawals_root = None;
+        let block = RecoveredBlock::new_sealed(SealedBlock::seal_slow(block), vec![]);
+        let parent = SealedHeader::seal_slow(Header {
+            timestamp: DENIM_TIMESTAMP - 1,
+            ..Default::default()
+        });
+        let state_updates = HashedPostState::default();
+
+        let error =
+            PayloadValidator::<BaseEngineTypes>::validate_block_post_execution_with_hashed_state(
+                &skipping_validator(&skips),
+                || &state_updates,
+                &block,
+                &parent,
+                || Ok(Box::new(NoopProvider::default())),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            base_consensus_error(&error),
+            Some(BaseConsensusError::L2WithdrawalsRootMissing)
+        ));
+        assert_eq!(skips.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn post_execution_skipping_the_message_passer_root_still_checks_base_time() {
+        let skips = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let block = base_time_block(DENIM_TIMESTAMP, 600, B256::repeat_byte(0x42));
+        let parent =
+            SealedHeader::seal_slow(Header { timestamp: DENIM_TIMESTAMP, ..Default::default() });
+        let state_updates = HashedPostState::default();
+
+        let error =
+            PayloadValidator::<BaseEngineTypes>::validate_block_post_execution_with_hashed_state(
+                &skipping_validator(&skips),
+                || &state_updates,
+                &block,
+                &parent,
+                || Ok(Box::new(parent_state(200))),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            base_consensus_error(&error),
+            Some(BaseConsensusError::BaseTimeProgressionInvalid { .. })
+        ));
+        assert_eq!(skips.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

@@ -522,6 +522,79 @@ reusing pages until it finishes, so prefer a stopped node.
 - A storage wipe of a split contract is applied per row and per range like any other deletion.
   A wipe of an existing contract cannot happen after Cancun, so this cost is not optimised.
 
+## Trie maintenance
+
+A clustered node does not compute the full state root of a block. It keeps its trie slice: the
+account-trie and storage-trie rows of the shards it holds, computed per block with reth's own
+incremental state-root code over its database and in-memory ancestors, with prefix sets
+restricted to what it holds, so unchanged and foreign subtrees are not walked. The engine's
+state-root strategy (installed on every clustered node, see `ClusterStateRoot` in
+`base-node-runner`) does this after execution and returns the block header's own state root with
+the slice's trie updates; persistence then writes them through the [write rule](#write-rule).
+
+**The header's state root is not verified when a block is inserted.** Execution, receipts root,
+logs bloom, gas and the other header checks are unchanged; a block whose state root is wrong is
+accepted. Detecting a bad state transition is the job of a separate check that compares the
+header with hashes collected from the shards' owners (not built yet).
+
+Per block, `TrieSlice::plan` turns the block's hashed post-state into one main computation and
+zero or more side computations (`TrieSlicePlan`):
+
+- Main computation: the account prefix set holds every changed account in a held shard, also
+  when only its storage changed. A held account whose storage is not split gets all its changed
+  slots as its storage prefix set; a split contract whose account is held gets only its changed
+  slots in held ranges. Held accounts that became empty (`None`) are destroyed accounts. Its
+  input state is exactly those held changes.
+- Side computation, one per split contract whose account shard this node does not hold but whose
+  held ranges changed: the walk computes a storage trie only when it reaches the account's leaf,
+  which the main computation never does for a foreign account. Its input state is that contract
+  with a placeholder account plus its changed slots in held ranges; its account prefix set is
+  that contract, its storage prefix set those slots. Only that contract's storage-trie updates
+  are kept.
+- A split contract whose account became empty (its storage wiped) fails the block: per-range
+  maintenance cannot delete the ranges other nodes hold. A wipe of an existing contract cannot
+  happen after Cancun.
+- A node that stores nothing (`storage = false`), and a storing node holding none of the block's
+  changes, computes nothing and returns empty trie updates.
+
+The replicated short paths (the account-trie root and its 16 children, and the same for each
+split contract's storage trie) are written exactly as this node's own computations output them,
+never taken from peers or from a side computation's account nodes.
+
+Rows on disk are either meaningful or don't-care:
+
+- Meaningful, byte for byte equal to a full node's: account-trie rows of two or more nibbles in
+  held shards, the storage tries of held accounts whose storage is not split, the rows of held
+  ranges of split contracts' storage tries, and in the replicated one-nibble nodes the hashes and
+  mask bits of held children.
+- Don't care: in replicated nodes, the hashes of children in shards this node does not hold (they
+  stay as this node last wrote them and are reused as they are, so a branch keeps its 16
+  children); the root nodes above them; and the path from a split contract's account leaf up to
+  its shard's two-nibble node, since that leaf's storage root mixes in other nodes' ranges.
+  Nothing may trust these values.
+
+Counters: blocks whose slice was computed, side computations and the time spent, in
+`ClusterNode::trie_slices`, the metrics `base_cluster_trie_slice_blocks` and
+`base_cluster_trie_slice_side_calls`, and a `cluster trie slices` log line every 10 seconds in
+which a block was computed or a check skipped.
+
+### Message-passer storage root
+
+Since Isthmus, Base checks after execution that the header's `withdrawals_root` equals the
+storage root of the L2-to-L1 message passer. A clustered node compares it only when it holds
+that account's shard and the contract is not in `split_storage`; otherwise it checks only that
+the header carries the field, skips the comparison and counts it (`message_passer_skips` in
+`ClusterNode::trie_slices`, metric `base_cluster_message_passer_root_skips`). This applies to
+execution and to apply mode alike; the block-time checks are unchanged. A clustered node logs at
+start-up whether it checks this root.
+
+### Unsupported on clustered nodes
+
+- Proofs (`eth_getProof`, witnesses) and the proofs-history extension: they read trie rows
+  outside the held slice. Nothing refuses them yet; their answers are wrong.
+- Building payloads: the payload builder computes a full state root over don't-care rows.
+- `--debug.skip-state-root` is refused: the node already uses its own state-root strategy.
+
 ## Design record
 
 Decided after a two-seat, two-pass design review on 2026-11-12.
@@ -535,3 +608,16 @@ Decided after a two-seat, two-pass design review on 2026-11-12.
   computes reverts from database reads, which would touch shards the owner does not hold.
 - Not verified by test at the time of writing: page-reuse cost of the held read snapshots, and
   that no Base execution extension on the node-run path reads state inside a write transaction.
+- Decided on 2026-11-13 (values-only design, trie maintenance): no full state root per block on
+  a clustered node, a custom state-root strategy inside reth's engine validator rather than a
+  wrapper that re-builds the executed block (the strategy has reth's overlay of in-memory,
+  possibly non-canonical, parents and keeps reth's deferred trie work).
+- Rejected: deriving prefix sets with reth's `construct_prefix_sets`. It covers foreign shards
+  and every range of a split contract, and it misses split contracts whose account is foreign.
+- Side computations keep only the contract's storage-trie updates: their account nodes come from
+  a walk through foreign shards and would overwrite this node's replicated nodes.
+- A wiped storage is detected as a split contract's account becoming empty: reth's hashed
+  post-state at this revision has no wipe flag (a destroyed account's slots arrive zeroed one by
+  one).
+- The message-passer skip counter is handed to Base's engine validator as a callback, so
+  `base-node-core` does not depend on this crate.

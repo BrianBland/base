@@ -20,7 +20,7 @@ use tracing::{error, info};
 use crate::{
     ApplyCounts, ApplyStats, ChangesetReader, ClientOptions, Cluster, ClusterClient,
     ExecutedBlocks, KeyPlacement, OwnerServer, OwnerStore, RemoteReadCounts, RemoteReadStats,
-    Shard, ShardedTable,
+    Shard, ShardedTable, TrieSlice, TrieSliceCounts, TrieSliceStats,
 };
 
 /// Returns the hash of the canonical block with the given number, when known.
@@ -88,6 +88,8 @@ pub struct ClusterNode {
     committed_finish: Mutex<u64>,
     executed_blocks: Arc<ExecutedBlocks>,
     apply_stats: Arc<ApplyStats>,
+    trie_slice: TrieSlice,
+    trie_slice_stats: Arc<TrieSliceStats>,
 }
 
 impl fmt::Debug for ClusterNode {
@@ -131,6 +133,11 @@ impl ClusterNode {
         apply_stats
             .spawn_logger(RemoteReadStats::LOG_INTERVAL)
             .map_err(ClusterStartError::StatsLogger)?;
+        let trie_slice_stats = Arc::new(TrieSliceStats::default());
+        trie_slice_stats
+            .spawn_logger(TrieSliceStats::LOG_INTERVAL)
+            .map_err(ClusterStartError::StatsLogger)?;
+        let trie_slice = TrieSlice::new(Arc::clone(&cluster));
         let owned = Shard::all().filter(|shard| cluster.owns(*shard)).count();
         info!(
             node_id = cluster.node_id().0,
@@ -149,6 +156,8 @@ impl ClusterNode {
             committed_finish: Mutex::new(finish),
             executed_blocks,
             apply_stats,
+            trie_slice,
+            trie_slice_stats,
         })
     }
 
@@ -217,6 +226,21 @@ impl ClusterNode {
     /// This node's apply-mode outcomes since it started.
     pub fn applied_blocks(&self) -> ApplyCounts {
         self.apply_stats.counts()
+    }
+
+    /// The planner of this node's trie slice.
+    pub const fn trie_slice(&self) -> &TrieSlice {
+        &self.trie_slice
+    }
+
+    /// The counters of this node's trie-slice work and skipped message-passer checks.
+    pub const fn trie_slice_stats(&self) -> &Arc<TrieSliceStats> {
+        &self.trie_slice_stats
+    }
+
+    /// This node's trie-slice work and skipped message-passer checks since it started.
+    pub fn trie_slices(&self) -> TrieSliceCounts {
+        self.trie_slice_stats.counts()
     }
 
     /// Installs the canonical block-hash lookup on the owner store. Only the first lookup

@@ -8,24 +8,27 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_primitives::B256;
-use base_common_consensus::BasePrimitives;
+use alloy_primitives::{B256, keccak256};
+use base_common_consensus::{BasePrimitives, Predeploys};
 use base_common_rpc_types_engine::ExecutionData;
 use base_execution_cluster::{ApplyFallback, ClusterNode, ExecutedBlockResult};
-use base_node_core::{BaseEngineTypes, BaseNodeTypes, BasePayloadValidatorBuilder};
+use base_node_core::{
+    BaseEngineTypes, BaseNodeTypes, BasePayloadValidatorBuilder, MessagePasserRootCheck,
+};
 use reth_chain_state::ExecutedBlock;
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_engine_tree::tree::{
-    CacheWaitDurations, EngineApiTreeState, EngineValidator, TreeConfig, ValidationOutcome,
-    ValidationOutput, WaitForCaches, payload_validator::TreeCtx,
+    BasicEngineValidator, CacheWaitDurations, EngineApiTreeState, EngineValidator, TreeConfig,
+    ValidationOutcome, ValidationOutput, WaitForCaches, payload_validator::TreeCtx,
 };
+use reth_evm::ConfigureEngineEvm;
 use reth_network_p2p::full_block::SealedBlockWithAccessList;
 use reth_node_api::{
     AddOnsContext, BuiltPayloadExecutedBlock, InsertBlockErrorKind, InvalidPayloadAttributesError,
     NewPayloadError, NodePrimitives, PayloadTypes, PayloadValidator,
 };
 use reth_node_builder::{
-    FullNodeComponents,
+    FullNodeComponents, FullNodeTypes,
     rpc::{BasicEngineValidatorBuilder, EngineValidatorBuilder, PayloadValidatorBuilder},
 };
 use reth_payload_builder::PayloadBuilderResources;
@@ -34,17 +37,26 @@ use reth_provider::{HeaderProvider, ProviderError, StateProviderFactory};
 use reth_storage_overlay::OverlayManager;
 use reth_trie_common::HashedPostState;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
+
+use crate::ClusterStateRoot;
 
 type BaseBlock = <BasePrimitives as NodePrimitives>::Block;
 type BaseHeader = <BasePrimitives as NodePrimitives>::BlockHeader;
 type PayloadAttributes = <BaseEngineTypes as PayloadTypes>::PayloadAttributes;
 type BasePayloadValidator<Node> =
     <BasePayloadValidatorBuilder as PayloadValidatorBuilder<Node>>::Validator;
+type BasicBaseValidator<Node> = BasicEngineValidator<
+    <Node as FullNodeTypes>::Provider,
+    <Node as FullNodeComponents>::Evm,
+    BasePayloadValidator<Node>,
+>;
 
 /// Builds the node's engine-tree validator: reth's basic validator, wrapped by an
 /// [`ApplyEngineValidator`] that applies peers' results when the installed cluster node lists
-/// nodes to apply from. Clones share the installed node.
+/// nodes to apply from. On a clustered node the basic validator maintains the node's trie slice
+/// ([`ClusterStateRoot`]) and compares the message-passer storage root only when the node holds
+/// that storage trie, on both paths. Clones share the installed node.
 #[derive(Debug, Clone, Default)]
 pub struct ApplyEngineValidatorBuilder {
     cluster: Arc<OnceLock<Arc<ClusterNode>>>,
@@ -57,22 +69,34 @@ impl ApplyEngineValidatorBuilder {
     pub fn install_cluster(&self, node: Arc<ClusterNode>) {
         let _ = self.cluster.set(node);
     }
+
+    /// How `node` checks the Isthmus message-passer storage root: compared when it holds that
+    /// contract's whole storage trie, otherwise skipped and counted.
+    pub fn message_passer_root_check(node: &ClusterNode) -> MessagePasserRootCheck {
+        let message_passer = keccak256(Predeploys::L2_TO_L1_MESSAGE_PASSER);
+        let checks = node.trie_slice().holds_storage_trie(&message_passer);
+        info!(checks, "cluster message-passer storage-root check");
+        if checks {
+            return MessagePasserRootCheck::Verify;
+        }
+        let stats = Arc::clone(node.trie_slice_stats());
+        MessagePasserRootCheck::Skip {
+            on_skip: Arc::new(move || stats.record_message_passer_skip()),
+        }
+    }
 }
 
 impl<Node> EngineValidatorBuilder<Node> for ApplyEngineValidatorBuilder
 where
     Node: FullNodeComponents<Types: BaseNodeTypes>,
-    BasicEngineValidatorBuilder<BasePayloadValidatorBuilder>: EngineValidatorBuilder<Node>,
+    BasicEngineValidatorBuilder<BasePayloadValidatorBuilder>:
+        EngineValidatorBuilder<Node, EngineValidator = BasicBaseValidator<Node>>,
     BasePayloadValidatorBuilder: PayloadValidatorBuilder<Node>,
-    BasePayloadValidator<Node>: PayloadValidator<BaseEngineTypes, Block = BaseBlock>,
+    BasePayloadValidator<Node>: PayloadValidator<BaseEngineTypes, Block = BaseBlock> + Clone,
+    Node::Evm: ConfigureEngineEvm<ExecutionData>,
 {
-    type EngineValidator = ApplyEngineValidator<
-        <BasicEngineValidatorBuilder<BasePayloadValidatorBuilder> as EngineValidatorBuilder<
-            Node,
-        >>::EngineValidator,
-        Node::Provider,
-        BasePayloadValidator<Node>,
-    >;
+    type EngineValidator =
+        ApplyEngineValidator<BasicBaseValidator<Node>, Node::Provider, BasePayloadValidator<Node>>;
 
     async fn build_tree_validator(
         self,
@@ -80,15 +104,29 @@ where
         tree_config: TreeConfig,
         overlay_manager: OverlayManager<BasePrimitives>,
     ) -> eyre::Result<Self::EngineValidator> {
-        let inner = BasicEngineValidatorBuilder::new(BasePayloadValidatorBuilder::default())
-            .build_tree_validator(ctx, tree_config, overlay_manager)
+        let cluster = self.cluster.get();
+        let payload_validator_builder =
+            cluster.map_or_else(BasePayloadValidatorBuilder::default, |node| {
+                BasePayloadValidatorBuilder::with_message_passer_root(
+                    Self::message_passer_root_check(node),
+                )
+            });
+        let mut inner = BasicEngineValidatorBuilder::new(payload_validator_builder.clone())
+            .build_tree_validator(ctx, tree_config, overlay_manager.clone())
             .await?;
-        let applier = match self.cluster.get() {
+        if let Some(node) = cluster {
+            inner = inner.with_state_root_strategy(Arc::new(ClusterStateRoot::new(
+                Arc::clone(node),
+                ctx.node.provider().clone(),
+                overlay_manager,
+            )));
+        }
+        let applier = match cluster {
             Some(node) if !node.cluster().apply_from().is_empty() => Some(BlockApplier {
                 node: Arc::clone(node),
                 provider: ctx.node.provider().clone(),
                 consensus: Arc::new(ctx.node.consensus().clone()),
-                payload_validator: BasePayloadValidatorBuilder::default().build(ctx).await?,
+                payload_validator: payload_validator_builder.build(ctx).await?,
             }),
             _ => None,
         };

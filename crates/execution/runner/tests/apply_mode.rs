@@ -3,21 +3,27 @@
 //! result arrives.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     net::{SocketAddr, TcpListener},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use alloy_eips::{BlockNumberOrTag, Encodable2718, eip7685::Requests};
+use alloy_eips::{
+    BlockNumberOrTag, Encodable2718,
+    eip7685::{EMPTY_REQUESTS_HASH, Requests},
+};
 use alloy_genesis::GenesisAccount;
 use alloy_primitives::{Address, B64, B256, Bytes, TxKind, U256, keccak256};
 use alloy_provider::{Provider, RootProvider};
-use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret, PayloadAttributes};
-use base_common_consensus::{BaseReceipt, JovianExtraData, TxDeposit};
+use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret, PayloadAttributes, PayloadStatusEnum};
+use base_common_consensus::{BaseReceipt, JovianExtraData, Predeploys, TxDeposit};
 use base_common_genesis::RollupConfig;
 use base_common_network::{Base, BaseEngineApi};
-use base_common_rpc_types_engine::{BaseExecutionPayloadEnvelopeV4, BasePayloadAttributes};
+use base_common_rpc_types_engine::{
+    BaseExecutionPayloadEnvelopeV4, BaseExecutionPayloadV4, BasePayloadAttributes,
+};
 use base_consensus_engine::{
     BaseEngineClient, EngineClient, EngineClientBuilder, EngineEndpoint, InMemoryTransport,
 };
@@ -26,7 +32,7 @@ use base_execution_chainspec::BaseChainSpec;
 use base_execution_cluster::{
     ApplyCounts, ApplyFallback, Cluster, ClusterConfig, ClusterNode, ClusteredDatabase,
     ExecutedBlockResult, ExecutedBlocks, NodeConfig as ClusterNodeConfig, NodeId, OwnerServer,
-    OwnerStore,
+    OwnerStore, Shard, ShardMap,
 };
 use base_node_core::args::RollupArgs;
 use base_node_runner::{
@@ -37,7 +43,7 @@ use base_test_utils::build_test_genesis;
 use eyre::{Result, eyre};
 use reth_db::{
     ClientVersion, Database, DatabaseEnv,
-    cursor::DbCursorRO,
+    cursor::{DbCursorRO, DbDupCursorRO},
     init_db,
     mdbx::{DatabaseArguments, RO, tx::Tx},
     table::Table,
@@ -54,6 +60,7 @@ use reth_provider::{
     AccountReader, ChangeSetReader, StateProvider, StateProviderFactory, StorageChangeSetReader,
 };
 use reth_tasks::Runtime;
+use reth_trie_common::{BranchNodeCompact, Nibbles};
 
 /// Blocks each test produces.
 const BLOCKS: u64 = 3;
@@ -72,7 +79,8 @@ const STORAGE_CONTRACT: Address = Address::repeat_byte(0xc0);
 const STORAGE_CONTRACT_CODE: [u8; 6] = [0x5f, 0x35, 0x43, 0x90, 0x55, 0x00];
 
 /// The transactions of block `number`: the L1 info deposit, then user deposits that create
-/// accounts and storage slots, so blocks change the account and storage tries.
+/// accounts (each deposit sends what it mints) and storage slots, so blocks change the account
+/// and storage tries.
 fn block_transactions(number: u64) -> Vec<Bytes> {
     let seed = |kind, index| deposit_seed(number, kind, index);
     let deposit = |source_hash, to, mint, input| {
@@ -81,7 +89,7 @@ fn block_transactions(number: u64) -> Vec<Bytes> {
             from: Address::repeat_byte(0xde),
             to: TxKind::Call(to),
             mint,
-            value: U256::ZERO,
+            value: U256::from(mint),
             gas_limit: 100_000,
             is_system_transaction: false,
             input,
@@ -112,7 +120,7 @@ type TableDump = (&'static str, Vec<(Vec<u8>, Vec<u8>)>);
 struct TestNode {
     launched: LaunchedBaseNode,
     env: DatabaseEnv,
-    cluster: Arc<ClusterNode>,
+    cluster: Option<Arc<ClusterNode>>,
     engine: BaseEngineClient<RootProvider, RootProvider<Base>>,
     reads: RootProvider<Base>,
     data_path: PathBuf,
@@ -130,25 +138,7 @@ impl TestNode {
         apply_from: Vec<NodeId>,
         split_storage: Vec<Bytes>,
     ) -> Result<Self> {
-        let network = NetworkArgs {
-            discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
-            ..NetworkArgs::default()
-        };
-        let mut node_config = NodeConfig::new(Arc::clone(chain_spec))
-            .with_network(network)
-            .with_rpc(RpcServerArgs::default().with_unused_ports())
-            .with_unused_ports();
-        node_config.engine.persistence_threshold = 0;
-        let data_path = tempdir_path();
-        node_config = node_config.with_datadir_args(DatadirArgs {
-            datadir: MaybePlatformPath::<DataDirPath>::from(data_path.clone()),
-            ..Default::default()
-        });
-        let env = init_db(
-            node_config.datadir().db(),
-            DatabaseArguments::new(ClientVersion::default())
-                .with_geometry_max_size(Some(100 * 1024 * 1024)),
-        )?;
+        let (node_config, data_path, env) = Self::datadir(chain_spec)?;
         let cluster = Cluster::new(ClusterConfig {
             node_id: NodeId(node_id),
             replication: 2,
@@ -164,7 +154,56 @@ impl TestNode {
             listener,
             Default::default(),
         )?;
-        let cluster = Arc::clone(db.cluster().ok_or_else(|| eyre!("database is not clustered"))?);
+        Self::start(runtime, node_config, data_path, env, db).await
+    }
+
+    /// Launches a node without a cluster config: its database is a pass-through to MDBX.
+    async fn launch_unclustered(
+        runtime: &Runtime,
+        chain_spec: &Arc<BaseChainSpec>,
+    ) -> Result<Self> {
+        let (node_config, data_path, env) = Self::datadir(chain_spec)?;
+        let db = ClusteredDatabase::new(env.clone());
+        Self::start(runtime, node_config, data_path, env, db).await
+    }
+
+    /// A node config over a fresh datadir, and that datadir's MDBX.
+    fn datadir(
+        chain_spec: &Arc<BaseChainSpec>,
+    ) -> Result<(NodeConfig<BaseChainSpec>, PathBuf, DatabaseEnv)> {
+        let network = NetworkArgs {
+            discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
+            ..NetworkArgs::default()
+        };
+        let mut node_config = NodeConfig::new(Arc::clone(chain_spec))
+            .with_network(network)
+            .with_rpc(RpcServerArgs::default().with_unused_ports())
+            .with_unused_ports();
+        node_config.engine.persistence_threshold = 0;
+        // As a clustered node requires: the state tables are at the `Finish` checkpoint.
+        node_config.engine.num_state_masking_blocks = 0;
+        let data_path = tempdir_path();
+        node_config = node_config.with_datadir_args(DatadirArgs {
+            datadir: MaybePlatformPath::<DataDirPath>::from(data_path.clone()),
+            ..Default::default()
+        });
+        let env = init_db(
+            node_config.datadir().db(),
+            DatabaseArguments::new(ClientVersion::default())
+                .with_geometry_max_size(Some(100 * 1024 * 1024)),
+        )?;
+        Ok((node_config, data_path, env))
+    }
+
+    /// Launches the node of `node_config` on `db`, whose MDBX is `env`.
+    async fn start(
+        runtime: &Runtime,
+        node_config: NodeConfig<BaseChainSpec>,
+        data_path: PathBuf,
+        env: DatabaseEnv,
+        db: ClusteredDatabase,
+    ) -> Result<Self> {
+        let cluster = db.cluster().cloned();
         let launched = BaseNodeRunner::new(RollupArgs::default())
             .launch(
                 NodeBuilder::new(node_config)
@@ -187,6 +226,11 @@ impl TestNode {
         .build()
         .await?;
         Ok(Self { launched, env, cluster, engine, reads, data_path })
+    }
+
+    /// This node's side of its cluster.
+    const fn cluster(&self) -> &Arc<ClusterNode> {
+        self.cluster.as_ref().expect("a clustered node")
     }
 
     /// Builds the next block on this node's head and returns its payload, without inserting it.
@@ -357,14 +401,30 @@ fn dump<T: Table>(tx: &Tx<RO>) -> Result<TableDump> {
 }
 
 fn chain_spec() -> Result<Arc<BaseChainSpec>> {
+    chain_spec_with(GENESIS_ACCOUNTS, 0)
+}
+
+/// A genesis with `accounts` funded accounts and [`STORAGE_CONTRACT`] holding `contract_slots`
+/// slots.
+fn chain_spec_with(accounts: u64, contract_slots: u64) -> Result<Arc<BaseChainSpec>> {
     let mut genesis = build_test_genesis();
-    for index in 0..GENESIS_ACCOUNTS {
+    for index in 0..accounts {
         let account = GenesisAccount::default().with_balance(U256::from(index + 1));
         genesis.alloc.insert(Address::from_word(keccak256(index.to_be_bytes())), account);
     }
+    let storage = (0..contract_slots)
+        .map(|index| {
+            (
+                keccak256([b"slot".as_slice(), &index.to_be_bytes()].concat()),
+                B256::with_last_byte(1),
+            )
+        })
+        .collect();
     genesis.alloc.insert(
         STORAGE_CONTRACT,
-        GenesisAccount::default().with_code(Some(Bytes::from_static(&STORAGE_CONTRACT_CODE))),
+        GenesisAccount::default()
+            .with_code(Some(Bytes::from_static(&STORAGE_CONTRACT_CODE)))
+            .with_storage(Some(storage)),
     );
     let base_fee_params = BaseChainSpec::from_genesis(genesis.clone())
         .base_fee_params_at_timestamp(genesis.timestamp);
@@ -409,9 +469,9 @@ async fn applied_chain_matches_the_executed_chain() -> Result<()> {
     executor.wait_persisted(BLOCKS).await?;
     applier.wait_persisted(BLOCKS).await?;
 
-    assert_eq!(applier.cluster.applied_blocks().applied, BLOCKS);
-    assert_eq!(applier.cluster.applied_blocks().fallbacks, [0; 4]);
-    assert_eq!(executor.cluster.applied_blocks(), ApplyCounts::default());
+    assert_eq!(applier.cluster().applied_blocks().applied, BLOCKS);
+    assert_eq!(applier.cluster().applied_blocks().fallbacks, [0; 4]);
+    assert_eq!(executor.cluster().applied_blocks(), ApplyCounts::default());
     assert_eq!(applier.head().await?, executor.head().await?);
     assert_eq!(applier.head().await?.1, BLOCKS);
     assert_eq!(applier.receipts().await?, executor.receipts().await?);
@@ -471,8 +531,8 @@ async fn stateless_apply_node_matches_the_executed_chain() -> Result<()> {
     executor.wait_persisted(BLOCKS).await?;
     applier.wait_persisted(BLOCKS).await?;
 
-    assert_eq!(applier.cluster.applied_blocks().applied, BLOCKS);
-    assert_eq!(applier.cluster.applied_blocks().fallbacks, [0; 4]);
+    assert_eq!(applier.cluster().applied_blocks().applied, BLOCKS);
+    assert_eq!(applier.cluster().applied_blocks().fallbacks, [0; 4]);
     assert_eq!(applier.head().await?, executor.head().await?);
     assert_eq!(applier.receipts().await?, executor.receipts().await?);
     let changesets = executor.changesets()?;
@@ -541,7 +601,7 @@ async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
     let corrupt_view = Cluster::new(ClusterConfig {
         node_id: NodeId(3),
         apply_from: vec![],
-        ..applier.cluster.cluster().config().clone()
+        ..applier.cluster().cluster().config().clone()
     })?;
     let corrupt_store =
         Arc::new(OwnerStore::new(Arc::new(corrupt_view), create_test_rw_db(), 160)?);
@@ -551,7 +611,7 @@ async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
     let envelope = executor.build_next().await?;
     let hash = executor.import(&envelope).await?;
     let result = executor
-        .cluster
+        .cluster()
         .executed_blocks()
         .wait_for(hash, Duration::from_secs(5))
         .ok_or_else(|| eyre!("executor kept no result for block 1"))?;
@@ -563,13 +623,13 @@ async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
     let corrupt = ExecutedBlockResult::new(&parts.output, &parts.senders, &parts.trie).encode()?;
     corrupt_results.insert(hash, corrupt);
     assert_eq!(applier.import(&envelope).await?, hash);
-    assert_eq!(applier.cluster.applied_blocks().fallbacks(ApplyFallback::Invalid), 1);
+    assert_eq!(applier.cluster().applied_blocks().fallbacks(ApplyFallback::Invalid), 1);
 
     // Block 2's result differs only in carrying an execution request.
     let envelope = executor.build_next().await?;
     let hash = executor.import(&envelope).await?;
     let result = executor
-        .cluster
+        .cluster()
         .executed_blocks()
         .wait_for(hash, Duration::from_secs(5))
         .ok_or_else(|| eyre!("executor kept no result for block 2"))?;
@@ -578,7 +638,7 @@ async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
     let corrupt = ExecutedBlockResult::new(&parts.output, &parts.senders, &parts.trie).encode()?;
     corrupt_results.insert(hash, corrupt);
     assert_eq!(applier.import(&envelope).await?, hash);
-    assert_eq!(applier.cluster.applied_blocks().fallbacks(ApplyFallback::Invalid), 2);
+    assert_eq!(applier.cluster().applied_blocks().fallbacks(ApplyFallback::Invalid), 2);
 
     drop(corrupt_server);
     for _ in 2..BLOCKS {
@@ -586,7 +646,7 @@ async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
         let hash = executor.import(&envelope).await?;
         assert_eq!(applier.import(&envelope).await?, hash);
     }
-    let counts = applier.cluster.applied_blocks();
+    let counts = applier.cluster().applied_blocks();
     assert_eq!(counts.applied, 0);
     assert_eq!(counts.fallbacks(ApplyFallback::Unreachable), BLOCKS - 2);
     assert_eq!(applier.head().await?, executor.head().await?);
@@ -594,6 +654,256 @@ async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
 
     let paths = [executor.data_path.clone(), applier.data_path.clone()];
     drop((executor, applier, runtime));
+    for path in paths {
+        let _ = std::fs::remove_dir_all(path);
+    }
+    Ok(())
+}
+
+/// Blocks of the trie-slice test, and its genesis: dense enough that the two-nibble account-trie
+/// nodes and [`STORAGE_CONTRACT`]'s two-nibble storage-trie nodes are stored branches.
+const SLICE_BLOCKS: u64 = 4;
+const SLICE_GENESIS_ACCOUNTS: u64 = 4_096;
+const SLICE_CONTRACT_SLOTS: u64 = 4_096;
+
+/// Ids of three storage nodes (`R = 2`) of which the first two are launched: exactly one of them
+/// owns the message passer's account shard, and exactly one owns [`STORAGE_CONTRACT`]'s.
+fn slice_node_ids() -> [u64; 3] {
+    let message_passer = keccak256(Predeploys::L2_TO_L1_MESSAGE_PASSER)[0];
+    let contract = keccak256(STORAGE_CONTRACT)[0];
+    (3..)
+        .map(|third| [1, 2, third])
+        .find(|ids| {
+            let shards = ShardMap::new(&ids.map(NodeId), 2);
+            let one_launched_owner = |shard| {
+                shards.owners(Shard(shard)).iter().filter(|id| ids[..2].contains(&id.0)).count()
+                    == 1
+            };
+            one_launched_owner(message_passer) && one_launched_owner(contract)
+        })
+        .expect("some third node id splits both shards")
+}
+
+/// A child of a replicated one-nibble node: the storage trie's contract (`None` for the account
+/// trie), the node's path, and the child nibble.
+type ChildPosition = (Option<B256>, Nibbles, u8);
+
+/// A child's state and tree mask bits and, when its hash bit is set, its hash.
+#[derive(Debug, PartialEq, Eq)]
+struct ChildFlags {
+    present: bool,
+    stored: bool,
+    hash: Option<B256>,
+}
+
+/// The trie rows of a node's slice that must equal a full node's, read from raw MDBX.
+#[derive(Debug, PartialEq, Eq)]
+struct SliceRows {
+    /// Account-trie rows of two or more nibbles in held shards, except the path to
+    /// [`STORAGE_CONTRACT`]'s account leaf.
+    accounts_trie: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Storage-trie rows of held unsplit accounts, and of held ranges of the split contract.
+    storages_trie: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+    /// State, tree and hash bits and hash of each held child of a replicated one-nibble node of
+    /// the account trie (except the split contract's account shard) and of the split contract's
+    /// storage trie.
+    held_children: BTreeMap<ChildPosition, ChildFlags>,
+}
+
+impl SliceRows {
+    /// The rows `cluster`'s node holds, as `env` stores them.
+    fn read(env: &DatabaseEnv, cluster: &Cluster) -> Result<Self> {
+        let split = keccak256(STORAGE_CONTRACT);
+        let split_leaf = Nibbles::unpack(split);
+        let owns = |path: &Nibbles| {
+            cluster.owns(Shard(path.get_unchecked(0) << 4 | path.get_unchecked(1)))
+        };
+        // A packed trie path is 32 bytes of nibbles and then the nibble count.
+        let path_of =
+            |encoded: &[u8]| Nibbles::unpack(&encoded[..32]).slice(..usize::from(encoded[32]));
+        let tx = env.tx()?;
+        let (_, accounts) = dump::<tables::PackedAccountsTrie>(&tx)?;
+        let accounts_trie = accounts
+            .into_iter()
+            .filter(|(key, _)| {
+                let path = path_of(key);
+                path.len() >= 2 && owns(&path) && !split_leaf.starts_with(&path)
+            })
+            .collect();
+        let mut storages_trie: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+        for (address, value) in dump::<tables::PackedStoragesTrie>(&tx)?.1 {
+            let held = if address.as_slice() == split.as_slice() {
+                let path = path_of(&value[..33]);
+                path.len() >= 2 && owns(&path)
+            } else {
+                cluster.owns(Shard(address[0]))
+            };
+            if held {
+                storages_trie.entry(address).or_default().insert(value);
+            }
+        }
+
+        let mut held_children = BTreeMap::new();
+        let mut record = |owner: Option<B256>, path: Nibbles, node: &BranchNodeCompact| {
+            for child in 0..16u8 {
+                let mut child_path = path;
+                child_path.push(child);
+                let on_split_path = owner.is_none() && split_leaf.starts_with(&child_path);
+                if owns(&child_path) && !on_split_path {
+                    let hashed = node.hash_mask.is_bit_set(child);
+                    held_children.insert(
+                        (owner, path, child),
+                        ChildFlags {
+                            present: node.state_mask.is_bit_set(child),
+                            stored: node.tree_mask.is_bit_set(child),
+                            hash: hashed.then(|| node.hash_for_nibble(child)),
+                        },
+                    );
+                }
+            }
+        };
+        for entry in tx.cursor_read::<tables::PackedAccountsTrie>()?.walk(None)? {
+            let (path, node) = entry?;
+            if path.0.len() == 1 {
+                record(None, path.0, &node);
+            }
+        }
+        for entry in
+            tx.cursor_dup_read::<tables::PackedStoragesTrie>()?.walk_dup(Some(split), None)?
+        {
+            let entry = entry?.1;
+            if entry.nibbles.0.len() == 1 {
+                record(Some(split), entry.nibbles.0, &entry.node);
+            }
+        }
+        Ok(Self { accounts_trie, storages_trie, held_children })
+    }
+}
+
+impl TestNode {
+    /// Submits `payload` built on this node's head without making it the head.
+    async fn submit(
+        &self,
+        payload: BaseExecutionPayloadV4,
+        parent_beacon_block_root: B256,
+    ) -> Result<PayloadStatusEnum> {
+        Ok(self.engine.new_payload_v4(payload, parent_beacon_block_root).await?.status)
+    }
+}
+
+/// `envelope`'s payload with the given header roots replaced, resealed under its new hash.
+fn resealed(
+    envelope: &BaseExecutionPayloadEnvelopeV4,
+    state_root: Option<B256>,
+    withdrawals_root: Option<B256>,
+) -> Result<BaseExecutionPayloadV4> {
+    let mut payload = envelope.execution_payload.clone();
+    let mut block = payload.clone().into_block_raw()?;
+    // Header fields an Engine API V4 payload carries beside the payload.
+    block.header.parent_beacon_block_root = Some(envelope.parent_beacon_block_root);
+    block.header.requests_hash = Some(EMPTY_REQUESTS_HASH);
+    let built = &payload.payload_inner.payload_inner.payload_inner;
+    if block.header.hash_slow() != built.block_hash {
+        return Err(eyre!("the payload's header does not reseal to its hash"));
+    }
+    if let Some(root) = state_root {
+        block.header.state_root = root;
+        payload.payload_inner.payload_inner.payload_inner.state_root = root;
+    }
+    if let Some(root) = withdrawals_root {
+        block.header.withdrawals_root = Some(root);
+        payload.withdrawals_root = root;
+    }
+    payload.payload_inner.payload_inner.payload_inner.block_hash = block.header.hash_slow();
+    Ok(payload)
+}
+
+/// Executing clustered nodes keep only their trie slice: after the blocks persist, every
+/// meaningful row each node holds equals an unclustered full node's. A clustered node accepts a
+/// block whose header state root is wrong, which the unclustered node rejects; the
+/// message-passer storage root is compared only by the node holding that storage trie and
+/// skipped and counted by the other.
+#[tokio::test(flavor = "multi_thread")]
+async fn clustered_nodes_keep_trie_slices_equal_to_a_full_node() -> Result<()> {
+    base_node_runner::test_utils::init_silenced_tracing();
+    let chain_spec = chain_spec_with(SLICE_GENESIS_ACCOUNTS, SLICE_CONTRACT_SLOTS)?;
+    let ids = slice_node_ids();
+    let (first_listener, first_address) = bound()?;
+    let (second_listener, second_address) = bound()?;
+    let addresses = [first_address, second_address, bound()?.1];
+    let nodes: Vec<_> = ids
+        .into_iter()
+        .zip(addresses)
+        .map(|(id, address)| ClusterNodeConfig { id: NodeId(id), address, storage: true })
+        .collect();
+    let split = || vec![Bytes::copy_from_slice(STORAGE_CONTRACT.as_slice())];
+    let runtime = Runtime::test();
+    let reference = TestNode::launch_unclustered(&runtime, &chain_spec).await?;
+    let first =
+        TestNode::launch(&runtime, &chain_spec, ids[0], &nodes, first_listener, vec![], split())
+            .await?;
+    let second =
+        TestNode::launch(&runtime, &chain_spec, ids[1], &nodes, second_listener, vec![], split())
+            .await?;
+    let clustered = [&first, &second];
+    let at_genesis = clustered
+        .iter()
+        .map(|node| SliceRows::read(&node.env, node.cluster().cluster()))
+        .collect::<Result<Vec<_>>>()?;
+
+    for _ in 0..SLICE_BLOCKS {
+        let envelope = reference.build_next().await?;
+        let hash = reference.import(&envelope).await?;
+        for node in clustered {
+            assert_eq!(node.import(&envelope).await?, hash);
+        }
+    }
+    for node in [&reference, &first, &second] {
+        node.wait_persisted(SLICE_BLOCKS).await?;
+    }
+
+    let message_passer = keccak256(Predeploys::L2_TO_L1_MESSAGE_PASSER);
+    let contract = keccak256(STORAGE_CONTRACT);
+    for (node, at_genesis) in clustered.into_iter().zip(at_genesis) {
+        let cluster = node.cluster().cluster();
+        let expected = SliceRows::read(&reference.env, cluster)?;
+        assert_eq!(SliceRows::read(&node.env, cluster)?, expected, "node {:?}", cluster.node_id());
+        assert!(expected.accounts_trie.len() > 50, "few account-trie rows compared");
+        assert!(expected.held_children.len() > 50, "few replicated children compared");
+        assert_ne!(expected.accounts_trie, at_genesis.accounts_trie, "no held row changed");
+        let counts = node.cluster().trie_slices();
+        assert_eq!(counts.blocks, SLICE_BLOCKS);
+        if cluster.owns(Shard(contract[0])) {
+            assert_eq!(counts.side_calls, 0, "the contract's account holder needs no side call");
+        } else {
+            assert_eq!(counts.side_calls, SLICE_BLOCKS);
+            let key = contract.to_vec();
+            assert!(
+                expected.storages_trie.get(&key).is_some_and(|rows| !rows.is_empty())
+                    && expected.storages_trie.get(&key) != at_genesis.storages_trie.get(&key),
+                "held ranges of the split contract did not change"
+            );
+        }
+        let skips = if cluster.owns(Shard(message_passer[0])) { 0 } else { SLICE_BLOCKS };
+        assert_eq!(counts.message_passer_skips, skips);
+    }
+
+    let envelope = reference.build_next().await?;
+    let root = envelope.parent_beacon_block_root;
+    let wrong_state_root = resealed(&envelope, Some(B256::repeat_byte(0x5a)), None)?;
+    let wrong_withdrawals_root = resealed(&envelope, None, Some(B256::repeat_byte(0x5b)))?;
+    assert!(reference.submit(wrong_state_root.clone(), root).await?.is_invalid());
+    assert!(reference.submit(wrong_withdrawals_root.clone(), root).await?.is_invalid());
+    for node in clustered {
+        let status = node.submit(wrong_state_root.clone(), root).await?;
+        assert!(status.is_valid(), "{status:?}");
+        let holds_message_passer = node.cluster().cluster().owns(Shard(message_passer[0]));
+        let status = node.submit(wrong_withdrawals_root.clone(), root).await?;
+        assert_eq!(status.is_valid(), !holds_message_passer, "{status:?}");
+    }
+
+    let paths = [reference.data_path.clone(), first.data_path.clone(), second.data_path.clone()];
+    drop((reference, first, second, runtime));
     for path in paths {
         let _ = std::fs::remove_dir_all(path);
     }

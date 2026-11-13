@@ -31,6 +31,12 @@ pub use stats::{
     RemoteReadKind, RemoteReadStats,
 };
 
+mod slice;
+pub use slice::{SideCall, TrieSlice, TrieSliceError, TrieSlicePlan};
+
+mod slice_stats;
+pub use slice_stats::{TrieSliceCounts, TrieSliceStats};
+
 mod placement;
 pub use placement::{KeyPlacement, NodeId, Shard, ShardMap, ShardedTable};
 

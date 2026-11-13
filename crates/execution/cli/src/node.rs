@@ -389,7 +389,7 @@ impl ExecutionNodeRuntimeConfig {
         );
         eyre::ensure!(
             !self.node_config.debug.skip_state_root,
-            "a clustered node computes every state root; remove --debug.skip-state-root"
+            "a clustered node maintains its own trie slice; remove --debug.skip-state-root"
         );
         let finish = env.tx()?.get::<tables::StageCheckpoints>(StageId::Finish.to_string())?;
         eyre::ensure!(
