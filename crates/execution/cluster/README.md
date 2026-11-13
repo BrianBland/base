@@ -21,7 +21,8 @@ historical state RPC older than the persisted tip, reth storage v1.
 ## Placement
 
 - A shard is one value of the first byte of a hash: 256 shards.
-- `HashedAccounts`, `HashedStorages`, `StoragesTrie`: shard = first byte of the hashed address.
+- `HashedAccounts`, `HashedStorages`, `StoragesTrie`: shard = first byte of the hashed address,
+  except for the storage of a split contract (below).
 - `AccountsTrie`: shard = first two nibbles of the trie path (byte 0 of the packed key). Paths
   shorter than two nibbles (the root and its 16 children) are **replicated**: stored and written
   on every node.
@@ -33,16 +34,30 @@ historical state RPC older than the persisted tip, reth storage v1.
 - The packed `AccountsTrie` key is 33 bytes: 32 bytes of packed nibbles, then the nibble count.
   A key is replicated when that count is below 2. `node_id` is a `u64`, hashed as 8 big-endian
   bytes after the shard byte.
+- **Split contracts** (large contracts listed in `split_storage`): their storage rows are placed
+  one by one by subkey, so one contract's storage spreads over all 256 shards. A
+  `HashedStorages` row is in the shard of the first byte of its hashed slot. A `StoragesTrie` row
+  is placed by its trie path exactly as an `AccountsTrie` key is: the first two nibbles, and
+  paths shorter than two nibbles (the contract's storage root and its 16 children) are
+  replicated. The part of a split contract in one shard is a **range**; a node holds the ranges
+  of the shards it owns. Rows of every other contract are placed by hashed address as above.
+  Reads, writes, shed and the owner store all use this one placement, per key and subkey.
+- `split_storage` lists 20-byte addresses (hashed with keccak at load) or 32-byte hashed
+  addresses (used as they are), told apart by length; any other entry is rejected. Absent or
+  empty: no contract is split.
 - A node reads the placement from a TOML file. The file is rejected when node ids repeat,
   `node_id` is not listed, `R` is 0 or larger than the number of storage nodes, or the retention
   window `W` (see [Owner side](#owner-side)) is below 160, or `apply_from` (see
-  [Apply mode](#apply-mode)) lists an unknown node or this node.
+  [Apply mode](#apply-mode)) lists an unknown node or this node, or a `split_storage` entry is
+  neither 20 nor 32 bytes. Every node must list the same `split_storage`; this is not checked
+  (see [Limits](#limits)).
 
 ```toml
 node_id = 1          # this node
 replication = 2      # R, optional, default 2
 retention_blocks = 160  # W, optional, default 160
 apply_from = [2]     # optional, default [] (execute); see Apply mode
+split_storage = ["0x4200000000000000000000000000000000000016"]  # optional, default []
 
 [[nodes]]
 id = 1
@@ -87,6 +102,16 @@ local MDBX only (see [Write rule](#write-rule)).
   replicated `AccountsTrie` paths of that byte range (the root in shard 0, the one-nibble path
   `n` in shard `n0`) sort before every sharded key and are read locally, because `SeekGe` never
   returns them.
+- A split contract is read the same way one level down: its ranges are contiguous subkey ranges
+  (the first subkey byte), and "the first duplicate with subkey `>=` X" (`seek_by_key_subkey`,
+  and `seek_exact`, `get` and `next_dup`, which ask for the first duplicate from the smallest
+  subkey or from after the current one) starts in X's range: its replicated storage-trie paths
+  from local MDBX, then the range from local MDBX when this node holds it and from an owner with
+  a `SeekDupGe` page otherwise. When the range has no such duplicate, the read continues with the
+  next range, local or remote as placement says, until a duplicate is found or the contract's
+  256 ranges are exhausted. Local reads of a split contract use a second MDBX cursor of the same
+  table, which works on encoded keys. Contracts outside `split_storage` are read as before, by
+  key, with no continuation.
 - The cursor keeps its own position; after a remote answer the MDBX cursor's position is
   meaningless.
 - A remote failure is a `DatabaseError`, never "absent".
@@ -95,7 +120,7 @@ Cursor operations on the sharded tables:
 
 | Operation | `HashedAccounts`, `AccountsTrie` | `Bytecodes` | `HashedStorages`, `StoragesTrie` |
 |---|---|---|---|
-| `get`, `get_by_encoded_key`, `seek_exact` | yes | yes | yes (first duplicate of the key) |
+| `get`, `get_by_encoded_key`, `seek_exact` | yes | yes | yes (first duplicate of the key, across ranges for a split contract) |
 | `current` | yes | yes | yes |
 | `first`, `seek`, `next`, forward walks | yes | only inside owned shards | error |
 | `seek_by_key_subkey`, `next_dup`, `next_dup_val`, `walk_dup` with a key | | | yes |
@@ -118,6 +143,13 @@ such a key once shed has run, and before that only a stale one; forward persiste
 only reads state tables to decide between insert, update and delete of the same key, whose write
 is dropped anyway, so this is sufficient there. Deletes run locally (a stale key is simply
 removed).
+
+A write of a duplicate of a split contract is kept or dropped by the duplicate's own placement:
+its subkey is the start of the encoded value. Whole-contract operations act on the rows this
+node holds: `delete_current_duplicates` on a split contract deletes its local rows only. reth's
+live persistence of the sharded tables never uses it (only `PlainStorageState`, which is not
+sharded, is wiped that way); a wiped storage reaches the hashed tables as one zeroed slot per
+row, each placed by its subkey.
 
 It is not sufficient for anything that computes from state inside a write transaction:
 
@@ -182,6 +214,8 @@ In those updates a deletion is always explicit and per key: an account or trie n
 storage slot of zero. There is no "wipe storage" or "delete trie" marker to honour. reth's
 in-memory cursor overlays (`HashedPostStateCursorFactory`, `InMemoryTrieCursorFactory`) already
 implement this merge over a database cursor factory.
+Because deletions are per slot and per trie path, a wiped storage of a split contract needs no
+special case: each owner applies the deletions of the ranges it serves.
 
 Retention: an owner keeps snapshots and per-block updates covering the last `W` blocks, `W >= 160`
 (Base's persistence backpressure threshold), set by `retention_blocks` in the cluster config. Each retained block is identified by number and hash;
@@ -197,7 +231,8 @@ without trie updates makes the owner unable to serve past it.
   below `P`) is `SnapshotUnavailable`. Its range is the lowest and highest block the owner can
   serve; the owner may still refuse blocks inside it.
 
-Serving never issues a remote read: an owner serves only shards it owns.
+Serving never issues a remote read: an owner serves only shards it owns, and for a split
+contract only the ranges of shards it owns.
 
 ## Wire protocol
 
@@ -207,7 +242,7 @@ Keys and values travel as the encoded table bytes MDBX stores, so the protocol i
 |---|---|---|
 | `Get { table, key }` | `HashedAccounts`, `AccountsTrie`, `Bytecodes` | value or absent |
 | `SeekGe { table, key, limit }` | `HashedAccounts`, `AccountsTrie` | up to `limit` entries with key `>=` the given key, ascending, within the key's shard; `end_of_shard` flag |
-| `SeekDupGe { table, key, subkey, limit }` | `HashedStorages`, `StoragesTrie` | up to `limit` duplicate entries of exactly `key` with subkey `>=` the given subkey; `end_of_key` flag |
+| `SeekDupGe { table, key, subkey, limit }` | `HashedStorages`, `StoragesTrie` | up to `limit` duplicate entries of exactly `key` with subkey `>=` the given subkey; for a split contract only within the subkey's range; `end_of_key` flag |
 | `ExecutedBlock { hash }` | none (see [Apply mode](#apply-mode)) | the block's encoded execution result |
 
 Every request carries the snapshot `P`. Errors: `SnapshotUnavailable` (with the range the owner can
@@ -217,6 +252,11 @@ is a key or subkey of the wrong length.
 
 - The shard of a `SeekGe` is the shard of its key. Replicated `AccountsTrie` keys are never
   returned by `SeekGe` (every node holds them), but `Get` answers them.
+- A `SeekDupGe` of a split contract is served by the owners of its subkey's range (the shard of
+  the subkey's first byte) and refused with `NotOwner` elsewhere. Its page ends at the range
+  boundary: `end_of_key` then means "no more duplicates in this range", and the asker continues
+  with the next range. Replicated storage-trie paths are never returned. The owner derives the
+  range from the subkey and its own `split_storage`, so the encoding is unchanged.
 - An owner may return fewer than `limit` entries without setting the end flag; the asker seeks
   again from after the last entry.
 - `Bytecodes`: an owner that lacks the code and has not persisted up to `P` refuses with
@@ -301,7 +341,8 @@ cold.
 ## Bootstrap
 
 Start from a full datadir (genesis initialised or snapshot restored on a pass-through database).
-Shedding deletes every key of a sharded table that the node does not hold. It runs on raw MDBX in
+Shedding deletes every row of a sharded table that the node does not hold, including the ranges
+of split contracts in shards it does not own. It runs on raw MDBX in
 the background after launch, in batches of bounded size, each its own short write transaction so
 the engine's persistence writer never waits long. Reads do not depend on it (see
 [Routing](#routing)), and writes never add such keys, so it is idempotent and a node stopped
@@ -322,6 +363,16 @@ scale-down sheds it.
   and fails if none does within the client's retry budget (2 s by default).
 - `entries` (table statistics) of a sharded table counts local rows only.
 - Shedding frees pages inside MDBX but does not shrink the file without a compacting copy.
+- `split_storage` must be identical on every node. Nothing checks it: a node with a different
+  list asks the wrong owners and reads wrong data. Changing the list (on every node) needs a
+  re-clone from a full datadir, because rows already shed under the old placement are gone.
+- Split contracts are chosen by the operator; nothing detects large contracts or rebalances.
+- A read of a split contract that finds nothing in a range asks the next range, so a seek past
+  the last slot of a range that this node does not hold costs one more remote read per empty
+  range crossed. Large contracts are dense, so this is rare. A seek past a contract's last slot
+  visits every remaining range.
+- A storage wipe of a split contract is applied per row and per range like any other deletion.
+  A wipe of an existing contract cannot happen after Cancun, so this cost is not optimised.
 
 ## Design record
 

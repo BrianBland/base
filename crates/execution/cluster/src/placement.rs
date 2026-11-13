@@ -128,6 +128,24 @@ impl ShardedTable {
         vec![0; self.subkey_len()]
     }
 
+    /// For a duplicate-key table, the table whose keys are laid out and placed like its subkeys:
+    /// the duplicates of a split contract are placed by subkey exactly as that table's keys are.
+    /// Hashed slots are laid out like hashed addresses, storage-trie paths like account-trie
+    /// paths.
+    pub const fn subkey_layout(self) -> Option<Self> {
+        match self {
+            Self::HashedStorages => Some(Self::HashedAccounts),
+            Self::StoragesTrie => Some(Self::AccountsTrie),
+            Self::HashedAccounts | Self::AccountsTrie | Self::Bytecodes => None,
+        }
+    }
+
+    /// The encoded subkey an encoded duplicate value starts with, or `None` when the value is
+    /// shorter than a subkey.
+    pub fn subkey_of(self, value: &[u8]) -> Option<&[u8]> {
+        value.get(..self.subkey_len())
+    }
+
     /// The smallest encoded key of the table.
     pub fn first_key(self) -> Vec<u8> {
         vec![0; self.key_len()]

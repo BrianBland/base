@@ -13,10 +13,10 @@ use alloy_primitives::B256;
 use parking_lot::Mutex;
 use reth_db::{
     Database, DatabaseEnv, DatabaseError,
-    cursor::DbCursorRO,
+    cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO},
     mdbx::{RO, RW, TransactionKind, tx::Tx},
-    table::Table,
-    tables::{self, RawKey, RawTable},
+    table::{DupSort, Table},
+    tables::{self, RawDupSort, RawKey, RawTable},
     transaction::{DbTx, DbTxMut},
 };
 use reth_stages_types::StageId;
@@ -180,11 +180,21 @@ impl ClusterNode {
         &self.server
     }
 
-    /// Whether this node holds the encoded `key` of `table`. A key that is not a valid encoded
-    /// key of the table is an error: a clustered database cannot place it.
-    pub fn holds(&self, table: ShardedTable, key: &[u8]) -> Result<bool, DatabaseError> {
-        self.cluster.holds(table, key).ok_or_else(|| {
-            DatabaseError::Other(format!("key of length {} is not a {table:?} key", key.len()))
+    /// Whether this node holds the row with encoded `key` and `subkey` of `table` (see
+    /// [`Cluster::placement`]). A row that is not valid for the table is an error: a clustered
+    /// database cannot place it.
+    pub fn holds(
+        &self,
+        table: ShardedTable,
+        key: &[u8],
+        subkey: &[u8],
+    ) -> Result<bool, DatabaseError> {
+        self.cluster.holds(table, key, subkey).ok_or_else(|| {
+            DatabaseError::Other(format!(
+                "key of length {} and subkey of length {} is not a {table:?} row",
+                key.len(),
+                subkey.len()
+            ))
         })
     }
 
@@ -312,10 +322,18 @@ impl ClusterNode {
             &mut budget,
         )?;
         self.shed_table::<tables::Bytecodes>(&tx, ShardedTable::Bytecodes, &mut budget)?;
+        self.shed_split::<tables::HashedStorages>(&tx, ShardedTable::HashedStorages, &mut budget)?;
+        self.shed_split::<tables::PackedStoragesTrie>(
+            &tx,
+            ShardedTable::StoragesTrie,
+            &mut budget,
+        )?;
         tx.commit()?;
         Ok(max_rows - budget)
     }
 
+    /// Deletes rows of `table` in the shards this node does not own, by key. Split contracts are
+    /// skipped whole; [`Self::shed_split`] sheds them by range.
     fn shed_table<T: Table>(
         &self,
         tx: &Tx<RW>,
@@ -326,21 +344,79 @@ impl ClusterNode {
         for shard in Shard::all().filter(|shard| !self.cluster.owns(*shard)) {
             let mut start = table.first_key();
             start[0] = shard.0;
-            let mut walker = cursor.walk(Some(RawKey::from_vec(start)))?;
+            let mut entry = cursor.seek(RawKey::from_vec(start))?;
             while *budget > 0 {
-                let Some(entry) = walker.next() else { break };
-                let key = entry?.0.into_key();
+                let Some((key, _)) = entry else { break };
+                let key = key.into_key();
+                if self.cluster.is_split(table, &key) {
+                    entry = match Self::key_after(&key) {
+                        Some(next) => cursor.seek(RawKey::from_vec(next))?,
+                        None => None,
+                    };
+                    continue;
+                }
                 match table.placement(&key) {
                     Some(KeyPlacement::Shard(found)) if found == shard => {
-                        walker.delete_current()?;
+                        cursor.delete_current()?;
                         *budget -= 1;
                     }
                     Some(KeyPlacement::Replicated) if key[0] == shard.0 => {}
                     _ => break,
                 }
+                entry = cursor.next()?;
             }
             if *budget == 0 {
                 break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The smallest key of the same length after `key`, or `None` when `key` is the largest.
+    fn key_after(key: &[u8]) -> Option<Vec<u8>> {
+        let mut next = key.to_vec();
+        for byte in next.iter_mut().rev() {
+            let (incremented, overflowed) = byte.overflowing_add(1);
+            *byte = incremented;
+            if !overflowed {
+                return Some(next);
+            }
+        }
+        None
+    }
+
+    /// Deletes the duplicates of split contracts in the ranges of shards this node does not own.
+    fn shed_split<T: DupSort>(
+        &self,
+        tx: &Tx<RW>,
+        table: ShardedTable,
+        budget: &mut u64,
+    ) -> Result<(), DatabaseError> {
+        let Some(layout) = table.subkey_layout() else { return Ok(()) };
+        let mut cursor = tx.cursor_dup_write::<RawDupSort<T>>()?;
+        for contract in self.cluster.split_storage() {
+            for range in Shard::all().filter(|shard| !self.cluster.owns(*shard)) {
+                let floor = RawKey::from_vec(layout.shard_floor(range));
+                let mut found = cursor
+                    .seek_by_key_subkey(RawKey::from_vec(contract.to_vec()), floor)?
+                    .map(|value| value.into_value());
+                while *budget > 0 {
+                    let Some(value) = found else { break };
+                    let in_range =
+                        table.subkey_of(&value).and_then(|subkey| layout.placement(subkey))
+                            == Some(KeyPlacement::Shard(range));
+                    if !in_range {
+                        break;
+                    }
+                    cursor.delete_current()?;
+                    *budget -= 1;
+                    found = cursor.next()?.and_then(|(key, value)| {
+                        (key.into_key() == contract.as_slice()).then(|| value.into_value())
+                    });
+                }
+                if *budget == 0 {
+                    return Ok(());
+                }
             }
         }
         Ok(())

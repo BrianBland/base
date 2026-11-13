@@ -11,7 +11,7 @@ use reth_db::{
     table::{Decode, Decompress, DupSort, Encode, IntoVec, Table, TableRow},
 };
 
-use crate::{ReadSnapshot, Shard, ShardedTable};
+use crate::{KeyPlacement, ReadSnapshot, Shard, ShardedTable, SplitCursor};
 
 /// Where a [`ShardedReads`] cursor is.
 #[derive(Debug)]
@@ -24,6 +24,14 @@ pub enum CursorPosition {
         /// Encoded key.
         key: Vec<u8>,
     },
+    /// At a duplicate of a split contract read from local MDBX; the [`SplitCursor`] is positioned
+    /// there.
+    LocalSplit {
+        /// Encoded key.
+        key: Vec<u8>,
+        /// Encoded value.
+        value: Vec<u8>,
+    },
     /// At an entry read from an owner, followed by the rest of its page.
     Remote {
         /// Encoded key.
@@ -32,7 +40,8 @@ pub enum CursorPosition {
         value: Vec<u8>,
         /// Entries of the page after this one, ascending.
         rest: VecDeque<(Vec<u8>, Vec<u8>)>,
-        /// No entry of the shard (or duplicate of the key) follows the page.
+        /// No entry of the shard (or duplicate of the key, or of the range of a split contract)
+        /// follows the page.
         complete: bool,
     },
     /// A positioning call found nothing: `current` and `next` return nothing.
@@ -48,18 +57,25 @@ pub enum CursorPosition {
 pub type FoundEntry<T> = (TableRow<T>, CursorPosition);
 
 /// Routes the reads of one read-only cursor over a sharded table, following the spec's
-/// [Read rule](crate#read-rule). The MDBX cursor of the same table is passed to every call.
+/// [Read rule](crate#read-rule). The MDBX cursor of the same table is passed to every call;
+/// duplicates of split contracts are read locally through this type's own [`SplitCursor`].
 #[derive(Debug)]
-pub struct ShardedReads {
+pub struct ShardedReads<K: TransactionKind> {
     snapshot: Arc<ReadSnapshot>,
     table: ShardedTable,
     position: CursorPosition,
+    split: Option<SplitCursor<K>>,
 }
 
-impl ShardedReads {
-    /// A fresh cursor over `table` reading at `snapshot`.
-    pub const fn new(snapshot: Arc<ReadSnapshot>, table: ShardedTable) -> Self {
-        Self { snapshot, table, position: CursorPosition::Unset }
+impl<K: TransactionKind> ShardedReads<K> {
+    /// A fresh cursor over `table` reading at `snapshot`. `split` is required to read a split
+    /// contract.
+    pub const fn new(
+        snapshot: Arc<ReadSnapshot>,
+        table: ShardedTable,
+        split: Option<SplitCursor<K>>,
+    ) -> Self {
+        Self { snapshot, table, position: CursorPosition::Unset, split }
     }
 
     /// The error returned by an operation that is not supported on a sharded table.
@@ -87,24 +103,17 @@ impl ShardedReads {
     }
 
     /// `DbCursorRO::first`.
-    pub fn first<K: TransactionKind, T: Table>(
-        &mut self,
-        inner: &mut Cursor<K, T>,
-    ) -> PairResult<T> {
+    pub fn first<T: Table>(&mut self, inner: &mut Cursor<K, T>) -> PairResult<T> {
         self.reject_duplicate("first")?;
         let found = self.find(inner, &self.table.first_key(), false)?;
         Ok(self.settle::<T>(found))
     }
 
     /// `DbCursorRO::seek`.
-    pub fn seek<K: TransactionKind, T: Table>(
-        &mut self,
-        inner: &mut Cursor<K, T>,
-        key: T::Key,
-    ) -> PairResult<T> {
+    pub fn seek<T: Table>(&mut self, inner: &mut Cursor<K, T>, key: T::Key) -> PairResult<T> {
         self.reject_duplicate("seek")?;
         let start = Self::encode::<T>(&key);
-        self.snapshot.node().holds(self.table, &start)?;
+        self.snapshot.node().holds(self.table, &start, &[])?;
         let found = self.find(inner, &start, false)?;
         Ok(self.settle::<T>(found))
     }
@@ -120,10 +129,7 @@ impl ShardedReads {
     }
 
     /// `DbCursorRO::next`.
-    pub fn next<K: TransactionKind, T: Table>(
-        &mut self,
-        inner: &mut Cursor<K, T>,
-    ) -> PairResult<T> {
+    pub fn next<T: Table>(&mut self, inner: &mut Cursor<K, T>) -> PairResult<T> {
         self.reject_duplicate("next")?;
         if let CursorPosition::Remote { key, value, rest, .. } = &mut self.position
             && let Some((next_key, next_value)) = rest.pop_front()
@@ -136,7 +142,10 @@ impl ShardedReads {
         let position = mem::replace(&mut self.position, CursorPosition::Missed);
         let found = match &position {
             CursorPosition::Unset => return self.first(inner),
-            CursorPosition::Missed | CursorPosition::PastEnd { .. } => {
+            // `LocalSplit` is a duplicate position, and duplicate-key tables reject `next`.
+            CursorPosition::Missed
+            | CursorPosition::PastEnd { .. }
+            | CursorPosition::LocalSplit { .. } => {
                 self.position = position;
                 return Ok(None);
             }
@@ -180,17 +189,16 @@ impl ShardedReads {
     }
 
     /// `DbCursorRO::current`.
-    pub fn current<K: TransactionKind, T: Table>(
-        &mut self,
-        inner: &mut Cursor<K, T>,
-    ) -> PairResult<T> {
+    pub fn current<T: Table>(&mut self, inner: &mut Cursor<K, T>) -> PairResult<T> {
         match &self.position {
             CursorPosition::Local { .. } => inner.current(),
-            CursorPosition::Remote { key, value, .. } => Self::decode::<T>(key, value).map(Some),
+            CursorPosition::Remote { key, value, .. }
+            | CursorPosition::LocalSplit { key, value } => Self::decode::<T>(key, value).map(Some),
             CursorPosition::PastEnd { last } => match last.as_ref() {
                 // Later shards may have moved the MDBX cursor since.
                 CursorPosition::Local { key } => inner.seek_exact(T::Key::decode(key)?),
-                CursorPosition::Remote { key, value, .. } => {
+                CursorPosition::Remote { key, value, .. }
+                | CursorPosition::LocalSplit { key, value } => {
                     Self::decode::<T>(key, value).map(Some)
                 }
                 _ => Ok(None),
@@ -200,13 +208,13 @@ impl ShardedReads {
     }
 
     /// `DbCursorRO::seek_exact`; for a duplicate-key table, the key's first duplicate.
-    pub fn seek_exact<K: TransactionKind, T: Table>(
-        &mut self,
-        inner: &mut Cursor<K, T>,
-        key: T::Key,
-    ) -> PairResult<T> {
+    pub fn seek_exact<T: Table>(&mut self, inner: &mut Cursor<K, T>, key: T::Key) -> PairResult<T> {
         let encoded = Self::encode::<T>(&key);
-        if self.snapshot.node().holds(self.table, &encoded)? {
+        if self.is_split(&encoded) {
+            let found = self.find_split::<T>(&encoded, &self.table.first_subkey(), false)?;
+            return Ok(self.settle::<T>(found));
+        }
+        if self.snapshot.node().holds(self.table, &encoded, &[])? {
             let row = inner.seek_exact(key)?;
             self.position = if row.is_some() || self.table.is_duplicate() {
                 CursorPosition::Local { key: encoded }
@@ -234,14 +242,18 @@ impl ShardedReads {
     }
 
     /// `DbDupCursorRO::seek_by_key_subkey`.
-    pub fn seek_by_key_subkey<K: TransactionKind, T: DupSort>(
+    pub fn seek_by_key_subkey<T: DupSort>(
         &mut self,
         inner: &mut Cursor<K, T>,
         key: T::Key,
         subkey: T::SubKey,
     ) -> ValueOnlyResult<T> {
         let encoded = Self::encode::<T>(&key);
-        if self.snapshot.node().holds(self.table, &encoded)? {
+        if self.is_split(&encoded) {
+            let found = self.find_split::<T>(&encoded, &subkey.encode().into_vec(), false)?;
+            return Ok(self.settle::<T>(found).map(|(_, value)| value));
+        }
+        if self.snapshot.node().holds(self.table, &encoded, &[])? {
             self.position = CursorPosition::Local { key: encoded };
             return inner.seek_by_key_subkey(key, subkey);
         }
@@ -249,49 +261,175 @@ impl ShardedReads {
         Ok(self.settle::<T>(found).map(|(_, value)| value))
     }
 
-    /// `DbDupCursorRO::next_dup`.
-    pub fn next_dup<K: TransactionKind, T: DupSort>(
-        &mut self,
-        inner: &mut Cursor<K, T>,
-    ) -> PairResult<T> {
-        let subkey_len = self.table.subkey_len();
-        let (key, subkey) = match &mut self.position {
-            CursorPosition::Local { .. } => return inner.next_dup(),
-            CursorPosition::Remote { key, value, rest, complete } => {
-                if let Some((next_key, next_value)) = rest.pop_front() {
-                    let row = Self::decode::<T>(&next_key, &next_value)?;
-                    *key = next_key;
-                    *value = next_value;
-                    return Ok(Some(row));
+    /// `DbDupCursorRO::next_dup`. For a split contract the next duplicate may be in a later range.
+    pub fn next_dup<T: DupSort>(&mut self, inner: &mut Cursor<K, T>) -> PairResult<T> {
+        if let CursorPosition::Remote { key, value, rest, .. } = &mut self.position
+            && let Some((next_key, next_value)) = rest.pop_front()
+        {
+            let row = Self::decode::<T>(&next_key, &next_value)?;
+            *key = next_key;
+            *value = next_value;
+            return Ok(Some(row));
+        }
+        let position = mem::replace(&mut self.position, CursorPosition::Missed);
+        let found = match &position {
+            CursorPosition::Local { .. } => {
+                self.position = position;
+                return inner.next_dup();
+            }
+            CursorPosition::LocalSplit { key, value } => self.next_local_split::<T>(key, value)?,
+            CursorPosition::Remote { key, value, complete, .. } => {
+                let subkey = self.subkey_of(value)?;
+                let in_page = if *complete {
+                    None
+                } else {
+                    self.remote_duplicates::<T>(key.clone(), subkey, true)?
+                };
+                match in_page {
+                    Some(found) => Some(found),
+                    None if self.is_split(key) => {
+                        self.find_split_after_range::<T>(key, Shard(subkey[0]))?
+                    }
+                    None => None,
                 }
-                if *complete {
-                    return Ok(None);
-                }
-                let subkey = value.get(..subkey_len).ok_or_else(|| {
-                    DatabaseError::Other(format!("{:?} value shorter than its subkey", self.table))
-                })?;
-                (key.clone(), subkey.to_vec())
             }
             CursorPosition::Unset | CursorPosition::Missed | CursorPosition::PastEnd { .. } => {
+                self.position = position;
                 return Ok(None);
             }
         };
-        match self.remote_duplicates::<T>(key, &subkey, true)? {
-            Some((row, position)) => {
-                self.position = position;
-                Ok(Some(row))
+        Ok(match found {
+            Some((row, next)) => {
+                self.position = next;
+                Some(row)
             }
             None => {
-                if let CursorPosition::Remote { complete, .. } = &mut self.position {
-                    *complete = true;
-                }
-                Ok(None)
+                self.position = CursorPosition::PastEnd { last: Box::new(position) };
+                None
+            }
+        })
+    }
+
+    fn is_split(&self, key: &[u8]) -> bool {
+        self.snapshot.node().cluster().is_split(self.table, key)
+    }
+
+    fn subkey_of<'a>(&self, value: &'a [u8]) -> Result<&'a [u8], DatabaseError> {
+        self.table.subkey_of(value).ok_or_else(|| {
+            DatabaseError::Other(format!("{:?} value shorter than its subkey", self.table))
+        })
+    }
+
+    /// Where a duplicate with encoded `subkey` of a split contract lives.
+    fn split_placement(&self, subkey: &[u8]) -> Option<KeyPlacement> {
+        self.table.subkey_layout().and_then(|layout| layout.placement(subkey))
+    }
+
+    fn split_cursor(&mut self) -> Result<&mut SplitCursor<K>, DatabaseError> {
+        let table = self.table;
+        self.split.as_mut().ok_or_else(|| {
+            DatabaseError::Other(format!("no split cursor to read a split contract of {table:?}"))
+        })
+    }
+
+    /// The duplicate after the local duplicate `value` of split contract `key`: the next local
+    /// duplicate while it stays in the same range, otherwise a search of the following ranges.
+    fn next_local_split<T: Table>(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
+        let subkey = self.subkey_of(value)?;
+        let range = match self.split_placement(subkey) {
+            Some(KeyPlacement::Shard(range)) => range,
+            _ => return self.find_split::<T>(key, subkey, true),
+        };
+        if let Some(next) = self.split_cursor()?.next_dup()?
+            && self.split_placement(self.subkey_of(&next)?) == Some(KeyPlacement::Shard(range))
+        {
+            let row = Self::decode::<T>(key, &next)?;
+            return Ok(Some((row, CursorPosition::LocalSplit { key: key.to_vec(), value: next })));
+        }
+        self.find_split_after_range::<T>(key, range)
+    }
+
+    /// The first duplicate of split contract `key` with subkey `>= start` (`> start` when
+    /// `after`), from `start`'s range on.
+    fn find_split<T: Table>(
+        &mut self,
+        key: &[u8],
+        start: &[u8],
+        after: bool,
+    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
+        let range = Shard(*start.first().ok_or_else(|| self.unsupported("an empty subkey"))?);
+        if let Some(found) = self.find_split_in_range::<T>(key, range, Some((start, after)))? {
+            return Ok(Some(found));
+        }
+        self.find_split_after_range::<T>(key, range)
+    }
+
+    /// The first duplicate of split contract `key` in the first non-empty range after `range`.
+    fn find_split_after_range<T: Table>(
+        &mut self,
+        key: &[u8],
+        range: Shard,
+    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
+        for next in (range.0..=u8::MAX).skip(1) {
+            if let Some(found) = self.find_split_in_range::<T>(key, Shard(next), None)? {
+                return Ok(Some(found));
             }
         }
+        Ok(None)
+    }
+
+    /// The first duplicate of split contract `key` in `range` at or after the bound: replicated
+    /// storage-trie paths first (local), then the range (local when owned, otherwise from an
+    /// owner, whose page ends at the range boundary).
+    fn find_split_in_range<T: Table>(
+        &mut self,
+        key: &[u8],
+        range: Shard,
+        bound: Option<(&[u8], bool)>,
+    ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
+        let layout = self.table.subkey_layout().ok_or_else(|| self.unsupported("a split key"))?;
+        let beyond = |subkey: &[u8]| match bound {
+            None => true,
+            Some((start, true)) => subkey > start,
+            Some((start, false)) => subkey >= start,
+        };
+        for candidate in layout.replicated_keys(range) {
+            if beyond(&candidate)
+                && let Some(value) = self.split_cursor()?.seek_by_key_subkey(key, &candidate)?
+                && value.starts_with(&candidate)
+            {
+                let row = Self::decode::<T>(key, &value)?;
+                return Ok(Some((row, CursorPosition::LocalSplit { key: key.to_vec(), value })));
+            }
+        }
+
+        let floor = layout.shard_floor(range);
+        let (from, after) = match bound {
+            Some((start, after)) if start >= floor.as_slice() => (start.to_vec(), after),
+            _ => (floor, false),
+        };
+        if !self.owns(range) {
+            return self.remote_duplicates::<T>(key.to_vec(), &from, after);
+        }
+        let split = self.split_cursor()?;
+        let mut value = split.seek_by_key_subkey(key, &from)?;
+        if after && value.as_ref().is_some_and(|value| value.starts_with(&from)) {
+            value = split.next_dup()?;
+        }
+        let Some(value) = value else { return Ok(None) };
+        if self.split_placement(self.subkey_of(&value)?) != Some(KeyPlacement::Shard(range)) {
+            return Ok(None);
+        }
+        let row = Self::decode::<T>(key, &value)?;
+        Ok(Some((row, CursorPosition::LocalSplit { key: key.to_vec(), value })))
     }
 
     /// The first entry with key `>= start` (`> start` when `after`), from `start`'s shard on.
-    fn find<K: TransactionKind, T: Table>(
+    fn find<T: Table>(
         &self,
         inner: &mut Cursor<K, T>,
         start: &[u8],
@@ -305,7 +443,7 @@ impl ShardedReads {
     }
 
     /// The first entry of the first non-empty shard after `shard`.
-    fn find_after_shard<K: TransactionKind, T: Table>(
+    fn find_after_shard<T: Table>(
         &self,
         inner: &mut Cursor<K, T>,
         shard: Shard,
@@ -320,7 +458,7 @@ impl ShardedReads {
 
     /// The first entry of `shard` at or after the bound: replicated keys first (local), then
     /// sharded keys (local when owned, otherwise from an owner).
-    fn find_in_shard<K: TransactionKind, T: Table>(
+    fn find_in_shard<T: Table>(
         &self,
         inner: &mut Cursor<K, T>,
         shard: Shard,

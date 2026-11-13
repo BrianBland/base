@@ -11,18 +11,18 @@ use reth_db::{
         ReverseWalker, Walker,
     },
     mdbx::{Error as MdbxError, RW, TransactionKind, cursor::Cursor},
-    table::{DupSort, Encode, IntoVec, Table},
+    table::{Compress, DupSort, Encode, IntoVec, Table},
 };
 
 use crate::{ClusterNode, ShardedReads, ShardedTable};
 
 /// What a [`ClusteredCursor`] does beyond forwarding to MDBX.
 #[derive(Debug)]
-pub enum CursorSharding {
+pub enum CursorSharding<K: TransactionKind> {
     /// Forward everything: the table is not sharded or the database is a pass-through.
     PassThrough,
     /// Route reads: a read-only cursor of a clustered database over a sharded table.
-    Reads(ShardedReads),
+    Reads(ShardedReads<K>),
     /// Drop writes to keys this node does not hold: a read-write cursor of a clustered database
     /// over a sharded table. Reads stay local.
     Writes {
@@ -33,13 +33,22 @@ pub enum CursorSharding {
     },
 }
 
-impl CursorSharding {
-    /// Whether a write of `key` reaches MDBX.
-    pub fn accepts_write<T: Table>(&self, key: &T::Key) -> Result<bool, DatabaseError> {
-        match self {
-            Self::Writes { node, table } => node.holds(*table, &key.clone().encode().into_vec()),
-            Self::PassThrough | Self::Reads(_) => Ok(true),
+impl<K: TransactionKind> CursorSharding<K> {
+    /// Whether a write of `value` under `key` reaches MDBX. The value is encoded only for a split
+    /// contract, whose duplicates are placed by the subkey the encoded value starts with.
+    pub fn accepts_write<T: Table>(
+        &self,
+        key: &T::Key,
+        value: &T::Value,
+    ) -> Result<bool, DatabaseError> {
+        let Self::Writes { node, table } = self else { return Ok(true) };
+        let key = key.clone().encode().into_vec();
+        if !node.cluster().is_split(*table, &key) {
+            return node.holds(*table, &key, &[]);
         }
+        let mut encoded = Vec::new();
+        value.compress_to_buf(&mut encoded);
+        node.holds(*table, &key, table.subkey_of(&encoded).unwrap_or_default())
     }
 }
 
@@ -51,12 +60,12 @@ impl CursorSharding {
 #[derive(Debug)]
 pub struct ClusteredCursor<K: TransactionKind, T: Table> {
     inner: Cursor<K, T>,
-    sharding: CursorSharding,
+    sharding: CursorSharding<K>,
 }
 
 impl<K: TransactionKind, T: Table> ClusteredCursor<K, T> {
     /// Wraps an MDBX cursor.
-    pub const fn new(inner: Cursor<K, T>, sharding: CursorSharding) -> Self {
+    pub const fn new(inner: Cursor<K, T>, sharding: CursorSharding<K>) -> Self {
         Self { inner, sharding }
     }
 }
@@ -219,21 +228,21 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for ClusteredCursor<K, T> 
 
 impl<T: Table> DbCursorRW<T> for ClusteredCursor<RW, T> {
     fn upsert(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
-        if !self.sharding.accepts_write::<T>(&key)? {
+        if !self.sharding.accepts_write::<T>(&key, value)? {
             return Ok(());
         }
         self.inner.upsert(key, value)
     }
 
     fn insert(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
-        if !self.sharding.accepts_write::<T>(&key)? {
+        if !self.sharding.accepts_write::<T>(&key, value)? {
             return Ok(());
         }
         self.inner.insert(key, value)
     }
 
     fn append(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
-        if !self.sharding.accepts_write::<T>(&key)? {
+        if !self.sharding.accepts_write::<T>(&key, value)? {
             return Ok(());
         }
         self.inner.append(key, value)
@@ -250,7 +259,7 @@ impl<T: DupSort> DbDupCursorRW<T> for ClusteredCursor<RW, T> {
     }
 
     fn append_dup(&mut self, key: T::Key, value: T::Value) -> Result<(), DatabaseError> {
-        if !self.sharding.accepts_write::<T>(&key)? {
+        if !self.sharding.accepts_write::<T>(&key, &value)? {
             return Ok(());
         }
         self.inner.append_dup(key, value)

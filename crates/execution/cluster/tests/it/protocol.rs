@@ -42,6 +42,7 @@ fn cluster_of(
             retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
             nodes,
             apply_from: Vec::new(),
+            split_storage: Vec::new(),
         })
         .unwrap(),
     )

@@ -73,6 +73,7 @@ pub(crate) fn cluster(node_id: u64) -> Arc<Cluster> {
             retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
             nodes,
             apply_from: Vec::new(),
+            split_storage: Vec::new(),
         })
         .unwrap(),
     )
@@ -109,6 +110,9 @@ pub(crate) struct KeyUniverse {
     pub(crate) slots: Vec<B256>,
     pub(crate) account_paths: Vec<Nibbles>,
     pub(crate) storage_paths: Vec<Nibbles>,
+    /// Contracts whose storage is split, read through their own checks; empty unless a test
+    /// sets them, and never written by [`random_updates`].
+    pub(crate) split_contracts: Vec<B256>,
 }
 
 impl KeyUniverse {
@@ -148,11 +152,12 @@ impl KeyUniverse {
             slots,
             account_paths: account_paths.into_iter().collect(),
             storage_paths,
+            split_contracts: Vec::new(),
         }
     }
 }
 
-fn random_node(rng: &mut StdRng) -> BranchNodeCompact {
+pub(crate) fn random_node(rng: &mut StdRng) -> BranchNodeCompact {
     let state_mask: u16 = rng.random_range(1..=u16::MAX);
     let tree_mask = state_mask & rng.random::<u16>();
     let hash_mask = state_mask & rng.random::<u16>();
@@ -237,8 +242,9 @@ pub(crate) fn random_updates(rng: &mut StdRng, keys: &KeyUniverse) -> BlockUpdat
 }
 
 /// `updates` restricted to the keys `cluster`'s node holds, as that node would persist them.
+/// `cluster` splits no contract, so storage is placed by address.
 pub(crate) fn held_by(cluster: &Cluster, updates: &BlockUpdates) -> BlockUpdates {
-    let holds = |table, key: &[u8]| cluster.holds(table, key).unwrap();
+    let holds = |table, key: &[u8]| cluster.holds(table, key, &[]).unwrap();
     let hashed = &updates.hashed_state;
     let accounts = hashed
         .accounts

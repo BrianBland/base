@@ -107,7 +107,7 @@ impl ClusterClient {
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, ClientError> {
         let query = Query::Get { key: key.to_vec() };
-        match self.read(Request { snapshot, table, query }, key)? {
+        match self.read(Request { snapshot, table, query }, Self::key_shard(table, key)?)? {
             Response::Value(value) => Ok(value),
             Response::Entries(_) | Response::Duplicates(_) | Response::ExecutedBlock(_) => {
                 unreachable!("checked by read")
@@ -124,7 +124,7 @@ impl ClusterClient {
         limit: u32,
     ) -> Result<ShardEntries, ClientError> {
         let query = Query::SeekGe { key: key.to_vec(), limit };
-        match self.read(Request { snapshot, table, query }, key)? {
+        match self.read(Request { snapshot, table, query }, Self::key_shard(table, key)?)? {
             Response::Entries(entries) => Ok(entries),
             Response::Value(_) | Response::Duplicates(_) | Response::ExecutedBlock(_) => {
                 unreachable!("checked by read")
@@ -132,7 +132,8 @@ impl ClusterClient {
         }
     }
 
-    /// Up to `limit` duplicate values of `key` with subkey `>= subkey`, as of `snapshot`.
+    /// Up to `limit` duplicate values of `key` with subkey `>= subkey`, as of `snapshot`. For a
+    /// split contract the owners of the subkey's range answer, within that range only.
     pub fn seek_dup_ge(
         &self,
         snapshot: SnapshotId,
@@ -141,8 +142,14 @@ impl ClusterClient {
         subkey: &[u8],
         limit: u32,
     ) -> Result<DuplicateValues, ClientError> {
+        let shard = if self.cluster.is_split(table, key) {
+            self.cluster.placement(table, key, subkey).ok_or(ClientError::InvalidKey)?;
+            Shard(subkey[0])
+        } else {
+            Self::key_shard(table, key)?
+        };
         let query = Query::SeekDupGe { key: key.to_vec(), subkey: subkey.to_vec(), limit };
-        match self.read(Request { snapshot, table, query }, key)? {
+        match self.read(Request { snapshot, table, query }, shard)? {
             Response::Duplicates(values) => Ok(values),
             Response::Value(_) | Response::Entries(_) | Response::ExecutedBlock(_) => {
                 unreachable!("checked by read")
@@ -237,13 +244,15 @@ impl ClusterClient {
         Ok(result)
     }
 
-    /// Sends `request` to the owners of `key`'s shard until one answers with the response kind
-    /// the query expects.
-    fn read(&self, request: Request, key: &[u8]) -> Result<Response, ClientError> {
-        if request.table.placement(key).is_none() {
-            return Err(ClientError::InvalidKey);
-        }
-        let shard = Shard(key[0]);
+    /// The shard whose owners serve encoded `key` of `table`: the shard of its first byte.
+    fn key_shard(table: ShardedTable, key: &[u8]) -> Result<Shard, ClientError> {
+        table.placement(key).ok_or(ClientError::InvalidKey)?;
+        Ok(Shard(key[0]))
+    }
+
+    /// Sends `request` to the owners of `shard` until one answers with the response kind the
+    /// query expects.
+    fn read(&self, request: Request, shard: Shard) -> Result<Response, ClientError> {
         let owners: Vec<_> = self
             .cluster
             .owners(shard)

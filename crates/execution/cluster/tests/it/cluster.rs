@@ -1,5 +1,6 @@
 //! Clustered databases: a seeded differential test of five clustered nodes against a full
-//! reference MDBX, the write rule, the commit guard, and shedding.
+//! reference MDBX, with and without a split contract, the write rule, the commit guard, and
+//! shedding.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -9,10 +10,10 @@ use std::{
     time::Duration,
 };
 
-use alloy_primitives::{B256, U256, keccak256};
+use alloy_primitives::{B256, Bytes, U256, keccak256, map::B256Map};
 use base_execution_cluster::{
-    BlockUpdates, ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, NodeConfig, NodeId,
-    ReadSnapshot, Shard, ShardedTable,
+    BlockUpdates, ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, KeyPlacement,
+    NodeConfig, NodeId, ReadSnapshot, Shard, ShardedTable,
 };
 use rand::{Rng, rngs::StdRng};
 use reth_chainspec::MAINNET;
@@ -25,7 +26,7 @@ use reth_db_api::{
     tables::{self, RawDupSort, RawKey, RawTable},
     transaction::{DbTx, DbTxMut},
 };
-use reth_primitives_traits::{Account, Bytecode};
+use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_provider::{
     DatabaseProviderRW, ProviderFactory, StageCheckpointWriter, StateWriter, StorageSettingsCache,
     TrieWriter,
@@ -34,15 +35,18 @@ use reth_provider::{
 };
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_trie::{
-    BranchNodeCompact, HashedPostStateSorted, HashedStorageSorted, Nibbles, PackedStoredNibbles,
-    hashed_cursor::{HashedCursor, HashedCursorFactory},
+    BranchNodeCompact, HashedPostStateSorted, HashedStorageSorted, Nibbles, PackedStorageTrieEntry,
+    PackedStoredNibbles,
+    hashed_cursor::{HashedCursor, HashedCursorFactory, HashedStorageCursor},
     trie_cursor::{TrieCursor, TrieCursorFactory},
+    updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
 };
 use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseTrieCursorFactory, PackedKeyAdapter};
 use tempfile::TempDir;
 
 use crate::common::{
-    KeyUniverse, TableDump, block_hash, canonical, factory, packed, random_updates, rng,
+    KeyUniverse, TableDump, block_hash, canonical, factory, packed, random_node, random_updates,
+    rng,
 };
 
 /// Blocks applied while every node runs, and after one storing node stops.
@@ -114,7 +118,9 @@ impl Node {
     }
 }
 
-fn cluster_view(node_id: u64, addresses: &[std::net::SocketAddr]) -> Arc<Cluster> {
+/// Node `node_id`'s view of the five-node cluster, splitting the storage of `split` (hashed
+/// addresses).
+fn cluster_view(node_id: u64, addresses: &[std::net::SocketAddr], split: &[B256]) -> Arc<Cluster> {
     let nodes = (1..=NODES)
         .zip(addresses)
         .map(|(id, address)| NodeConfig { id: NodeId(id), address: *address, storage: id < NODES })
@@ -126,6 +132,10 @@ fn cluster_view(node_id: u64, addresses: &[std::net::SocketAddr]) -> Arc<Cluster
             retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
             nodes,
             apply_from: Vec::new(),
+            split_storage: split
+                .iter()
+                .map(|hash| Bytes::copy_from_slice(hash.as_slice()))
+                .collect(),
         })
         .unwrap(),
     )
@@ -135,10 +145,16 @@ fn options() -> ClientOptions {
     ClientOptions { retry_for: Duration::from_millis(100), ..Default::default() }
 }
 
+/// Largest size of a node's MDBX. Each environment reserves this much address space, and the
+/// tests open dozens at once.
+const NODE_DB_MAX_SIZE: usize = 1 << 30;
+
 /// An MDBX environment holding the full state of `initial`, written through a pass-through
 /// database.
 fn populated_env(dir: &Path, initial: &[Block]) -> DatabaseEnv {
-    let env = init_db(dir.join("db"), DatabaseArguments::new(ClientVersion::default())).unwrap();
+    let arguments = DatabaseArguments::new(ClientVersion::default())
+        .with_geometry_max_size(Some(NODE_DB_MAX_SIZE));
+    let env = init_db(dir.join("db"), arguments).unwrap();
     let populate = provider_factory(ClusteredDatabase::new(env.clone()), &dir.join("populate"));
     persist(populate.provider_rw().unwrap(), initial);
     env
@@ -224,11 +240,13 @@ fn check_ordered<T: Table>(
     }
 }
 
-/// Point reads and per-key duplicate walks of duplicate-key table `T` through `tx`.
+/// Point reads, per-key duplicate walks, and `seeks` walks from a random subkey per key of
+/// duplicate-key table `T` through `tx`.
 fn check_duplicates<T: DupSort>(
     tx: &impl DbTx,
     expected: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
     keys: &[B256],
+    seeks: usize,
     rng: &mut StdRng,
     context: &str,
 ) {
@@ -248,25 +266,31 @@ fn check_duplicates<T: DupSort>(
         assert_eq!(walked, want, "{context}: walk_dup {table:?} of {key}");
 
         let subkey_len = table.subkey_len();
-        let subkey = match want.get(rng.random_range(0..=want.len())) {
-            Some(value) if rng.random_bool(0.5) => value[..subkey_len].to_vec(),
-            _ if table == ShardedTable::StoragesTrie => {
-                let len = rng.random_range(1..6);
-                let nibbles = (0..len).map(|_| rng.random_range(0..16u8)).collect::<Vec<_>>();
-                packed(Nibbles::from_nibbles(nibbles))
+        for _ in 0..seeks {
+            let subkey = match want.get(rng.random_range(0..=want.len())) {
+                Some(value) if rng.random_bool(0.5) => value[..subkey_len].to_vec(),
+                _ if table == ShardedTable::StoragesTrie => {
+                    let len = rng.random_range(1..6);
+                    let nibbles = (0..len).map(|_| rng.random_range(0..16u8)).collect::<Vec<_>>();
+                    packed(Nibbles::from_nibbles(nibbles))
+                }
+                _ => rng.random::<[u8; 32]>().to_vec(),
+            };
+            let mut seen = Vec::new();
+            let mut value = cursor
+                .seek_by_key_subkey(raw_key.clone(), RawKey::from_vec(subkey.clone()))
+                .unwrap();
+            while let Some(found) = value {
+                seen.push(found.into_value());
+                value = cursor.next_dup_val().unwrap();
             }
-            _ => rng.random::<[u8; 32]>().to_vec(),
-        };
-        let mut seen = Vec::new();
-        let mut value =
-            cursor.seek_by_key_subkey(raw_key.clone(), RawKey::from_vec(subkey.clone())).unwrap();
-        while let Some(found) = value {
-            seen.push(found.into_value());
-            value = cursor.next_dup_val().unwrap();
+            let want_from: Vec<_> =
+                want.iter().filter(|value| value[..subkey_len] >= subkey[..]).cloned().collect();
+            assert_eq!(
+                seen, want_from,
+                "{context}: seek_by_key_subkey {table:?} of {key} from {subkey:02x?}"
+            );
         }
-        let want_from: Vec<_> =
-            want.iter().filter(|value| value[..subkey_len] >= subkey[..]).cloned().collect();
-        assert_eq!(seen, want_from, "{context}: seek_by_key_subkey {table:?} of {key}");
     }
 }
 
@@ -284,20 +308,25 @@ fn check_node(
     let tx = db.tx().unwrap();
     check_ordered::<tables::HashedAccounts>(&tx, &dump.hashed_accounts, rng, shards, context);
     check_ordered::<tables::PackedAccountsTrie>(&tx, &dump.accounts_trie, rng, shards, context);
-    check_duplicates::<tables::HashedStorages>(
-        &tx,
-        &dump.hashed_storages,
-        &keys.addresses,
-        rng,
-        context,
-    );
-    check_duplicates::<tables::PackedStoragesTrie>(
-        &tx,
-        &dump.storages_trie,
-        &keys.addresses,
-        rng,
-        context,
-    );
+    let split = keys.split_contracts.as_slice();
+    for (contracts, seeks) in [(keys.addresses.as_slice(), 1), (split, SPLIT_SEEKS)] {
+        check_duplicates::<tables::HashedStorages>(
+            &tx,
+            &dump.hashed_storages,
+            contracts,
+            seeks,
+            rng,
+            context,
+        );
+        check_duplicates::<tables::PackedStoragesTrie>(
+            &tx,
+            &dump.storages_trie,
+            contracts,
+            seeks,
+            rng,
+            context,
+        );
+    }
 
     // reth's own readers over the clustered transaction.
     let hashed = DatabaseHashedCursorFactory::new(&tx);
@@ -345,6 +374,9 @@ fn check_node(
             .map(|v| BranchNodeCompact::decompress(v).unwrap());
         assert_eq!(found, want, "{context}: reth account trie seek_exact {path:?}");
     }
+    for contract in split {
+        check_storage_cursors(&tx, dump, *contract, rng, context);
+    }
 
     if let Some(latest) = latest_codes {
         for (hash, latest_code) in &latest.bytecodes {
@@ -364,7 +396,245 @@ fn check_node(
     }
 }
 
-/// Every key in `env`'s sharded tables is held by `cluster`'s node.
+/// Seeks per check from a random subkey of a split contract, so that some land in empty ranges.
+const SPLIT_SEEKS: usize = 6;
+
+/// reth's storage and storage-trie cursors over `contract` through `tx` read like `dump`.
+fn check_storage_cursors(
+    tx: &impl DbTx,
+    dump: &TableDump,
+    contract: B256,
+    rng: &mut StdRng,
+    context: &str,
+) {
+    let slots: Vec<(B256, U256)> = dump
+        .hashed_storages
+        .get(contract.as_slice())
+        .into_iter()
+        .flatten()
+        .map(|value| {
+            let entry = StorageEntry::decompress(value).unwrap();
+            (entry.key, entry.value)
+        })
+        .collect();
+    let hashed = DatabaseHashedCursorFactory::new(tx);
+    let mut storage = hashed.hashed_storage_cursor(contract).unwrap();
+    assert_eq!(storage.is_storage_empty().unwrap(), slots.is_empty(), "{context}: storage empty");
+    let mut read = Vec::new();
+    let mut entry = storage.seek(B256::ZERO).unwrap();
+    while let Some(found) = entry {
+        read.push(found);
+        entry = storage.next().unwrap();
+    }
+    assert_eq!(read, slots, "{context}: reth storage cursor of {contract}");
+    for _ in 0..SPLIT_SEEKS {
+        let from = B256::from(rng.random::<[u8; 32]>());
+        let found = storage.seek(from).unwrap();
+        let want = slots.iter().find(|(slot, _)| *slot >= from).copied();
+        assert_eq!(found, want, "{context}: reth storage seek {from} of {contract}");
+    }
+
+    let nodes: Vec<(Nibbles, BranchNodeCompact)> = dump
+        .storages_trie
+        .get(contract.as_slice())
+        .into_iter()
+        .flatten()
+        .map(|value| {
+            let entry = PackedStorageTrieEntry::decompress(value).unwrap();
+            (entry.nibbles.0, entry.node)
+        })
+        .collect();
+    let trie = DatabaseTrieCursorFactory::<_, PackedKeyAdapter>::new(tx);
+    let mut storage_trie = trie.storage_trie_cursor(contract).unwrap();
+    let mut read = Vec::new();
+    let mut entry = storage_trie.seek(Nibbles::default()).unwrap();
+    while let Some(found) = entry {
+        read.push(found);
+        entry = storage_trie.next().unwrap();
+    }
+    assert_eq!(read, nodes, "{context}: reth storage trie cursor of {contract}");
+    for (path, node) in &nodes {
+        let found = storage_trie.seek_exact(*path).unwrap();
+        assert_eq!(found.as_ref(), Some(&(*path, node.clone())), "{context}: seek_exact {path:?}");
+    }
+}
+
+/// Slots of the split contract spread over all ranges.
+const SPREAD_SLOTS: usize = 300;
+/// Slots, and storage-trie paths, crowded into one range: more than a remote page.
+const CROWDED: usize = ReadSnapshot::PAGE_LEN as usize + 16;
+/// The range crowded slots and paths are in.
+const CROWDED_RANGE: u8 = 0x5a;
+/// Storage-trie paths of two to five nibbles spread over all ranges.
+const SPREAD_PATHS: usize = 120;
+
+/// A large contract whose storage is split: slots in most ranges and none in some, one range
+/// holding more than a remote page, and storage-trie nodes one nibble deep (replicated; the root
+/// path is never stored), two nibbles deep and deeper.
+#[derive(Debug, Clone)]
+struct DenseContract {
+    address: B256,
+    slots: Vec<B256>,
+    paths: Vec<Nibbles>,
+}
+
+impl DenseContract {
+    fn new(rng: &mut StdRng) -> Self {
+        let address = B256::from(rng.random::<[u8; 32]>());
+        let mut slots = BTreeSet::new();
+        while slots.len() < SPREAD_SLOTS {
+            slots.insert(B256::from(rng.random::<[u8; 32]>()));
+        }
+        while slots.len() < SPREAD_SLOTS + CROWDED {
+            let mut slot = B256::from(rng.random::<[u8; 32]>());
+            slot.0[0] = CROWDED_RANGE;
+            slots.insert(slot);
+        }
+        let mut paths: BTreeSet<_> =
+            (0..16u8).map(|nibble| Nibbles::from_nibbles([nibble])).collect();
+        let mut random_path =
+            |rng: &mut StdRng, prefix: &[u8], extra: std::ops::RangeInclusive<usize>| {
+                let mut nibbles = prefix.to_vec();
+                nibbles.extend((0..rng.random_range(extra)).map(|_| rng.random_range(0..16u8)));
+                paths.insert(Nibbles::from_nibbles(nibbles));
+                paths.len()
+            };
+        while random_path(rng, &[], 2..=5) < 16 + SPREAD_PATHS {}
+        let crowded = [CROWDED_RANGE >> 4, CROWDED_RANGE & 0xf];
+        while random_path(rng, &crowded, 1..=3) < 16 + SPREAD_PATHS + CROWDED {}
+        Self { address, slots: slots.into_iter().collect(), paths: paths.into_iter().collect() }
+    }
+
+    /// Every slot and trie node written: the contract's state at genesis.
+    fn genesis(&self, rng: &mut StdRng) -> BlockUpdates {
+        let slots = self
+            .slots
+            .iter()
+            .map(|slot| (*slot, U256::from(rng.random_range(1..u64::MAX))))
+            .collect();
+        let nodes = self.paths.iter().map(|path| (*path, Some(random_node(rng)))).collect();
+        self.updates(slots, nodes)
+    }
+
+    /// One block's changes: about a tenth of the slots and trie nodes rewritten, a third of them
+    /// deleted. Deleted ones come back in later blocks as new slots and nodes.
+    fn random(&self, rng: &mut StdRng) -> BlockUpdates {
+        let mut slots = Vec::new();
+        for slot in &self.slots {
+            if rng.random_bool(0.1) {
+                let deleted = rng.random_bool(0.3);
+                let value =
+                    if deleted { U256::ZERO } else { U256::from(rng.random_range(1..u64::MAX)) };
+                slots.push((*slot, value));
+            }
+        }
+        let mut nodes = Vec::new();
+        for path in &self.paths {
+            if rng.random_bool(0.1) {
+                nodes.push((*path, (!rng.random_bool(0.3)).then(|| random_node(rng))));
+            }
+        }
+        self.updates(slots, nodes)
+    }
+
+    fn updates(
+        &self,
+        storage_slots: Vec<(B256, U256)>,
+        storage_nodes: Vec<(Nibbles, Option<BranchNodeCompact>)>,
+    ) -> BlockUpdates {
+        let storage = HashedStorageSorted { storage_slots };
+        let trie = StorageTrieUpdatesSorted { storage_nodes };
+        BlockUpdates {
+            hashed_state: Arc::new(HashedPostStateSorted::new(
+                Vec::new(),
+                std::iter::once((self.address, storage)).collect(),
+            )),
+            trie_updates: Arc::new(TrieUpdatesSorted::new(
+                Vec::new(),
+                std::iter::once((self.address, trie)).collect(),
+            )),
+        }
+    }
+}
+
+/// `updates` with the storage and storage-trie changes of `extra` added; `extra`'s win for a
+/// contract in both.
+fn with_storage(updates: &BlockUpdates, extra: &BlockUpdates) -> BlockUpdates {
+    let mut storages = updates.hashed_state.storages.clone();
+    storages.extend(extra.hashed_state.storages.iter().map(|(k, v)| (*k, v.clone())));
+    let mut tries: B256Map<_> = updates.trie_updates.storage_tries_ref().clone();
+    tries.extend(extra.trie_updates.storage_tries_ref().iter().map(|(k, v)| (*k, v.clone())));
+    BlockUpdates {
+        hashed_state: Arc::new(HashedPostStateSorted::new(
+            updates.hashed_state.accounts.clone(),
+            storages,
+        )),
+        trie_updates: Arc::new(TrieUpdatesSorted::new(
+            updates.trie_updates.account_nodes_ref().to_vec(),
+            tries,
+        )),
+    }
+}
+
+/// Raw rows of one duplicate-key table in a dump.
+type DuplicateRows = fn(&TableDump) -> &BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
+
+/// After shed, the rows of split `contract` on each node are exactly those placement gives it:
+/// every storing node holds some but not all of its sharded rows (about `R/N`), every node holds
+/// its replicated paths, and every row of `reference` is on exactly `R` storing nodes (on every
+/// node when replicated) and nowhere else.
+fn assert_split_spread(nodes: &[Node], reference: &TableDump, contract: B256) {
+    let cluster = nodes[0].db.cluster().unwrap().cluster();
+    let replication = cluster.config().replication;
+    let dumps: Vec<_> =
+        nodes.iter().map(|node| TableDump::read_tx(&node.env.tx().unwrap())).collect();
+    let tables: [(ShardedTable, DuplicateRows); 2] = [
+        (ShardedTable::HashedStorages, |dump| &dump.hashed_storages),
+        (ShardedTable::StoragesTrie, |dump| &dump.storages_trie),
+    ];
+    for (table, rows) in tables {
+        let rows_of = |dump: &TableDump| -> BTreeSet<Vec<u8>> {
+            rows(dump).get(contract.as_slice()).into_iter().flatten().cloned().collect()
+        };
+        let want = rows_of(reference);
+        let placement = |row: &Vec<u8>| {
+            cluster.placement(table, contract.as_slice(), table.subkey_of(row).unwrap()).unwrap()
+        };
+        let sharded = want.iter().filter(|row| placement(row) != KeyPlacement::Replicated).count();
+        assert!(sharded > 100, "{table:?}: {sharded} sharded rows");
+        let held: Vec<_> = dumps.iter().map(rows_of).collect();
+        for (node, rows) in nodes.iter().zip(&held) {
+            assert!(
+                rows.is_subset(&want),
+                "{table:?}: node {} holds rows not in the reference",
+                node.id
+            );
+            let own = rows.iter().filter(|row| placement(row) != KeyPlacement::Replicated).count();
+            if node.storing() {
+                assert!(
+                    sharded / 4 < own && own < sharded * 3 / 4,
+                    "{table:?}: node {} holds {own} of {sharded} rows",
+                    node.id
+                );
+            } else {
+                assert_eq!(own, 0, "{table:?}: node {} stores nothing", node.id);
+            }
+        }
+        for row in &want {
+            let copies = held.iter().filter(|rows| rows.contains(row)).count();
+            let expected = match placement(row) {
+                KeyPlacement::Replicated => nodes.len(),
+                KeyPlacement::Shard(_) => replication,
+            };
+            assert_eq!(copies, expected, "{table:?}: copies of {row:02x?}");
+        }
+        if table == ShardedTable::StoragesTrie {
+            assert!(want.iter().any(|row| placement(row) == KeyPlacement::Replicated));
+        }
+    }
+}
+
+/// Every row in `env`'s sharded tables is held by `cluster`'s node.
 fn assert_holds_only_own_keys(env: &DatabaseEnv, cluster: &Cluster, context: &str) -> usize {
     let tx = env.tx().unwrap();
     let mut keys = 0;
@@ -375,25 +645,33 @@ fn assert_holds_only_own_keys(env: &DatabaseEnv, cluster: &Cluster, context: &st
         (ShardedTable::StoragesTrie, raw_walk::<tables::PackedStoragesTrie>(&tx)),
         (ShardedTable::Bytecodes, raw_walk::<tables::Bytecodes>(&tx)),
     ] {
-        for (key, _) in entries {
-            assert_eq!(cluster.holds(table, &key), Some(true), "{context}: {table:?} {key:02x?}");
+        for (key, value) in entries {
+            let subkey = table.subkey_of(&value).unwrap();
+            let held = cluster.holds(table, &key, subkey);
+            assert_eq!(held, Some(true), "{context}: {table:?} {key:02x?} {subkey:02x?}");
             keys += 1;
         }
     }
     keys
 }
 
-/// Runs the cluster differential test. Nodes listed in `unshed` never shed.
-fn run_cluster(seed: u64, unshed: &[u64]) {
+/// Runs the cluster differential test, with a split contract when `split`. Nodes listed in
+/// `unshed` never shed.
+fn run_cluster(seed: u64, unshed: &[u64], split: bool) {
     let mut rng = rng(seed);
     let mut shards: BTreeSet<Shard> = [0x00, 0x10, 0x11, 0x7f, 0xf0, 0xff].map(Shard).into();
     shards.extend((0..10).map(|_| Shard(rng.random())));
     let shards: Vec<_> = shards.into_iter().collect();
-    let keys = KeyUniverse::new(&mut rng, &shards);
-    let new_block = |rng: &mut StdRng, number: u64| Block {
-        number,
-        updates: random_updates(rng, &keys),
-        codes: random_codes(rng),
+    let mut keys = KeyUniverse::new(&mut rng, &shards);
+    let dense = split.then(|| DenseContract::new(&mut rng));
+    keys.split_contracts = dense.iter().map(|dense| dense.address).collect();
+    let new_block = |rng: &mut StdRng, number: u64| {
+        let mut updates = random_updates(rng, &keys);
+        if let Some(dense) = &dense {
+            let extra = if number == 0 { dense.genesis(rng) } else { dense.random(rng) };
+            updates = with_storage(&updates, &extra);
+        }
+        Block { number, updates, codes: random_codes(rng) }
     };
 
     let genesis = new_block(&mut rng, 0);
@@ -408,7 +686,7 @@ fn run_cluster(seed: u64, unshed: &[u64]) {
         .map(|(id, listener)| {
             let dir = TempDir::new().unwrap();
             let env = populated_env(dir.path(), std::slice::from_ref(&genesis));
-            let cluster = cluster_view(id, &addresses);
+            let cluster = cluster_view(id, &addresses, &keys.split_contracts);
             let db =
                 ClusteredDatabase::clustered(env.clone(), cluster, listener, options()).unwrap();
             let node = db.cluster().unwrap();
@@ -430,6 +708,11 @@ fn run_cluster(seed: u64, unshed: &[u64]) {
             }
         })
         .collect();
+    if let Some(dense) = &dense
+        && unshed.is_empty()
+    {
+        assert_split_spread(&nodes, &history[0], dense.address);
+    }
 
     let check_all = |nodes: &[Node], history: &[TableDump], rng: &mut StdRng, label: &str| {
         let codes_tip = nodes.iter().filter(|n| n.storing()).map(|n| n.persisted).min().unwrap();
@@ -490,9 +773,9 @@ fn run_cluster(seed: u64, unshed: &[u64]) {
         let context = format!("seed {seed}, node {}", node.id);
         if unshed.contains(&node.id) {
             let tx = node.env.tx().unwrap();
-            let stale = raw_walk::<tables::HashedAccounts>(&tx)
-                .iter()
-                .any(|(key, _)| cluster.holds(ShardedTable::HashedAccounts, key) == Some(false));
+            let stale = raw_walk::<tables::HashedAccounts>(&tx).iter().any(|(key, _)| {
+                cluster.holds(ShardedTable::HashedAccounts, key, &[]) == Some(false)
+            });
             assert!(stale, "{context}: an unshed node keeps keys it does not hold");
         } else {
             assert_holds_only_own_keys(&node.env, cluster, &context);
@@ -503,13 +786,20 @@ fn run_cluster(seed: u64, unshed: &[u64]) {
 #[test]
 fn clustered_nodes_read_like_a_full_database() {
     for seed in [1, 2] {
-        run_cluster(seed, &[]);
+        run_cluster(seed, &[], false);
     }
 }
 
 #[test]
 fn unshed_nodes_read_like_shed_nodes() {
-    run_cluster(3, &[2, 5]);
+    run_cluster(3, &[2, 5], false);
+}
+
+/// Shed and unshed nodes, one after the other to bound how many nodes run at once.
+#[test]
+fn split_contracts_spread_over_nodes_and_read_like_a_full_database() {
+    run_cluster(4, &[], true);
+    run_cluster(5, &[2, 5], true);
 }
 
 /// One node of the five-node layout over a fully populated database, with its peers down.
@@ -532,7 +822,7 @@ fn lone_node(id: u64, seed: u64) -> (ClusteredDatabase, DatabaseEnv, TableDump, 
     let listener = listeners.into_iter().nth(id as usize - 1).unwrap();
     let db = ClusteredDatabase::clustered(
         env.clone(),
-        cluster_view(id, &addresses),
+        cluster_view(id, &addresses, &[]),
         listener,
         options(),
     )
@@ -545,7 +835,7 @@ fn shed_deletes_exactly_the_keys_this_node_does_not_hold_and_is_idempotent() {
     let (db, env, full, _dir) = lone_node(2, 7);
     let node = db.cluster().unwrap();
     let cluster = node.cluster();
-    let held = |table, key: &Vec<u8>| cluster.holds(table, key) == Some(true);
+    let held = |table, key: &Vec<u8>| cluster.holds(table, key, &[]) == Some(true);
 
     assert_eq!(node.shed_batch(5).unwrap(), 5, "a batch deletes at most its row budget");
     let deleted = 5 + node.shed().unwrap();
@@ -682,16 +972,20 @@ fn remote_walks_continue_across_pages() {
         let dir = TempDir::new().unwrap();
         let env = populated_env(dir.path(), std::slice::from_ref(&block));
         let listener = listeners[id as usize - 1].take().unwrap();
-        let db =
-            ClusteredDatabase::clustered(env, cluster_view(id, &addresses), listener, options())
-                .unwrap();
+        let db = ClusteredDatabase::clustered(
+            env,
+            cluster_view(id, &addresses, &[]),
+            listener,
+            options(),
+        )
+        .unwrap();
         let node = db.cluster().unwrap();
         node.shed().unwrap();
         assert!(node.install_block_hashes(Box::new(|number| Some(block_hash(0, number)))));
         assert!(node.register_persistence_point().unwrap().is_some());
         (db, dir)
     };
-    let owner = cluster_view(NODES, &addresses).owners(shard)[0];
+    let owner = cluster_view(NODES, &addresses, &[]).owners(shard)[0];
     let (_owner, _owner_dir) = start_node(owner.0);
     // Node 5 stores nothing, so it reads every sharded key from an owner.
     let (reader, _reader_dir) = start_node(NODES);

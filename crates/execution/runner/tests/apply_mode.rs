@@ -119,8 +119,8 @@ struct TestNode {
 }
 
 impl TestNode {
-    /// Launches node `node_id` of `nodes`, serving peers on `listener` and applying from
-    /// `apply_from`.
+    /// Launches node `node_id` of `nodes`, serving peers on `listener`, applying from
+    /// `apply_from` and splitting the storage of the `split_storage` contracts.
     async fn launch(
         runtime: &Runtime,
         chain_spec: &Arc<BaseChainSpec>,
@@ -128,6 +128,7 @@ impl TestNode {
         nodes: &[ClusterNodeConfig],
         listener: TcpListener,
         apply_from: Vec<NodeId>,
+        split_storage: Vec<Bytes>,
     ) -> Result<Self> {
         let network = NetworkArgs {
             discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
@@ -154,6 +155,7 @@ impl TestNode {
             retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
             nodes: nodes.to_vec(),
             apply_from,
+            split_storage,
         })?;
         let db = ClusteredDatabase::clustered(
             env.clone(),
@@ -392,9 +394,11 @@ async fn applied_chain_matches_the_executed_chain() -> Result<()> {
     let nodes = three_nodes([executor_address, apply_address, bound()?.1]);
     let runtime = Runtime::test();
     let executor =
-        TestNode::launch(&runtime, &chain_spec, 1, &nodes, executor_listener, vec![]).await?;
+        TestNode::launch(&runtime, &chain_spec, 1, &nodes, executor_listener, vec![], vec![])
+            .await?;
     let applier =
-        TestNode::launch(&runtime, &chain_spec, 2, &nodes, apply_listener, vec![NodeId(1)]).await?;
+        TestNode::launch(&runtime, &chain_spec, 2, &nodes, apply_listener, vec![NodeId(1)], vec![])
+            .await?;
 
     for _ in 0..BLOCKS {
         let envelope = executor.build_next().await?;
@@ -433,7 +437,8 @@ async fn applied_chain_matches_the_executed_chain() -> Result<()> {
 
 /// A stateless apply node (`storage = false`, owning no shard) ends with the executing node's
 /// head, receipts, changesets and state as its provider reads it, while its own sharded tables
-/// hold only the replicated account-trie paths.
+/// hold only the replicated account-trie paths and the replicated storage-trie paths of
+/// [`STORAGE_CONTRACT`], whose storage is split on every node.
 #[tokio::test(flavor = "multi_thread")]
 async fn stateless_apply_node_matches_the_executed_chain() -> Result<()> {
     base_node_runner::test_utils::init_silenced_tracing();
@@ -442,10 +447,20 @@ async fn stateless_apply_node_matches_the_executed_chain() -> Result<()> {
     let (apply_listener, apply_address) = bound()?;
     let nodes = three_nodes([executor_address, bound()?.1, apply_address]);
     let runtime = Runtime::test();
+    let split = || vec![Bytes::copy_from_slice(STORAGE_CONTRACT.as_slice())];
     let executor =
-        TestNode::launch(&runtime, &chain_spec, 1, &nodes, executor_listener, vec![]).await?;
-    let applier =
-        TestNode::launch(&runtime, &chain_spec, 3, &nodes, apply_listener, vec![NodeId(1)]).await?;
+        TestNode::launch(&runtime, &chain_spec, 1, &nodes, executor_listener, vec![], split())
+            .await?;
+    let applier = TestNode::launch(
+        &runtime,
+        &chain_spec,
+        3,
+        &nodes,
+        apply_listener,
+        vec![NodeId(1)],
+        split(),
+    )
+    .await?;
 
     for _ in 0..BLOCKS {
         let envelope = executor.build_next().await?;
@@ -466,16 +481,18 @@ async fn stateless_apply_node_matches_the_executed_chain() -> Result<()> {
     assert!(state.iter().any(|read| read.ends_with(": Some(1)")), "no written slot read");
     assert_eq!(applier.touched_state()?, state);
 
+    let split_contract = keccak256(STORAGE_CONTRACT);
+    // A packed trie path is 32 bytes of nibbles and then the nibble count.
+    let short_path = |path: &[u8]| path.get(32).is_some_and(|len| *len < 2);
     let replicated_only = |(name, rows): TableDump| -> TableDump {
         if name == "AccountsTrie" {
-            (
-                name,
-                rows.into_iter()
-                    .filter(|(key, _)| key.last().is_some_and(|len| *len < 2))
-                    .collect(),
-            )
-        } else if ["HashedAccounts", "HashedStorages", "StoragesTrie", "Bytecodes"].contains(&name)
-        {
+            (name, rows.into_iter().filter(|(key, _)| short_path(key)).collect())
+        } else if name == "StoragesTrie" {
+            let replicated = |(key, value): &(Vec<u8>, Vec<u8>)| {
+                key.as_slice() == split_contract.as_slice() && short_path(value)
+            };
+            (name, rows.into_iter().filter(replicated).collect())
+        } else if ["HashedAccounts", "HashedStorages", "Bytecodes"].contains(&name) {
             (name, Vec::new())
         } else {
             (name, rows)
@@ -485,6 +502,10 @@ async fn stateless_apply_node_matches_the_executed_chain() -> Result<()> {
     assert!(
         expected.iter().any(|(name, rows)| *name == "AccountsTrie" && !rows.is_empty()),
         "no replicated account-trie path to compare"
+    );
+    assert!(
+        expected.iter().any(|(name, rows)| *name == "StoragesTrie" && !rows.is_empty()),
+        "no replicated storage-trie path of the split contract to compare"
     );
     assert_eq!(applier.state_tables()?, expected);
 
@@ -508,9 +529,11 @@ async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
     let nodes = three_nodes([executor_address, apply_address, corrupt_address]);
     let runtime = Runtime::test();
     let executor =
-        TestNode::launch(&runtime, &chain_spec, 1, &nodes, executor_listener, vec![]).await?;
+        TestNode::launch(&runtime, &chain_spec, 1, &nodes, executor_listener, vec![], vec![])
+            .await?;
     let applier =
-        TestNode::launch(&runtime, &chain_spec, 2, &nodes, apply_listener, vec![NodeId(3)]).await?;
+        TestNode::launch(&runtime, &chain_spec, 2, &nodes, apply_listener, vec![NodeId(3)], vec![])
+            .await?;
 
     // Node 3 serves results whose first receipt reports one more gas than was used.
     let corrupt_results = Arc::new(ExecutedBlocks::default());

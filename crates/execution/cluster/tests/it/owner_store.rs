@@ -156,7 +156,7 @@ fn assert_owner_matches(
 
     for address in &keys.addresses {
         let key = address.as_slice();
-        if !cluster.holds(ShardedTable::HashedAccounts, key).unwrap() {
+        if !cluster.holds(ShardedTable::HashedAccounts, key, &[]).unwrap() {
             continue;
         }
         let get =
@@ -192,7 +192,7 @@ fn assert_owner_matches(
 
     for path in &keys.account_paths {
         let key = packed(*path);
-        if !cluster.holds(ShardedTable::AccountsTrie, &key).unwrap() {
+        if !cluster.holds(ShardedTable::AccountsTrie, &key, &[]).unwrap() {
             continue;
         }
         let get =

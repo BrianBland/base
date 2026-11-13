@@ -349,12 +349,15 @@ impl<TX: DbTx> SnapshotView<TX> {
     }
 
     /// Up to `limit` duplicate values of `key` with subkey `>= subkey`, ascending
-    /// (`HashedStorages` or `StoragesTrie`).
+    /// (`HashedStorages` or `StoragesTrie`). For a split contract `range` is the subkey's range:
+    /// values outside it are not returned, nor are replicated storage-trie paths, and
+    /// `end_of_key` means the end of the range.
     pub fn seek_dup_ge(
         &self,
         table: ShardedTable,
         key: &[u8],
         subkey: &[u8],
+        range: Option<Shard>,
         limit: usize,
     ) -> Result<DuplicateValues, StoreError> {
         let address = B256::from_slice(key);
@@ -363,7 +366,7 @@ impl<TX: DbTx> SnapshotView<TX> {
                 let factory = self.hashed_cursors();
                 let mut cursor = factory.hashed_storage_cursor(address)?;
                 let mut entry = cursor.seek(B256::from_slice(subkey))?;
-                Self::collect_key(limit, || {
+                Self::collect_key(table, range, limit, || {
                     let current =
                         entry.take().map(|(key, value)| StorageEntry { key, value }.compress());
                     entry = cursor.next()?;
@@ -374,7 +377,7 @@ impl<TX: DbTx> SnapshotView<TX> {
                 let factory = self.trie_cursors();
                 let mut cursor = factory.storage_trie_cursor(address)?;
                 let mut entry = cursor.seek(PackedStoredNibblesSubKey::decode(subkey)?.0)?;
-                Self::collect_key(limit, || {
+                Self::collect_key(table, range, limit, || {
                     let current = entry.take().map(|(path, node)| {
                         PackedStorageTrieEntry { nibbles: PackedStoredNibblesSubKey(path), node }
                             .compress()
@@ -388,12 +391,25 @@ impl<TX: DbTx> SnapshotView<TX> {
     }
 
     fn collect_key(
+        table: ShardedTable,
+        range: Option<Shard>,
         limit: usize,
         mut next: impl FnMut() -> Result<Option<Vec<u8>>, DatabaseError>,
     ) -> Result<DuplicateValues, StoreError> {
         let limit = limit.min(Self::MAX_ENTRIES_PER_RESPONSE);
         let mut values = Vec::new();
         while let Some(value) = next()? {
+            if let Some(range) = range {
+                let placement = table
+                    .subkey_of(&value)
+                    .zip(table.subkey_layout())
+                    .and_then(|(subkey, layout)| layout.placement(subkey));
+                match placement {
+                    Some(KeyPlacement::Replicated) => continue,
+                    Some(KeyPlacement::Shard(found)) if found == range => {}
+                    _ => break,
+                }
+            }
             if values.len() == limit {
                 return Ok(DuplicateValues { values, end_of_key: false });
             }
@@ -473,26 +489,31 @@ impl<TX: DbTx + Sync> OwnerStore<TX> {
                 Ok(Response::Entries(view.seek_ge(table, key, shard, *limit as usize)?))
             }
             Query::SeekDupGe { key, subkey, limit } => {
-                let valid_subkey = match table {
-                    ShardedTable::HashedStorages => subkey.len() == ShardedTable::HASH_KEY_LEN,
-                    ShardedTable::StoragesTrie => {
-                        ShardedTable::packed_path_nibbles(subkey).is_some()
-                    }
-                    _ => false,
-                };
+                let valid_subkey =
+                    table.subkey_layout().is_some_and(|layout| layout.placement(subkey).is_some());
                 if !valid_subkey {
                     return Err(ReadError::Unsupported.into());
                 }
-                self.check_holds(table, key)?;
+                let range = if self.cluster.is_split(table, key) {
+                    let range = Shard(subkey[0]);
+                    if !self.cluster.owns(range) {
+                        return Err(ReadError::NotOwner.into());
+                    }
+                    Some(range)
+                } else {
+                    self.check_holds(table, key)?;
+                    None
+                };
                 let view = self.view(request.snapshot)?;
-                Ok(Response::Duplicates(view.seek_dup_ge(table, key, subkey, *limit as usize)?))
+                let limit = *limit as usize;
+                Ok(Response::Duplicates(view.seek_dup_ge(table, key, subkey, range, limit)?))
             }
             Query::ExecutedBlock { .. } => Err(ReadError::Unsupported.into()),
         }
     }
 
     fn check_holds(&self, table: ShardedTable, key: &[u8]) -> Result<(), ReadError> {
-        match self.cluster.holds(table, key) {
+        match self.cluster.holds(table, key, &[]) {
             None => Err(ReadError::Unsupported),
             Some(false) => Err(ReadError::NotOwner),
             Some(true) => Ok(()),

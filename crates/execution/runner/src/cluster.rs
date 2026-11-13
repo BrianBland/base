@@ -194,6 +194,7 @@ mod tests {
             retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
             nodes: vec![NodeConfig { id: NodeId(1), address, storage: true }],
             apply_from: Vec::new(),
+            split_storage: Vec::new(),
         })
         .unwrap();
         let env = Arc::try_unwrap(create_test_rw_db()).unwrap().into_inner_db();

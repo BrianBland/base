@@ -2,6 +2,7 @@
 
 use std::{collections::HashSet, net::SocketAddr, path::Path};
 
+use alloy_primitives::{B256, Bytes, keccak256, map::B256Set};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -42,9 +43,16 @@ pub struct ClusterConfig {
     /// executing them (apply mode). Empty: this node executes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub apply_from: Vec<NodeId>,
+    /// Large contracts whose storage is split over all shards by subkey: 20-byte addresses,
+    /// hashed at load, or 32-byte hashed addresses. Must be the same on every node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub split_storage: Vec<Bytes>,
 }
 
 impl ClusterConfig {
+    /// Length of a contract address in `split_storage`, hashed at load.
+    pub const ADDRESS_LEN: usize = 20;
+
     /// Default replication factor: one owner of each shard may be down.
     pub const DEFAULT_REPLICATION: usize = 2;
 
@@ -92,13 +100,17 @@ pub enum ConfigError {
     /// `apply_from` lists this node.
     #[error("apply_from lists this node {0:?}")]
     ApplyFromSelf(NodeId),
+    /// A `split_storage` entry is neither a 20-byte address nor a 32-byte hashed address.
+    #[error("split_storage entry {0} is neither a 20-byte address nor a 32-byte hashed address")]
+    InvalidSplitStorage(Bytes),
 }
 
-/// A validated cluster configuration with the shard owners precomputed.
+/// A validated cluster configuration with the shard owners and split contracts precomputed.
 #[derive(Debug, Clone)]
 pub struct Cluster {
     config: ClusterConfig,
     shard_map: ShardMap,
+    split_storage: B256Set,
 }
 
 impl Cluster {
@@ -134,8 +146,17 @@ impl Cluster {
         if config.apply_from.contains(&config.node_id) {
             return Err(ConfigError::ApplyFromSelf(config.node_id));
         }
+        let split_storage = config
+            .split_storage
+            .iter()
+            .map(|entry| match entry.len() {
+                ClusterConfig::ADDRESS_LEN => Ok(keccak256(entry)),
+                ShardedTable::HASH_KEY_LEN => Ok(B256::from_slice(entry)),
+                _ => Err(ConfigError::InvalidSplitStorage(entry.clone())),
+            })
+            .collect::<Result<_, _>>()?;
         let shard_map = ShardMap::new(&storage_nodes, config.replication);
-        Ok(Self { config, shard_map })
+        Ok(Self { config, shard_map, split_storage })
     }
 
     /// The node this cluster view belongs to.
@@ -163,10 +184,44 @@ impl Cluster {
         self.owners(shard).contains(&self.config.node_id)
     }
 
-    /// Whether this node holds the encoded `key` of `table`: the key is replicated or in a shard
-    /// this node owns. `None` when the key is not a valid encoded key of the table.
-    pub fn holds(&self, table: ShardedTable, key: &[u8]) -> Option<bool> {
-        Some(match table.placement(key)? {
+    /// The hashed addresses of the split contracts.
+    pub const fn split_storage(&self) -> &B256Set {
+        &self.split_storage
+    }
+
+    /// Whether any contract's storage is split.
+    pub fn splits_storage(&self) -> bool {
+        !self.split_storage.is_empty()
+    }
+
+    /// Whether the encoded `key` of `table` belongs to a split contract, whose duplicates are
+    /// placed by subkey.
+    pub fn is_split(&self, table: ShardedTable, key: &[u8]) -> bool {
+        !self.split_storage.is_empty()
+            && table.is_duplicate()
+            && key.len() == ShardedTable::HASH_KEY_LEN
+            && self.split_storage.contains(&B256::from_slice(key))
+    }
+
+    /// Where the row with encoded `key` and `subkey` of `table` lives. `subkey` (the start of an
+    /// encoded duplicate value) is read only for a split contract; other rows are placed by key.
+    /// `None` when the key, or the subkey of a split contract, is not valid for the table.
+    pub fn placement(
+        &self,
+        table: ShardedTable,
+        key: &[u8],
+        subkey: &[u8],
+    ) -> Option<KeyPlacement> {
+        match table.subkey_layout() {
+            Some(layout) if self.is_split(table, key) => layout.placement(subkey),
+            _ => table.placement(key),
+        }
+    }
+
+    /// Whether this node holds the row with encoded `key` and `subkey` of `table` (see
+    /// [`Self::placement`]): the row is replicated or in a shard this node owns.
+    pub fn holds(&self, table: ShardedTable, key: &[u8], subkey: &[u8]) -> Option<bool> {
+        Some(match self.placement(table, key, subkey)? {
             KeyPlacement::Replicated => true,
             KeyPlacement::Shard(shard) => self.owns(shard),
         })
@@ -232,8 +287,8 @@ mod tests {
             ShardedTable::AccountsTrie.placement(&root_child),
             Some(KeyPlacement::Replicated)
         );
-        assert_eq!(cluster.holds(ShardedTable::AccountsTrie, &root_child), Some(true));
-        assert_eq!(cluster.holds(ShardedTable::HashedAccounts, &[0x70; 32]), Some(false));
+        assert_eq!(cluster.holds(ShardedTable::AccountsTrie, &root_child, &[]), Some(true));
+        assert_eq!(cluster.holds(ShardedTable::HashedAccounts, &[0x70; 32], &[]), Some(false));
     }
 
     #[test]
@@ -267,6 +322,15 @@ mod tests {
 
         let from_self = THREE_NODES.replace("node_id = 3", "node_id = 3\napply_from = [3]");
         assert!(matches!(parse(&from_self), Err(ConfigError::ApplyFromSelf(NodeId(3)))));
+
+        let short_entry = THREE_NODES.replace(
+            "node_id = 3",
+            "node_id = 3\nsplit_storage = [\"0x42000000000000000000000000000000000016\"]",
+        );
+        assert!(matches!(parse(&short_entry), Err(ConfigError::InvalidSplitStorage(_))));
+
+        let not_hex = THREE_NODES.replace("node_id = 3", "node_id = 3\nsplit_storage = [\"0xzz\"]");
+        assert!(toml::from_str::<ClusterConfig>(&not_hex).is_err());
     }
 
     #[test]
@@ -275,5 +339,60 @@ mod tests {
 
         let applying = THREE_NODES.replace("node_id = 3", "node_id = 3\napply_from = [2, 1]");
         assert_eq!(parse(&applying).unwrap().apply_from(), [NodeId(2), NodeId(1)]);
+    }
+
+    #[test]
+    fn split_storage_places_listed_contracts_by_subkey() {
+        const ADDRESS: &str = "0x4200000000000000000000000000000000000016";
+        const HASHED: &str = "0x4c06361fae302f0881e3f88f50ae396fedd00dad86367c25d0336250c9ce554d";
+        let listed = THREE_NODES.replace(
+            "node_id = 3",
+            &format!("node_id = 1\nsplit_storage = [\"{ADDRESS}\", \"{HASHED}\"]"),
+        );
+        let cluster = parse(&listed).unwrap();
+        let from_address = keccak256(ADDRESS.parse::<Bytes>().unwrap());
+        let hashed: B256 = HASHED.parse().unwrap();
+        let unlisted = B256::repeat_byte(0x4c);
+
+        let mut slot = [0u8; 32];
+        slot[0] = 0x9a;
+        for contract in [from_address, hashed] {
+            assert!(cluster.is_split(ShardedTable::HashedStorages, contract.as_slice()));
+            assert_eq!(
+                cluster.placement(ShardedTable::HashedStorages, contract.as_slice(), &slot),
+                Some(KeyPlacement::Shard(Shard(0x9a)))
+            );
+        }
+        assert!(!cluster.is_split(ShardedTable::HashedStorages, unlisted.as_slice()));
+        assert!(!cluster.is_split(ShardedTable::HashedAccounts, hashed.as_slice()));
+        assert_eq!(
+            cluster.placement(ShardedTable::HashedStorages, unlisted.as_slice(), &slot),
+            Some(KeyPlacement::Shard(Shard(0x4c)))
+        );
+
+        let path = |first_byte: u8, nibbles: u8| {
+            let mut path = [0u8; 33];
+            path[0] = first_byte;
+            path[32] = nibbles;
+            path
+        };
+        let trie = ShardedTable::StoragesTrie;
+        assert_eq!(
+            cluster.placement(trie, hashed.as_slice(), &path(0, 0)),
+            Some(KeyPlacement::Replicated)
+        );
+        assert_eq!(
+            cluster.placement(trie, hashed.as_slice(), &path(0xa0, 1)),
+            Some(KeyPlacement::Replicated)
+        );
+        assert_eq!(
+            cluster.placement(trie, hashed.as_slice(), &path(0xa3, 2)),
+            Some(KeyPlacement::Shard(Shard(0xa3)))
+        );
+        assert_eq!(cluster.placement(trie, hashed.as_slice(), &path(0xa3, 1)), None);
+        assert_eq!(
+            cluster.placement(trie, unlisted.as_slice(), &path(0xa3, 2)),
+            Some(KeyPlacement::Shard(Shard(0x4c)))
+        );
     }
 }

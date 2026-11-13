@@ -13,6 +13,9 @@ pub use cursor::{ClusteredCursor, CursorSharding};
 mod reads;
 pub use reads::{CursorPosition, FoundEntry, ShardedReads};
 
+mod split;
+pub use split::SplitCursor;
+
 mod snapshot;
 pub use snapshot::ReadSnapshot;
 
