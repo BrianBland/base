@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     io::{self, Read, Write},
-    net::TcpStream,
+    net::{SocketAddr, TcpStream},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -13,6 +13,7 @@ use std::{
 
 use alloy_primitives::{B256, Bytes};
 use parking_lot::Mutex;
+use socket2::{Domain, Protocol, Socket, Type};
 use thiserror::Error;
 use tracing::{debug, warn};
 
@@ -473,11 +474,41 @@ impl ClusterClient {
     fn connect_within(&self, node: NodeId, within: Duration) -> Result<TcpStream, FrameError> {
         let address = self.cluster.address(node).expect("asked nodes are listed cluster nodes");
         let timeout = within.min(self.options.connect_timeout);
-        let stream = TcpStream::connect_timeout(&address, timeout)?;
+        let stream = Self::open(address, timeout)?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(self.options.io_timeout))?;
         stream.set_write_timeout(Some(self.options.io_timeout))?;
         Ok(stream)
+    }
+
+    /// Opens a connection to `address` within `timeout`.
+    ///
+    /// The socket is marked address-reusable before it connects, so if it ever ends in TIME-WAIT
+    /// on an owner's port it does not stop that owner's listener (which std also marks reusable)
+    /// from binding. A connection to itself is refused (see [`Self::refuse_self_connection`]).
+    pub fn open(address: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+        let socket = Socket::new(Domain::for_address(address), Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        socket.connect_timeout(&address.into(), timeout)?;
+        Self::refuse_self_connection(socket.into())
+    }
+
+    /// Returns `stream` unless it is connected to itself, which fails with
+    /// [`io::ErrorKind::ConnectionRefused`] so the owner counts as unreachable.
+    ///
+    /// When an owner listening on a loopback port inside the kernel's ephemeral range is down,
+    /// the kernel can pick that same port as the source of a connection to it, and TCP
+    /// simultaneous open connects the socket to itself. Such a socket holds the owner's port, so
+    /// it is reset (closed with a zero linger) rather than closed gracefully into TIME-WAIT.
+    pub fn refuse_self_connection(stream: TcpStream) -> io::Result<TcpStream> {
+        if stream.local_addr()? != stream.peer_addr()? {
+            return Ok(stream);
+        }
+        Socket::from(stream).set_linger(Some(Duration::ZERO))?;
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "connected to itself: the owner is down and its port is in the ephemeral port range",
+        ))
     }
 
     /// Sends `request` and reads the reply, returning the connection to the pool on success.

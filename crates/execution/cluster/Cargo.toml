@@ -38,6 +38,7 @@ toml = { workspace = true, features = ["parse", "serde"] }
 
 # misc
 metrics.workspace = true
+socket2.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true

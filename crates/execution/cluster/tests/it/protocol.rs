@@ -651,3 +651,62 @@ fn apply_node_far_behind_catches_up_without_waiting() {
         assert_eq!(result, expected, "block {number}");
     }
 }
+
+#[test]
+fn a_connection_to_a_listening_peer_is_kept() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let stream = ClusterClient::open(address, Duration::from_secs(1)).unwrap();
+
+    assert_eq!(stream.peer_addr().unwrap(), address);
+}
+
+/// Linux connects a socket bound to a port to its own address (TCP simultaneous open), which is
+/// how a client retrying a down owner on an ephemeral loopback port ends up holding that port.
+/// macOS refuses such a connect, so the case cannot be built there.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_connection_to_itself_is_refused_and_frees_the_port() {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let address = closed_port();
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+    socket.bind(&address.into()).unwrap();
+    socket.connect(&address.into()).unwrap();
+    let stream: TcpStream = socket.into();
+    assert_eq!(stream.local_addr().unwrap(), stream.peer_addr().unwrap());
+
+    let refused = ClusterClient::refuse_self_connection(stream).unwrap_err();
+
+    assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+    assert!(TcpListener::bind(address).is_ok(), "the self-connected socket still holds the port");
+}
+
+#[test]
+fn the_owner_bind_waits_for_its_port_to_be_released() {
+    let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = holder.local_addr().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(holder);
+    });
+
+    let listener = OwnerServer::bind(address, Duration::from_secs(10)).unwrap();
+
+    assert_eq!(listener.local_addr().unwrap(), address);
+    release.join().unwrap();
+}
+
+#[test]
+fn the_owner_bind_gives_up_once_its_wait_is_spent() {
+    let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = holder.local_addr().unwrap();
+    let started = Instant::now();
+
+    let error = OwnerServer::bind(address, Duration::from_millis(1500)).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    assert!(started.elapsed() < Duration::from_secs(3), "waited {:?}", started.elapsed());
+    drop(holder);
+}

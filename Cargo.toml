@@ -615,6 +615,7 @@ alloc-no-stdlib = "2.0"
 
 # system
 libc = "0.2"
+socket2 = "0.6"
 rlimit = "0.11"
 hostname = "0.4.0"
 tokio-vsock = "0.7"

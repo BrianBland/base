@@ -512,6 +512,14 @@ A clustered node refuses to start unless:
   start`. The command checks it before binding the owner port, and the node launch checks it
   again, so an embedded launch refuses too.
 
+Not checked, but required: every owner port (the `address` of each node) must be outside the
+kernel's ephemeral port range (`net.ipv4.ip_local_port_range`, 32768-60999 by default on Linux).
+While an owner on such a port is down, peers retrying it can be handed that same port as their
+source port and connect to themselves. The client refuses and resets such a connection and marks
+its sockets address-reusable, and the owner retries its bind for up to 90 seconds while the port
+is in use (logging `cluster owner port in use; retrying the bind`), but ports in the ephemeral
+range can also be taken by any other outgoing connection on the host.
+
 ### Configuration keys
 
 Every key of the cluster TOML (see [Placement](#placement) for the example):

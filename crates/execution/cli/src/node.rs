@@ -1,13 +1,13 @@
 //! Chainless execution-node arguments and launch helpers.
 
 use std::{
-    net::{Ipv4Addr, TcpListener},
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use base_execution_chainspec::BaseChainSpec;
-use base_execution_cluster::{Cluster, ClusteredDatabase, RootMismatchMarker};
+use base_execution_cluster::{Cluster, ClusteredDatabase, OwnerServer, RootMismatchMarker};
 use base_node_runner::{BaseNodeBuilder, LaunchedBaseNode};
 use base_upgrade_signal::UpgradeSignalStartupMode;
 use clap::{Args, value_parser};
@@ -401,7 +401,7 @@ impl ExecutionNodeRuntimeConfig {
         let address = cluster
             .address(cluster.node_id())
             .ok_or_else(|| eyre::eyre!("cluster config does not list this node"))?;
-        let listener = TcpListener::bind(address)?;
+        let listener = OwnerServer::bind(address, OwnerServer::BIND_WAIT)?;
         let options = cluster.config().client_options();
         let database = ClusteredDatabase::clustered(env, cluster, listener, options)?;
         if let Some(node) = database.cluster() {

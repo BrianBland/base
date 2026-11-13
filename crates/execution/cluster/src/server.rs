@@ -10,13 +10,13 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use alloy_primitives::B256;
 use parking_lot::Mutex;
 use reth_db_api::Database;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     CapturedHashes, ExecutedBlocks, Frame, OwnerStore, Query, ReadError, ReadResult, Request,
@@ -36,6 +36,42 @@ impl OwnerServer {
     /// How long the accepting thread waits between polls for a connection, and so at most how
     /// long it takes to notice that the server is dropped.
     pub const ACCEPT_POLL: Duration = Duration::from_millis(10);
+
+    /// How long [`Self::bind`] keeps retrying an address in use: longer than Linux keeps a
+    /// closed connection in TIME-WAIT (60 seconds).
+    pub const BIND_WAIT: Duration = Duration::from_secs(90);
+
+    /// Pause between two attempts of [`Self::bind`].
+    pub const BIND_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+    /// Binds the owner listener on `address`, retrying for at most `wait` while the address is
+    /// in use.
+    ///
+    /// std marks the listener address-reusable, which is enough for connections this node left
+    /// in TIME-WAIT. A socket that was not marked reusable (an old peer's connection that
+    /// connected to itself on this port, for example) still blocks the port until it leaves
+    /// TIME-WAIT, so the bind is retried rather than failing the start.
+    pub fn bind(address: SocketAddr, wait: Duration) -> io::Result<TcpListener> {
+        let deadline = Instant::now() + wait;
+        loop {
+            match TcpListener::bind(address) {
+                Err(error)
+                    if error.kind() == io::ErrorKind::AddrInUse
+                        && Instant::now() + Self::BIND_RETRY_INTERVAL <= deadline =>
+                {
+                    warn!(
+                        address = %address,
+                        error = %error,
+                        retry_in = ?Self::BIND_RETRY_INTERVAL,
+                        "cluster owner port in use; retrying the bind (a closed connection in \
+                         TIME-WAIT holds it for up to a minute)"
+                    );
+                    std::thread::sleep(Self::BIND_RETRY_INTERVAL);
+                }
+                result => return result,
+            }
+        }
+    }
 
     /// Serves `store` and `executed` on `listener`, with no captured hashes: one thread accepts,
     /// and each connection is served on its own thread, one request at a time.
