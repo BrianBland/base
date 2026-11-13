@@ -36,6 +36,7 @@ fn serve() -> (SocketAddr, OwnerServer) {
         apply_from: Vec::new(),
         split_storage: Vec::new(),
         read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
+        simulated_round_trip_micros: 0,
         root_check: Default::default(),
     })
     .unwrap();

@@ -23,7 +23,7 @@ use crate::{
     ShardedTable, SnapshotId,
 };
 
-/// Timeouts, retry budget, and pool size of a [`ClusterClient`].
+/// Timeouts, retry budget, pool size and simulated latency of a [`ClusterClient`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientOptions {
     /// Timeout for opening a connection to an owner.
@@ -37,6 +37,9 @@ pub struct ClientOptions {
     pub retry_interval: Duration,
     /// Idle connections kept per owner.
     pub max_idle_per_owner: usize,
+    /// For experiments only: how long every request sent to another node sleeps on the calling
+    /// thread before its reply is read, as if the network took this round trip. Zero adds none.
+    pub simulated_round_trip: Duration,
 }
 
 impl ClientOptions {
@@ -53,6 +56,7 @@ impl Default for ClientOptions {
             retry_for: Self::DEFAULT_RETRY_FOR,
             retry_interval: Duration::from_millis(20),
             max_idle_per_owner: 4,
+            simulated_round_trip: Duration::ZERO,
         }
     }
 }
@@ -351,6 +355,7 @@ impl ClusterClient {
     ) -> Result<ReadResult, FrameError> {
         let mut bounded = DeadlineStream { stream, deadline, io_timeout: self.options.io_timeout };
         Frame::write(&mut bounded, request)?;
+        self.simulate_round_trip();
         let result = Frame::read(&mut bounded)?;
         if Instant::now() > deadline {
             return Err(DeadlineStream::expired().into());
@@ -538,9 +543,18 @@ impl ClusterClient {
         request: &Request,
     ) -> Result<ReadResult, FrameError> {
         Frame::write(&mut stream, request)?;
+        self.simulate_round_trip();
         let result = Frame::read(&mut stream)?;
         self.release(node, stream);
         Ok(result)
+    }
+
+    /// Sleeps for [`ClientOptions::simulated_round_trip`] between sending a request and reading
+    /// its reply.
+    fn simulate_round_trip(&self) {
+        if !self.options.simulated_round_trip.is_zero() {
+            std::thread::sleep(self.options.simulated_round_trip);
+        }
     }
 
     /// Returns a healthy connection to `node`'s pool, unless the pool is full.

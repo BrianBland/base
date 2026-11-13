@@ -53,6 +53,12 @@ pub struct ClusterConfig {
     /// requested block ([`ClientOptions::retry_for`]). May differ between nodes.
     #[serde(default = "ClusterConfig::default_read_retry_secs")]
     pub read_retry_secs: u64,
+    /// For experiments only: microseconds every request to another node sleeps before reading
+    /// the reply, simulating the network round trip loopback lacks
+    /// ([`ClientOptions::simulated_round_trip`]). 0 (the default) adds none; at most
+    /// [`Self::MAX_SIMULATED_ROUND_TRIP_MICROS`]. May differ between nodes.
+    #[serde(default)]
+    pub simulated_round_trip_micros: u64,
     /// The state-root check: keys `root_check` and `root_check_warn_blocks`.
     #[serde(flatten)]
     pub root_check: RootCheckConfig,
@@ -77,6 +83,9 @@ impl ClusterConfig {
     /// Default `read_retry_secs`: [`ClientOptions::DEFAULT_RETRY_FOR`].
     pub const DEFAULT_READ_RETRY_SECS: u64 = ClientOptions::DEFAULT_RETRY_FOR.as_secs();
 
+    /// Largest `simulated_round_trip_micros`: one second, far beyond any real round trip.
+    pub const MAX_SIMULATED_ROUND_TRIP_MICROS: u64 = 1_000_000;
+
     const fn default_replication() -> usize {
         Self::DEFAULT_REPLICATION
     }
@@ -89,9 +98,14 @@ impl ClusterConfig {
         Self::DEFAULT_READ_RETRY_SECS
     }
 
-    /// The client options this node reads with: the defaults, retrying for `read_retry_secs`.
+    /// The client options this node reads with: the defaults, retrying for `read_retry_secs` and
+    /// simulating a round trip of `simulated_round_trip_micros`.
     pub fn client_options(&self) -> ClientOptions {
-        ClientOptions { retry_for: Duration::from_secs(self.read_retry_secs), ..Default::default() }
+        ClientOptions {
+            retry_for: Duration::from_secs(self.read_retry_secs),
+            simulated_round_trip: Duration::from_micros(self.simulated_round_trip_micros),
+            ..Default::default()
+        }
     }
 }
 
@@ -139,6 +153,12 @@ pub enum ConfigError {
     /// `read_retry_secs` is 0, so a read would fail as soon as an owner is behind.
     #[error("read_retry_secs must be at least 1")]
     ZeroReadRetry,
+    /// `simulated_round_trip_micros` exceeds [`ClusterConfig::MAX_SIMULATED_ROUND_TRIP_MICROS`].
+    #[error(
+        "simulated_round_trip_micros {0} exceeds the maximum {max}",
+        max = ClusterConfig::MAX_SIMULATED_ROUND_TRIP_MICROS
+    )]
+    SimulatedRoundTripTooLong(u64),
 }
 
 /// A validated cluster configuration with the shard owners and split contracts precomputed.
@@ -187,6 +207,9 @@ impl Cluster {
         }
         if config.read_retry_secs == 0 {
             return Err(ConfigError::ZeroReadRetry);
+        }
+        if config.simulated_round_trip_micros > ClusterConfig::MAX_SIMULATED_ROUND_TRIP_MICROS {
+            return Err(ConfigError::SimulatedRoundTripTooLong(config.simulated_round_trip_micros));
         }
         let split_storage = config
             .split_storage
@@ -319,6 +342,7 @@ mod tests {
         assert_eq!(cluster.address(NodeId(2)), Some("127.0.0.1:9002".parse().unwrap()));
         assert!(cluster.config().nodes[0].storage);
         assert_eq!(cluster.config().client_options().retry_for, ClientOptions::DEFAULT_RETRY_FOR);
+        assert_eq!(cluster.config().client_options().simulated_round_trip, Duration::ZERO);
     }
 
     #[test]
@@ -333,6 +357,30 @@ mod tests {
 
         let zero = THREE_NODES.replace("node_id = 3", "node_id = 3\nread_retry_secs = 0");
         assert!(matches!(parse(&zero), Err(ConfigError::ZeroReadRetry)));
+    }
+
+    #[test]
+    fn simulated_round_trip_micros_sets_the_client_delay_up_to_one_second() {
+        let configured =
+            THREE_NODES.replace("node_id = 3", "node_id = 3\nsimulated_round_trip_micros = 250");
+        let options = parse(&configured).unwrap().config().client_options();
+        assert_eq!(options.simulated_round_trip, Duration::from_micros(250));
+        assert_eq!(options.retry_for, ClientOptions::DEFAULT_RETRY_FOR);
+
+        let one_second = THREE_NODES
+            .replace("node_id = 3", "node_id = 3\nsimulated_round_trip_micros = 1000000");
+        assert!(parse(&one_second).is_ok());
+
+        let too_long = THREE_NODES
+            .replace("node_id = 3", "node_id = 3\nsimulated_round_trip_micros = 1000001");
+        assert!(matches!(parse(&too_long), Err(ConfigError::SimulatedRoundTripTooLong(1_000_001))));
+
+        let negative =
+            THREE_NODES.replace("node_id = 3", "node_id = 3\nsimulated_round_trip_micros = -5");
+        assert!(toml::from_str::<ClusterConfig>(&negative).is_err());
+        let fractional =
+            THREE_NODES.replace("node_id = 3", "node_id = 3\nsimulated_round_trip_micros = 0.5");
+        assert!(toml::from_str::<ClusterConfig>(&fractional).is_err());
     }
 
     #[test]

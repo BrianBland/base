@@ -44,6 +44,7 @@ fn cluster_of(
             apply_from: Vec::new(),
             split_storage: Vec::new(),
             read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
+            simulated_round_trip_micros: 0,
             root_check: Default::default(),
         })
         .unwrap(),
@@ -259,6 +260,33 @@ fn a_read_from_owners_that_never_answer_ends_within_its_retry_budget() {
     assert!(matches!(read, Err(ClientError::OwnersFailed(_))), "{read:?}");
     let waited = started.elapsed();
     assert!(waited < retry_for + Duration::from_millis(500), "waited {waited:?}");
+}
+
+#[test]
+fn every_request_to_a_peer_waits_the_simulated_round_trip() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client_view = cluster_of(3, 2, listener.local_addr().unwrap(), closed_port());
+    let (_store, _server, _shared, _db, _chain) = owner_at_genesis(&client_view, listener);
+    let round_trip = Duration::from_millis(100);
+    let client = ClusterClient::new(
+        client_view,
+        ClientOptions { simulated_round_trip: round_trip, ..Default::default() },
+    );
+    let timed = |request: &dyn Fn()| {
+        let started = Instant::now();
+        request();
+        started.elapsed()
+    };
+
+    let genesis = SnapshotId { number: 0, hash: Some(block_hash(0, 0)) };
+    let read =
+        timed(&|| assert_eq!(client.account(genesis, B256::repeat_byte(0x42)).unwrap(), None));
+    assert!(read >= round_trip, "value read took {read:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = timed(&|| assert!(client.status(NodeId(1), deadline).unwrap().is_some()));
+    assert!(status >= round_trip, "status took {status:?}");
+    let hashes = timed(&|| drop(client.shard_hashes(NodeId(1), 0, block_hash(0, 0))));
+    assert!(hashes >= round_trip, "shard hashes took {hashes:?}");
 }
 
 /// Longer than the client's former 2-second retry budget.

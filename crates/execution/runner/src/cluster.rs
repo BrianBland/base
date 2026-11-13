@@ -51,6 +51,7 @@ impl ClusterFeed {
     }
 
     /// Feeds `node` until the notifications close, holding `_provider` for the node's lookup.
+    /// Each notification also marks a block boundary of the node's remote-read stats.
     async fn follow<N: NodePrimitives, P>(
         node: Arc<ClusterNode>,
         mut notifications: tokio::sync::broadcast::Receiver<CanonStateNotification<N>>,
@@ -59,9 +60,11 @@ impl ClusterFeed {
         loop {
             match notifications.recv().await {
                 Ok(CanonStateNotification::Commit { new }) => {
+                    node.client().remote_read_stats().record_block();
                     node.owner_store().commit_blocks(Self::canonical_blocks(&new));
                 }
                 Ok(CanonStateNotification::Reorg { old, new }) => {
+                    node.client().remote_read_stats().record_block();
                     let reverted_from = old.first().number();
                     node.owner_store().reorg_blocks(reverted_from, Self::canonical_blocks(&new));
                 }
@@ -216,6 +219,7 @@ mod tests {
             apply_from: Vec::new(),
             split_storage: Vec::new(),
             read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
+            simulated_round_trip_micros: 0,
             root_check: Default::default(),
         })
         .unwrap();

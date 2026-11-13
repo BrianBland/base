@@ -31,7 +31,7 @@ pub use readiness::{OwnerState, OwnerStates, OwnersNotReady};
 mod stats;
 pub use stats::{
     ApplyCounts, ApplyFallback, ApplyStats, OwnerAnswer, OwnerCounts, OwnerStats, RemoteReadCounts,
-    RemoteReadKind, RemoteReadStats,
+    RemoteReadKind, RemoteReadPeaks, RemoteReadStats,
 };
 
 mod slice;

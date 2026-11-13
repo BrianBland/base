@@ -69,6 +69,16 @@ impl RemoteReadCounts {
     }
 }
 
+/// The largest remote-read costs seen in one log period.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemoteReadPeaks {
+    /// The slowest single remote read, retries included.
+    pub max_read: Duration,
+    /// The most remote reads between two canonical-chain notifications (normally one block
+    /// each), counting the reads before the first notification of the period.
+    pub max_block_reads: u64,
+}
+
 /// Lock-free counters of this node's remote reads, also exported as the metrics
 /// `base_cluster_remote_reads` and `base_cluster_remote_read_failures`.
 #[derive(Debug)]
@@ -80,6 +90,9 @@ pub struct RemoteReadStats {
     failures: AtomicU64,
     waits: AtomicU64,
     elapsed_nanos: AtomicU64,
+    max_read_nanos: AtomicU64,
+    block_reads: AtomicU64,
+    max_block_reads: AtomicU64,
     reads_metric: Counter,
     failures_metric: Counter,
 }
@@ -94,6 +107,9 @@ impl Default for RemoteReadStats {
             failures: AtomicU64::new(0),
             waits: AtomicU64::new(0),
             elapsed_nanos: AtomicU64::new(0),
+            max_read_nanos: AtomicU64::new(0),
+            block_reads: AtomicU64::new(0),
+            max_block_reads: AtomicU64::new(0),
             reads_metric: metrics::counter!("base_cluster_remote_reads"),
             failures_metric: metrics::counter!("base_cluster_remote_read_failures"),
         }
@@ -115,6 +131,8 @@ impl RemoteReadStats {
         counter.fetch_add(1, Ordering::Relaxed);
         let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         self.elapsed_nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.max_read_nanos.fetch_max(nanos, Ordering::Relaxed);
+        self.block_reads.fetch_add(1, Ordering::Relaxed);
         self.reads_metric.increment(1);
         if failed {
             self.failures.fetch_add(1, Ordering::Relaxed);
@@ -125,6 +143,23 @@ impl RemoteReadStats {
     /// Counts one read that waited on owners behind the requested block.
     pub fn record_wait(&self) {
         self.waits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Marks a block boundary: a canonical-chain notification. The reads since the previous
+    /// boundary count toward [`RemoteReadPeaks::max_block_reads`].
+    pub fn record_block(&self) {
+        let reads = self.block_reads.swap(0, Ordering::Relaxed);
+        self.max_block_reads.fetch_max(reads, Ordering::Relaxed);
+    }
+
+    /// The peaks since the previous call, which starts a new period. Reads since the last block
+    /// boundary count toward the period's `max_block_reads` without ending their block.
+    pub fn take_peaks(&self) -> RemoteReadPeaks {
+        let open_block = self.block_reads.load(Ordering::Relaxed);
+        RemoteReadPeaks {
+            max_read: Duration::from_nanos(self.max_read_nanos.swap(0, Ordering::Relaxed)),
+            max_block_reads: self.max_block_reads.swap(0, Ordering::Relaxed).max(open_block),
+        }
     }
 
     /// The reads counted so far.
@@ -156,6 +191,7 @@ impl RemoteReadStats {
             let Some(stats) = stats.upgrade() else { return };
             let counts = stats.counts();
             let new = counts.since(&logged);
+            let peaks = stats.take_peaks();
             if new.total() > 0 {
                 info!(
                     accounts = new.accounts,
@@ -165,6 +201,8 @@ impl RemoteReadStats {
                     failures = new.failures,
                     waits = new.waits,
                     elapsed = ?new.elapsed,
+                    max_read = ?peaks.max_read,
+                    max_block_reads = peaks.max_block_reads,
                     "cluster remote reads"
                 );
             }
@@ -431,5 +469,35 @@ impl ApplyStats {
             }
             logged = counts;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peaks_report_the_slowest_read_and_the_busiest_block_of_the_period() {
+        let stats = RemoteReadStats::default();
+        let read =
+            |millis| stats.record(RemoteReadKind::Account, Duration::from_millis(millis), false);
+        read(3);
+        stats.record_block();
+        read(9);
+        read(1);
+        read(2);
+        stats.record_block();
+        read(4);
+
+        let peaks = stats.take_peaks();
+        assert_eq!(
+            peaks,
+            RemoteReadPeaks { max_read: Duration::from_millis(9), max_block_reads: 3 }
+        );
+
+        read(5);
+        let next = stats.take_peaks();
+        assert_eq!(next.max_read, Duration::from_millis(5), "a new period forgets the old peak");
+        assert_eq!(next.max_block_reads, 2, "the block still open spans both periods");
     }
 }

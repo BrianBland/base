@@ -149,6 +149,7 @@ fn cluster_view(node_id: u64, addresses: &[std::net::SocketAddr], split: &[B256]
                 .map(|hash| alloy_primitives::Bytes::copy_from_slice(hash.as_slice()))
                 .collect(),
             read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
+            simulated_round_trip_micros: 0,
             root_check: Default::default(),
         })
         .unwrap(),
@@ -1022,6 +1023,15 @@ fn with_storage(updates: &BlockUpdates, extra: &BlockUpdates) -> BlockUpdates {
 
 /// One node of the five-node layout over a fully populated database, with its peers down.
 fn lone_node(id: u64, seed: u64) -> (ClusteredDatabase, DatabaseEnv, TableDump, TempDir) {
+    lone_node_with(id, seed, options())
+}
+
+/// [`lone_node`] reading with client `options`.
+fn lone_node_with(
+    id: u64,
+    seed: u64,
+    options: ClientOptions,
+) -> (ClusteredDatabase, DatabaseEnv, TableDump, TempDir) {
     let mut rng = rng(seed);
     let shards: Vec<_> = (0..24).map(|_| Shard(rng.random())).collect();
     let keys = KeyUniverse::new(&mut rng, &shards);
@@ -1043,10 +1053,30 @@ fn lone_node(id: u64, seed: u64) -> (ClusteredDatabase, DatabaseEnv, TableDump, 
         env.clone(),
         cluster_view(id, &addresses, &[]),
         listener,
-        options(),
+        options,
     )
     .unwrap();
     (db, env, full, dir)
+}
+
+#[test]
+fn a_read_of_a_held_row_skips_the_simulated_round_trip() {
+    let round_trip = Duration::from_secs(1);
+    let options = ClientOptions { simulated_round_trip: round_trip, ..options() };
+    let (db, _env, full, _dir) = lone_node_with(1, 10, options);
+    let cluster = db.cluster().unwrap().cluster();
+    let (key, value) = full
+        .hashed_accounts
+        .iter()
+        .find(|(key, _)| cluster.holds(ShardedTable::HashedAccounts, key, &[]) == Some(true))
+        .expect("node 1 holds some account");
+    let tx = db.tx().unwrap();
+
+    let started = Instant::now();
+    let read = tx.get::<tables::HashedAccounts>(B256::from_slice(key)).unwrap();
+
+    assert!(started.elapsed() < round_trip, "a held row took {:?}", started.elapsed());
+    assert_eq!(read, Some(Account::decompress(value).unwrap()));
 }
 
 #[test]

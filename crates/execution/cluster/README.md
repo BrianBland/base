@@ -550,6 +550,12 @@ Every key of the cluster TOML (see [Placement](#placement) for the example):
 | `root_check` | `"exit"` | `"exit"`, `"log"` or `"off"`: what a state-root mismatch does ([State-root check](#state-root-check)) |
 | `root_check_warn_blocks` | 300 | blocks without a verified state root before the check warns |
 
+`simulated_round_trip_micros` (optional, default 0 = off, at most 1000000, may differ between
+nodes) exists for experiments only: it makes every request this node sends to another node sleep
+that many microseconds before reading the reply, simulating a real network round trip (about
+100-1000 in one availability zone) for clusters run over loopback. Reads this node answers itself
+are not delayed. Do not set it in production.
+
 A node is clustered when started with `--cluster.config <FILE>` (`base rpc` and the `node`
 command); without it the database is a pass-through to MDBX. At startup a clustered node checks
 the requirements above before opening anything, opens the clustered database, starts its owner
@@ -560,9 +566,10 @@ owner. It logs the shards it owns and shed progress, and counts remote reads and
 metrics `base_cluster_remote_reads` and `base_cluster_remote_read_failures`. Every 10 seconds in
 which any remote read happened it logs `cluster remote reads` with the reads of each kind
 (`accounts`, `storages`, `storage_probes`, `bytecodes`), the `failures`, the reads that waited
-more than 1 second on owners behind the requested block (`waits`), and the total time spent in
-them (`elapsed`) since the previous line; `ClusterNode::remote_reads` returns the same counts
-since start.
+more than 1 second on owners behind the requested block (`waits`), the total time spent in
+them (`elapsed`), the slowest single read (`max_read`), and the most reads between two
+canonical-chain notifications, normally one block each (`max_block_reads`), since the previous
+line; `ClusterNode::remote_reads` returns the same counts since start.
 
 The block-hash lookup and the changeset reader hold the provider only weakly; the feed task holds
 it strongly. The provider owns the clustered database, which owns the node, so a strong
