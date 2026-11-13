@@ -74,6 +74,7 @@ pub(crate) fn cluster(node_id: u64) -> Arc<Cluster> {
             nodes,
             apply_from: Vec::new(),
             split_storage: Vec::new(),
+            read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
         })
         .unwrap(),
     )

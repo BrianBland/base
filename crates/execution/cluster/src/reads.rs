@@ -211,7 +211,7 @@ impl<K: TransactionKind> ShardedReads<K> {
     pub fn seek_exact<T: Table>(&mut self, inner: &mut Cursor<K, T>, key: T::Key) -> PairResult<T> {
         let encoded = Self::encode::<T>(&key);
         if self.is_split(&encoded) {
-            let deadline = Instant::now() + ReadSnapshot::SPLIT_READ_BUDGET;
+            let deadline = self.snapshot.split_read_deadline();
             let first = self.table.first_subkey();
             let found = self.find_split::<T>(&encoded, &first, false, deadline)?;
             return Ok(self.settle::<T>(found));
@@ -252,7 +252,7 @@ impl<K: TransactionKind> ShardedReads<K> {
     ) -> ValueOnlyResult<T> {
         let encoded = Self::encode::<T>(&key);
         if self.is_split(&encoded) {
-            let deadline = Instant::now() + ReadSnapshot::SPLIT_READ_BUDGET;
+            let deadline = self.snapshot.split_read_deadline();
             let subkey = subkey.encode().into_vec();
             let found = self.find_split::<T>(&encoded, &subkey, false, deadline)?;
             return Ok(self.settle::<T>(found).map(|(_, value)| value));
@@ -285,13 +285,12 @@ impl<K: TransactionKind> ShardedReads<K> {
                 return inner.next_dup();
             }
             CursorPosition::LocalSplit { key, value } => {
-                let deadline = Instant::now() + ReadSnapshot::SPLIT_READ_BUDGET;
+                let deadline = self.snapshot.split_read_deadline();
                 self.next_local_split::<T>(key, value, deadline)?
             }
             CursorPosition::Remote { key, value, complete, .. } => {
                 let subkey = self.subkey_of(value)?;
-                let deadline =
-                    self.is_split(key).then(|| Instant::now() + ReadSnapshot::SPLIT_READ_BUDGET);
+                let deadline = self.is_split(key).then(|| self.snapshot.split_read_deadline());
                 let in_page = if *complete {
                     None
                 } else {

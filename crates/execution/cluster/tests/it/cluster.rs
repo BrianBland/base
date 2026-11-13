@@ -14,8 +14,8 @@ use std::{
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256, map::B256Map};
 use base_execution_cluster::{
     BlockUpdates, ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, DuplicateValues, Frame,
-    KeyPlacement, NodeConfig, NodeId, ReadResult, ReadSnapshot, Request, Response, Shard,
-    ShardedTable,
+    KeyPlacement, NodeConfig, NodeId, ReadError, ReadResult, ReadSnapshot, Request, Response,
+    Shard, ShardedTable,
 };
 use rand::{Rng, rngs::StdRng};
 use reth_chainspec::MAINNET;
@@ -142,13 +142,16 @@ fn cluster_view(node_id: u64, addresses: &[std::net::SocketAddr], split: &[B256]
                 .iter()
                 .map(|hash| Bytes::copy_from_slice(hash.as_slice()))
                 .collect(),
+            read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
         })
         .unwrap(),
     )
 }
 
+/// Client options of the test nodes: a 2-second retry budget, which is also the deadline of a
+/// split read that may cross all 256 ranges on a loaded test machine.
 fn options() -> ClientOptions {
-    ClientOptions { retry_for: Duration::from_millis(100), ..Default::default() }
+    ClientOptions { retry_for: Duration::from_secs(2), ..Default::default() }
 }
 
 /// Largest size of a node's MDBX. Each environment reserves this much address space, and the
@@ -1091,7 +1094,63 @@ fn a_split_read_through_slow_owners_fails_within_its_budget() {
     let found = storages.seek_exact(contract);
     let elapsed = started.elapsed();
     assert!(found.is_err(), "running out of time is an error, not absence: {found:?}");
-    assert!(elapsed < ReadSnapshot::SPLIT_READ_BUDGET + SPLIT_READ_SLACK, "took {elapsed:?}");
+    assert!(elapsed < options().retry_for + SPLIT_READ_SLACK, "took {elapsed:?}");
+}
+
+/// Longer than the former fixed 2-second deadline of a split read.
+const PAST_OLD_SPLIT_BUDGET: Duration = Duration::from_millis(2500);
+
+/// A peer that refuses every request as behind until `catch_up`, then answers it with an empty,
+/// complete duplicate page.
+fn behind_owner(catch_up: Instant) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            std::thread::spawn(move || {
+                while Frame::read::<Request>(&mut stream).is_ok() {
+                    let answer: ReadResult = if Instant::now() < catch_up {
+                        Err(ReadError::SnapshotUnavailable { servable: None })
+                    } else {
+                        let empty = DuplicateValues { values: Vec::new(), end_of_key: true };
+                        Ok(Response::Duplicates(empty))
+                    };
+                    if Frame::write(&mut stream, &answer).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    address
+}
+
+#[test]
+fn a_split_read_waits_within_the_client_budget_for_owners_behind() {
+    let catch_up = Instant::now() + PAST_OLD_SPLIT_BUDGET;
+    let mut addresses: Vec<_> = (1..NODES).map(|_| behind_owner(catch_up)).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    addresses.push(listener.local_addr().unwrap());
+    let contract = B256::repeat_byte(0x33);
+    let empty = Block {
+        number: 0,
+        updates: BlockUpdates { hashed_state: Arc::default(), trie_updates: Arc::default() },
+        codes: Vec::new(),
+    };
+    let dir = TempDir::new().unwrap();
+    let env = populated_env(dir.path(), &[empty]);
+    // Node 5 stores nothing, so every range of the empty contract is asked of an owner.
+    let view = cluster_view(NODES, &addresses, &[contract]);
+    let options = ClientOptions { retry_for: Duration::from_secs(10), ..Default::default() };
+    let db = ClusteredDatabase::clustered(env, view, listener, options).unwrap();
+
+    let tx = db.tx().unwrap();
+    let mut storages = tx.cursor_dup_read::<tables::HashedStorages>().unwrap();
+    assert_eq!(storages.seek_exact(contract).unwrap(), None);
+    let counts = db.cluster().unwrap().remote_reads();
+    assert_eq!(counts.failures, 0, "{counts:?}");
+    assert_eq!(counts.waits, 1, "{counts:?}");
 }
 
 /// A reth storage root calculator over a database transaction with storage v2 trie keys.

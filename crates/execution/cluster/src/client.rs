@@ -11,11 +11,11 @@ use std::{
 use alloy_primitives::{B256, Bytes};
 use parking_lot::Mutex;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     ApplyFallback, Cluster, DuplicateValues, Frame, FrameError, NodeId, Query, ReadError,
-    ReadResult, Request, Response, Shard, ShardEntries, ShardedTable, SnapshotId,
+    ReadResult, RemoteReadStats, Request, Response, Shard, ShardEntries, ShardedTable, SnapshotId,
 };
 
 /// Timeouts, retry budget, and pool size of a [`ClusterClient`].
@@ -25,7 +25,8 @@ pub struct ClientOptions {
     pub connect_timeout: Duration,
     /// Timeout for each socket read or write.
     pub io_timeout: Duration,
-    /// How long to keep retrying while every owner is behind the requested snapshot.
+    /// How long one read keeps retrying while every owner is unreachable or behind the requested
+    /// snapshot; also the deadline of one read of a split contract.
     pub retry_for: Duration,
     /// Pause between retry rounds.
     pub retry_interval: Duration,
@@ -33,12 +34,18 @@ pub struct ClientOptions {
     pub max_idle_per_owner: usize,
 }
 
+impl ClientOptions {
+    /// Default [`Self::retry_for`]. An owner behind the requested block normally catches up
+    /// within a few seconds; giving up sooner fails the block being executed.
+    pub const DEFAULT_RETRY_FOR: Duration = Duration::from_secs(60);
+}
+
 impl Default for ClientOptions {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(1),
             io_timeout: Duration::from_secs(5),
-            retry_for: Duration::from_secs(2),
+            retry_for: Self::DEFAULT_RETRY_FOR,
             retry_interval: Duration::from_millis(20),
             max_idle_per_owner: 4,
         }
@@ -87,20 +94,36 @@ pub enum ClientError {
 /// Calls block the calling thread. Owners are tried in rendezvous order, skipping this node;
 /// the round is retried within [`ClientOptions::retry_for`] only while every owner is unreachable
 /// or behind the snapshot and at least one is behind. A read given a deadline also finishes every
-/// connect, write, read and retry by it.
+/// connect, write, read and retry by it, each socket operation still waiting at most its
+/// configured timeout. A read that waits on behind owners for longer than
+/// [`Self::SLOW_WAIT`] logs one warning and counts one wait in [`Self::remote_read_stats`].
 #[derive(Debug)]
 pub struct ClusterClient {
     cluster: Arc<Cluster>,
     options: ClientOptions,
     pools: HashMap<NodeId, Mutex<Vec<TcpStream>>>,
+    remote_reads: Arc<RemoteReadStats>,
 }
 
 impl ClusterClient {
+    /// How long a read may wait on behind owners before it is logged and counted as a wait.
+    pub const SLOW_WAIT: Duration = Duration::from_secs(1);
+
     /// Creates a client for `cluster`'s node.
     pub fn new(cluster: Arc<Cluster>, options: ClientOptions) -> Self {
         let pools =
             cluster.config().nodes.iter().map(|node| (node.id, Mutex::new(Vec::new()))).collect();
-        Self { cluster, options, pools }
+        Self { cluster, options, pools, remote_reads: Arc::default() }
+    }
+
+    /// The options this client was created with.
+    pub const fn options(&self) -> &ClientOptions {
+        &self.options
+    }
+
+    /// The counters of this client's remote reads.
+    pub const fn remote_read_stats(&self) -> &Arc<RemoteReadStats> {
+        &self.remote_reads
     }
 
     /// The encoded value of `key` in `table` as of `snapshot`, or `None` when absent.
@@ -238,7 +261,7 @@ impl ClusterClient {
         request: &Request,
         deadline: Instant,
     ) -> Result<ReadResult, FrameError> {
-        let mut bounded = DeadlineStream { stream, deadline };
+        let mut bounded = DeadlineStream { stream, deadline, io_timeout: self.options.io_timeout };
         Frame::write(&mut bounded, request)?;
         let result = Frame::read(&mut bounded)?;
         if Instant::now() > deadline {
@@ -275,8 +298,10 @@ impl ClusterClient {
             return Err(ClientError::NoOwner(shard));
         }
 
-        let retry_until = Instant::now() + self.options.retry_for;
+        let started = Instant::now();
+        let retry_until = started + self.options.retry_for;
         let retry_until = deadline.map_or(retry_until, |deadline| retry_until.min(deadline));
+        let mut warned = false;
         loop {
             let mut attempts = Vec::with_capacity(owners.len());
             for &node in &owners {
@@ -299,8 +324,37 @@ impl ClusterClient {
             if !retryable || Instant::now() + self.options.retry_interval > retry_until {
                 return Err(ClientError::OwnersFailed(attempts));
             }
+            if !warned && started.elapsed() > Self::SLOW_WAIT {
+                warned = true;
+                self.remote_reads.record_wait();
+                Self::warn_waiting(&request, &attempts, started.elapsed());
+            }
             std::thread::sleep(self.options.retry_interval);
         }
+    }
+
+    /// Logs that `request` has waited `waited` on owners behind its snapshot, with the highest
+    /// block each owner of the last round could serve (`None`: unreachable or nothing servable).
+    fn warn_waiting(request: &Request, attempts: &[OwnerAttempt], waited: Duration) {
+        let owners_highest: Vec<_> = attempts
+            .iter()
+            .map(|attempt| {
+                let highest = match &attempt.failure {
+                    OwnerFailure::Refused(ReadError::SnapshotUnavailable {
+                        servable: Some(range),
+                    }) => Some(range.highest),
+                    _ => None,
+                };
+                (attempt.node.0, highest)
+            })
+            .collect();
+        warn!(
+            table = ?request.table,
+            block = request.snapshot.number,
+            owners_highest = ?owners_highest,
+            waited = ?waited,
+            "cluster read waiting for owners behind the requested block"
+        );
     }
 
     /// Asks one owner, on a pooled connection when one is idle. A pooled connection that fails is
@@ -376,13 +430,16 @@ impl ClusterClient {
 }
 
 /// A connection whose every read and write must finish by `deadline`: each operation's socket
-/// timeout is the time left, and an operation started at or after it fails with `TimedOut`.
+/// timeout is the time left, at most `io_timeout`, and an operation started at or after the
+/// deadline fails with `TimedOut`.
 #[derive(Debug)]
 pub struct DeadlineStream {
     /// The connection.
     pub stream: TcpStream,
     /// When every operation must have finished.
     pub deadline: Instant,
+    /// The longest one operation may wait, however far the deadline is.
+    pub io_timeout: Duration,
 }
 
 impl DeadlineStream {
@@ -393,7 +450,7 @@ impl DeadlineStream {
 
     fn remaining(&self) -> io::Result<Duration> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() { Err(Self::expired()) } else { Ok(remaining) }
+        if remaining.is_zero() { Err(Self::expired()) } else { Ok(remaining.min(self.io_timeout)) }
     }
 }
 

@@ -296,7 +296,7 @@ impl Bootstrap {
         })
     }
 
-    /// Whether two views share everything but `node_id` and `apply_from`.
+    /// Whether two views share everything but `node_id`, `apply_from` and `read_retry_secs`.
     fn same_placement(a: &Cluster, b: &Cluster) -> bool {
         a.config().nodes == b.config().nodes
             && a.config().replication == b.config().replication

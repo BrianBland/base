@@ -206,6 +206,7 @@ fn cluster(node_id: u64, split: &[B256]) -> Cluster {
         nodes,
         apply_from: Vec::new(),
         split_storage: split.iter().map(|hash| Bytes::copy_from_slice(hash.as_slice())).collect(),
+        read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
     })
     .unwrap()
 }

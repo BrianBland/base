@@ -43,6 +43,7 @@ fn cluster_of(
             nodes,
             apply_from: Vec::new(),
             split_storage: Vec::new(),
+            read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
         })
         .unwrap(),
     )
@@ -235,6 +236,83 @@ fn client_retries_while_every_owner_is_behind() {
     let tip = SnapshotId { number: 0, hash: Some(block_hash(0, 0)) };
     assert_eq!(client.get(tip, ShardedTable::HashedAccounts, &[0x42; 32]).unwrap(), None);
     catch_up.join().unwrap();
+}
+
+/// Longer than the client's former 2-second retry budget.
+const PAST_OLD_RETRY_BUDGET: Duration = Duration::from_millis(2500);
+
+#[test]
+fn client_waits_by_default_for_an_owner_behind_longer_than_two_seconds() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client_view = cluster_of(3, 2, listener.local_addr().unwrap(), closed_port());
+    let owner_view = Arc::new(
+        Cluster::new(ClusterConfig { node_id: NodeId(1), ..client_view.config().clone() }).unwrap(),
+    );
+    let (store, _server) = serve(&owner_view, listener);
+    let db = factory();
+    store.register_persistence_point(BlockNumHash::new(0, block_hash(0, 0)), snapshot(&db));
+
+    let catch_up = {
+        let store = Arc::clone(&store);
+        let tx = snapshot(&db);
+        std::thread::spawn(move || {
+            std::thread::sleep(PAST_OLD_RETRY_BUDGET);
+            store.register_persistence_point(BlockNumHash::new(1, block_hash(0, 1)), tx);
+        })
+    };
+    let client = ClusterClient::new(client_view, ClientOptions::default());
+    let tip = SnapshotId { number: 1, hash: Some(block_hash(0, 1)) };
+    assert_eq!(client.get(tip, ShardedTable::HashedAccounts, &[0x42; 32]).unwrap(), None);
+    catch_up.join().unwrap();
+    assert_eq!(client.remote_read_stats().counts().waits, 1);
+}
+
+#[test]
+fn client_refuses_at_once_when_owners_no_longer_have_the_block() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client_view = cluster_of(3, 2, listener.local_addr().unwrap(), closed_port());
+    let owner_view = Arc::new(
+        Cluster::new(ClusterConfig { node_id: NodeId(1), ..client_view.config().clone() }).unwrap(),
+    );
+    let (store, _server) = serve(&owner_view, listener);
+    store.register_persistence_point(
+        BlockNumHash::new(500, block_hash(0, 500)),
+        snapshot(&factory()),
+    );
+
+    let client = ClusterClient::new(client_view, ClientOptions::default());
+    let discarded = SnapshotId { number: 100, hash: Some(block_hash(0, 100)) };
+    let started = Instant::now();
+    let Err(ClientError::OwnersFailed(attempts)) =
+        client.get(discarded, ShardedTable::HashedAccounts, &[0x42; 32])
+    else {
+        panic!("expected every owner to fail")
+    };
+    assert!(started.elapsed() < ClusterClient::SLOW_WAIT, "took {:?}", started.elapsed());
+    assert!(attempts.iter().any(|attempt| matches!(
+        attempt.failure,
+        OwnerFailure::Refused(ReadError::SnapshotUnavailable { servable: Some(range) })
+            if range.lowest > 100
+    )));
+    assert_eq!(client.remote_read_stats().counts().waits, 0);
+}
+
+#[test]
+fn a_stalled_owner_holds_a_read_with_a_distant_deadline_only_for_the_io_timeout() {
+    let stalled = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client_view = cluster_of(3, 2, stalled.local_addr().unwrap(), closed_port());
+    let io_timeout = Duration::from_millis(200);
+    let options = ClientOptions { io_timeout, ..Default::default() };
+    let client = ClusterClient::new(client_view, options);
+    let tip = SnapshotId { number: 0, hash: None };
+
+    let started = Instant::now();
+    let deadline = Some(started + Duration::from_secs(30));
+    let read =
+        client.seek_dup_ge(tip, ShardedTable::HashedStorages, &[0x42; 32], &[0; 32], 4, deadline);
+    assert!(matches!(read, Err(ClientError::OwnersFailed(_))), "{read:?}");
+    assert!(started.elapsed() < io_timeout * 5, "took {:?}", started.elapsed());
+    drop(stalled);
 }
 
 #[test]

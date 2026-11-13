@@ -49,7 +49,7 @@ historical state RPC older than the persisted tip, reth storage v1.
   `node_id` is not listed, `R` is 0 or larger than the number of storage nodes, or the retention
   window `W` (see [Owner side](#owner-side)) is below 160, or `apply_from` (see
   [Apply mode](#apply-mode)) lists an unknown node or this node, or a `split_storage` entry is
-  neither 20 nor 32 bytes. Every node must list the same `split_storage`; this is not checked
+  neither 20 nor 32 bytes, or `read_retry_secs` (see [Read rule](#read-rule)) is 0. Every node must list the same `split_storage`; this is not checked
   (see [Limits](#limits)).
 
 ```toml
@@ -58,6 +58,7 @@ replication = 2      # R, optional, default 2
 retention_blocks = 160  # W, optional, default 160
 apply_from = [2]     # optional, default [] (execute); see Apply mode
 split_storage = ["0x4200000000000000000000000000000000000016"]  # optional, default []
+read_retry_secs = 60 # optional, default 60; see Read rule
 
 [[nodes]]
 id = 1
@@ -84,6 +85,15 @@ Consequences:
 - The owner refuses when it cannot reproduce `P` (it is behind, has discarded `P`, or is on a
   different fork). The asker then tries the next owner, and retries for a bounded time when every
   owner is merely behind.
+- An owner behind `P` is normal while the cluster follows the chain: the node reading may have
+  persisted a block or two before the owner did. The asker waits for it, retrying every 20 ms for
+  up to `read_retry_secs` (cluster config, default 60 seconds, 0 is rejected), which is also the
+  deadline of one read of a split contract. An owner that no longer has `P` (its lowest servable
+  block is above `P`, after a restart for example) is not waited for. A read that waits more than
+  1 second logs one warning, `cluster read waiting for owners behind the requested block`, with
+  the `table`, the requested `block`, each owner's highest servable block (`owners_highest`) and
+  the time `waited`, and is counted in `waits` of the remote-read log line. Running out of time
+  is an error, never "absent".
 - `Bytecodes` is the exception: entries are content-addressed and never change, so an owner
   answers from its newest data without reproducing `P`.
 
@@ -113,10 +123,11 @@ local MDBX only (see [Write rule](#write-rule)).
   table, which works on encoded keys and is opened only when the cursor first reads a split
   contract. Contracts outside `split_storage` are read as before, by key, with no continuation.
 - One read of a split contract (one `seek_exact`, `get`, `seek_by_key_subkey`, or `next_dup` that
-  continues past the current page or local range) has one deadline, 2 seconds after it starts
-  (the default retry budget of one remote read). Every range it visits, owner it asks, connect,
-  frame write and frame read, and retry pause inside it finishes by that deadline, each socket
-  operation waiting only the time left. Running out of time is a `DatabaseError`, never
+  continues past the current page or local range) has one deadline, the client's retry budget
+  (`read_retry_secs`) after it starts. Every range it visits, owner it asks, connect, frame write
+  and frame read, and retry pause inside it finishes by that deadline, each socket operation
+  waiting only the time left and never longer than its usual connect or I/O timeout, so one
+  stalled owner does not use up the whole budget. Running out of time is a `DatabaseError`, never
   "absent".
 - The cursor keeps its own position; after a remote answer the MDBX cursor's position is
   meaningless.
@@ -198,8 +209,9 @@ block-hash lookup, registers the initial persistence point, and feeds every cano
 logs the shards it owns and shed progress, and counts remote reads and failures in the metrics
 `base_cluster_remote_reads` and `base_cluster_remote_read_failures`. Every 10 seconds in which
 any remote read happened it logs `cluster remote reads` with the reads of each kind (`gets`,
-`seeks`, `duplicate_seeks`), the `failures`, and the total time spent in them (`elapsed`) since
-the previous line; `ClusterNode::remote_reads` returns the same counts since start.
+`seeks`, `duplicate_seeks`), the `failures`, the reads that waited more than 1 second on owners
+behind the requested block (`waits`), and the total time spent in them (`elapsed`) since the
+previous line; `ClusterNode::remote_reads` returns the same counts since start.
 
 The block-hash lookup holds the provider only weakly; the feed task holds it strongly. The
 provider owns the clustered database, which owns the node, so a strong lookup would keep the
@@ -377,8 +389,8 @@ exactly as one started on a full copy.
   also refuses when the source has no `Finish` stage checkpoint, when a `<to>/db` exists and is
   not empty, and when a config does not list its `node_id`; then nothing is created.
 - The pairs are refused when their counts differ, when two share a `--to` path or a `node_id`,
-  or when the configs differ in anything but `node_id` and `apply_from` (node list, replication,
-  retention, split contracts), since the nodes would not agree on placement.
+  or when the configs differ in anything but `node_id`, `apply_from` and `read_retry_secs` (node
+  list, replication, retention, split contracts), since the nodes would not agree on placement.
 - A row of a sharded table that cannot be placed (a key or split-contract subkey of the wrong
   encoding) stops the copy with an error; nothing is dropped silently.
 - Rows move as raw bytes in source order, in MDBX append mode. The source is read in parallel,
@@ -445,7 +457,12 @@ reusing pages until it finishes, so prefer a stopped node.
   shard it crosses that this node does not own, even an empty one.
 - An owner answers a bytecode only once it has persisted it, so reading code from a block this
   node persisted before every owner of the code's shard did waits for an owner to persist it,
-  and fails if none does within the client's retry budget (2 s by default).
+  and fails if none does within the client's retry budget (`read_retry_secs`, 60 s by default).
+- A read that runs out of `read_retry_secs` while owners stay behind fails. Inside transaction
+  execution reth retries the block, but when the failure lands in the pre-execution system calls
+  (the block-hash contract call, for example) or the post-execution checks (the L2 withdrawals
+  root), reth records the block as invalid, rejects every descendant, and the node needs a
+  restart.
 - `entries` (table statistics) of a sharded table counts local rows only.
 - Shedding frees pages inside MDBX but does not shrink the file without a compacting copy.
 - `split_storage` must be identical on every node. Nothing checks it: a node with a different

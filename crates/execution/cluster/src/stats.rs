@@ -35,6 +35,9 @@ pub struct RemoteReadCounts {
     pub duplicate_seeks: u64,
     /// Reads of any kind that failed after every owner was tried.
     pub failures: u64,
+    /// Reads that waited longer than [`ClusterClient::SLOW_WAIT`](crate::ClusterClient::SLOW_WAIT)
+    /// on owners behind the requested block, whether or not they then succeeded.
+    pub waits: u64,
     /// Total time spent in remote reads, retries included.
     pub elapsed: Duration,
 }
@@ -52,6 +55,7 @@ impl RemoteReadCounts {
             seeks: self.seeks - earlier.seeks,
             duplicate_seeks: self.duplicate_seeks - earlier.duplicate_seeks,
             failures: self.failures - earlier.failures,
+            waits: self.waits - earlier.waits,
             elapsed: self.elapsed.saturating_sub(earlier.elapsed),
         }
     }
@@ -65,6 +69,7 @@ pub struct RemoteReadStats {
     seeks: AtomicU64,
     duplicate_seeks: AtomicU64,
     failures: AtomicU64,
+    waits: AtomicU64,
     elapsed_nanos: AtomicU64,
     reads_metric: Counter,
     failures_metric: Counter,
@@ -77,6 +82,7 @@ impl Default for RemoteReadStats {
             seeks: AtomicU64::new(0),
             duplicate_seeks: AtomicU64::new(0),
             failures: AtomicU64::new(0),
+            waits: AtomicU64::new(0),
             elapsed_nanos: AtomicU64::new(0),
             reads_metric: metrics::counter!("base_cluster_remote_reads"),
             failures_metric: metrics::counter!("base_cluster_remote_read_failures"),
@@ -105,6 +111,11 @@ impl RemoteReadStats {
         }
     }
 
+    /// Counts one read that waited on owners behind the requested block.
+    pub fn record_wait(&self) {
+        self.waits.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The reads counted so far.
     pub fn counts(&self) -> RemoteReadCounts {
         RemoteReadCounts {
@@ -112,6 +123,7 @@ impl RemoteReadStats {
             seeks: self.seeks.load(Ordering::Relaxed),
             duplicate_seeks: self.duplicate_seeks.load(Ordering::Relaxed),
             failures: self.failures.load(Ordering::Relaxed),
+            waits: self.waits.load(Ordering::Relaxed),
             elapsed: Duration::from_nanos(self.elapsed_nanos.load(Ordering::Relaxed)),
         }
     }
@@ -138,6 +150,7 @@ impl RemoteReadStats {
                     seeks = new.seeks,
                     duplicate_seeks = new.duplicate_seeks,
                     failures = new.failures,
+                    waits = new.waits,
                     elapsed = ?new.elapsed,
                     "cluster remote reads"
                 );

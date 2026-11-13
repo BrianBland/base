@@ -2,7 +2,7 @@
 
 use std::{
     sync::{Arc, OnceLock},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use alloy_primitives::B256;
@@ -26,12 +26,6 @@ impl ReadSnapshot {
     /// Entries asked for per remote `SeekGe` or `SeekDupGe`.
     pub const PAGE_LEN: u32 = 64;
 
-    /// The time one read of a split contract may take across every range it visits, owner it
-    /// asks, connection it opens and frame it exchanges: the default retry budget of one remote
-    /// read ([`ClientOptions::retry_for`](crate::ClientOptions::retry_for)). Running out of it is
-    /// an error, never "absent".
-    pub const SPLIT_READ_BUDGET: Duration = Duration::from_secs(2);
-
     /// A snapshot at block `number`, the `Finish` checkpoint of the transaction.
     pub const fn new(node: Arc<ClusterNode>, number: u64) -> Self {
         Self { node, number, hash: OnceLock::new() }
@@ -45,6 +39,14 @@ impl ReadSnapshot {
     /// This node.
     pub fn node(&self) -> &ClusterNode {
         &self.node
+    }
+
+    /// The deadline of one read of a split contract starting now, across every range it visits,
+    /// owner it asks, connection it opens and frame it exchanges: the retry budget of one remote
+    /// read ([`ClientOptions::retry_for`](crate::ClientOptions::retry_for)). Running out of it is
+    /// an error, never "absent".
+    pub fn split_read_deadline(&self) -> Instant {
+        Instant::now() + self.node.client().options().retry_for
     }
 
     /// `P` with its hash, looked up once per transaction when the node knows it.
@@ -62,7 +64,7 @@ impl ReadSnapshot {
         let snapshot = self.id();
         let started = Instant::now();
         let result = read(snapshot);
-        self.node.remote_read_stats().record(kind, started.elapsed(), result.is_err());
+        self.node.client().remote_read_stats().record(kind, started.elapsed(), result.is_err());
         result.map_err(|error| {
             DatabaseError::Other(format!(
                 "cluster read of {table:?} at block {} failed: {error}",

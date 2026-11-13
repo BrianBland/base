@@ -94,7 +94,6 @@ pub struct ClusterNode {
     committed_finish: Mutex<u64>,
     /// Block of the last persistence point registered.
     registered_point: Mutex<Option<u64>>,
-    remote_reads: Arc<RemoteReadStats>,
     executed_blocks: Arc<ExecutedBlocks>,
     apply_stats: Arc<ApplyStats>,
 }
@@ -128,8 +127,9 @@ impl ClusterNode {
         let executed_blocks = Arc::new(ExecutedBlocks::default());
         let server =
             OwnerServer::spawn(listener, Arc::clone(&owner_store), Arc::clone(&executed_blocks))?;
-        let remote_reads = Arc::new(RemoteReadStats::default());
-        remote_reads
+        let client = ClusterClient::new(Arc::clone(&cluster), options);
+        client
+            .remote_read_stats()
             .spawn_logger(RemoteReadStats::LOG_INTERVAL)
             .map_err(ClusterStartError::StatsLogger)?;
         let apply_stats = Arc::new(ApplyStats::default());
@@ -146,7 +146,7 @@ impl ClusterNode {
             "cluster node started"
         );
         Ok(Self {
-            client: ClusterClient::new(Arc::clone(&cluster), options),
+            client,
             env,
             cluster,
             owner_store,
@@ -154,7 +154,6 @@ impl ClusterNode {
             block_hashes: OnceLock::new(),
             committed_finish: Mutex::new(finish),
             registered_point: Mutex::new(None),
-            remote_reads,
             executed_blocks,
             apply_stats,
         })
@@ -207,14 +206,9 @@ impl ClusterNode {
         Ok(self.cluster.holds_placement(placement))
     }
 
-    /// The counters of this node's remote reads.
-    pub const fn remote_read_stats(&self) -> &Arc<RemoteReadStats> {
-        &self.remote_reads
-    }
-
     /// This node's remote reads since it started.
     pub fn remote_reads(&self) -> RemoteReadCounts {
-        self.remote_reads.counts()
+        self.client.remote_read_stats().counts()
     }
 
     /// The execution results of this node's recent blocks, served to apply nodes.

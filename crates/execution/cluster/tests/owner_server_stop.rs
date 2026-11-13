@@ -35,6 +35,7 @@ fn serve() -> (SocketAddr, OwnerServer) {
         nodes: vec![NodeConfig { id: NodeId(1), address, storage: true }],
         apply_from: Vec::new(),
         split_storage: Vec::new(),
+        read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
     })
     .unwrap();
     let store = Arc::new(OwnerStore::<Tx<RO>>::new(Arc::new(cluster), 160));

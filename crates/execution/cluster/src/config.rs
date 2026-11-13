@@ -1,12 +1,12 @@
 //! Cluster configuration file and the validated cluster view built from it.
 
-use std::{collections::HashSet, net::SocketAddr, path::Path};
+use std::{collections::HashSet, net::SocketAddr, path::Path, time::Duration};
 
 use alloy_primitives::{B256, Bytes, keccak256, map::B256Set};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{KeyPlacement, NodeId, Shard, ShardMap, ShardedTable};
+use crate::{ClientOptions, KeyPlacement, NodeId, Shard, ShardMap, ShardedTable};
 
 /// One node of the cluster as listed in the configuration file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +47,10 @@ pub struct ClusterConfig {
     /// hashed at load, or 32-byte hashed addresses. Must be the same on every node.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub split_storage: Vec<Bytes>,
+    /// Seconds one remote read keeps retrying while every owner is unreachable or behind the
+    /// requested block ([`ClientOptions::retry_for`]). May differ between nodes.
+    #[serde(default = "ClusterConfig::default_read_retry_secs")]
+    pub read_retry_secs: u64,
 }
 
 impl ClusterConfig {
@@ -59,12 +63,24 @@ impl ClusterConfig {
     /// Smallest and default retention window `W`: Base's persistence backpressure threshold.
     pub const MIN_RETENTION_BLOCKS: u64 = 160;
 
+    /// Default `read_retry_secs`: [`ClientOptions::DEFAULT_RETRY_FOR`].
+    pub const DEFAULT_READ_RETRY_SECS: u64 = ClientOptions::DEFAULT_RETRY_FOR.as_secs();
+
     const fn default_replication() -> usize {
         Self::DEFAULT_REPLICATION
     }
 
     const fn default_retention_blocks() -> u64 {
         Self::MIN_RETENTION_BLOCKS
+    }
+
+    const fn default_read_retry_secs() -> u64 {
+        Self::DEFAULT_READ_RETRY_SECS
+    }
+
+    /// The client options this node reads with: the defaults, retrying for `read_retry_secs`.
+    pub fn client_options(&self) -> ClientOptions {
+        ClientOptions { retry_for: Duration::from_secs(self.read_retry_secs), ..Default::default() }
     }
 }
 
@@ -103,6 +119,9 @@ pub enum ConfigError {
     /// A `split_storage` entry is neither a 20-byte address nor a 32-byte hashed address.
     #[error("split_storage entry {0} is neither a 20-byte address nor a 32-byte hashed address")]
     InvalidSplitStorage(Bytes),
+    /// `read_retry_secs` is 0, so a read would fail as soon as an owner is behind.
+    #[error("read_retry_secs must be at least 1")]
+    ZeroReadRetry,
 }
 
 /// A validated cluster configuration with the shard owners and split contracts precomputed.
@@ -145,6 +164,9 @@ impl Cluster {
         }
         if config.apply_from.contains(&config.node_id) {
             return Err(ConfigError::ApplyFromSelf(config.node_id));
+        }
+        if config.read_retry_secs == 0 {
+            return Err(ConfigError::ZeroReadRetry);
         }
         let split_storage = config
             .split_storage
@@ -276,6 +298,21 @@ mod tests {
         assert_eq!(cluster.config().retention_blocks, ClusterConfig::MIN_RETENTION_BLOCKS);
         assert_eq!(cluster.address(NodeId(2)), Some("127.0.0.1:9002".parse().unwrap()));
         assert!(cluster.config().nodes[0].storage);
+        assert_eq!(cluster.config().client_options().retry_for, ClientOptions::DEFAULT_RETRY_FOR);
+    }
+
+    #[test]
+    fn read_retry_secs_sets_the_client_retry_budget() {
+        let configured = THREE_NODES.replace("node_id = 3", "node_id = 3\nread_retry_secs = 5");
+        let cluster = parse(&configured).unwrap();
+        assert_eq!(cluster.config().client_options().retry_for, Duration::from_secs(5));
+        assert_eq!(
+            cluster.config().client_options().io_timeout,
+            ClientOptions::default().io_timeout
+        );
+
+        let zero = THREE_NODES.replace("node_id = 3", "node_id = 3\nread_retry_secs = 0");
+        assert!(matches!(parse(&zero), Err(ConfigError::ZeroReadRetry)));
     }
 
     #[test]

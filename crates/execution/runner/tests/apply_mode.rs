@@ -156,6 +156,7 @@ impl TestNode {
             nodes: nodes.to_vec(),
             apply_from,
             split_storage,
+            read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
         })?;
         let db = ClusteredDatabase::clustered(
             env.clone(),
