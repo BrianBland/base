@@ -60,7 +60,7 @@ retention_blocks = 30000  # W, optional, default 30000; the same on every node
 apply_from = [2]     # optional, default [] (execute); only on a node with storage = false
 split_storage = ["0x4200000000000000000000000000000000000016"]  # optional, default []
 read_retry_secs = 60 # optional, default 60; see Read rule
-root_check = "exit" # optional, "exit" | "log" | "off"; see State-root check
+root_check = "exit" # optional, default "exit"; "exit" | "log" | "off"; see State-root check
 root_check_warn_blocks = 300 # optional, default 300
 
 [[nodes]]
@@ -206,78 +206,6 @@ in the transaction that advances `Finish`, so a read-write commit is refused wit
 - the `Headers` or `Bodies` checkpoint is ahead of `Finish`: reth's staged pipeline is running;
 - `Finish` is below the last committed `Finish`: blocks are being unwound.
 
-## Operating requirements
-
-A clustered node refuses to start unless:
-
-- `--engine.num-state-masking-blocks` is 0 (Base's default). With masking, the state tables lag
-  the `Finish` checkpoint and `P` no longer identifies their contents.
-- `--debug.skip-state-root` is not set.
-- The proofs-history extension (`--proofs-history`) is not enabled: it reads trie rows outside
-  the node's slice. The launch fails with `the proofs-history extension reads trie rows a
-  clustered node does not hold; remove --proofs-history or the cluster config`.
-- The datadir is initialised: genesis is written (a `Finish` checkpoint exists).
-- reth's account and storage changesets are kept for at least `W` blocks (Base's full node
-  default keeps them); an owner can serve history only as far back as they reach.
-
-A node is clustered when started with `--cluster.config <FILE>` (`base rpc` and the `node`
-command); without it the database is a pass-through to MDBX. At startup a clustered node checks
-the requirements above before opening anything, opens the clustered database, starts its owner
-server on its configured address, launches, and sheds in the background. Once its provider
-exists it installs the block-hash lookup and the changeset reader (which builds the owner's
-history index, see [Owner side](#owner-side)) and feeds every canonical-state notification to its
-owner. It logs the shards it owns and shed progress, and counts remote reads and failures in the
-metrics `base_cluster_remote_reads` and `base_cluster_remote_read_failures`. Every 10 seconds in
-which any remote read happened it logs `cluster remote reads` with the reads of each kind
-(`accounts`, `storages`, `storage_probes`, `bytecodes`), the `failures`, the reads that waited
-more than 1 second on owners behind the requested block (`waits`), and the total time spent in
-them (`elapsed`) since the previous line; `ClusterNode::remote_reads` returns the same counts
-since start.
-
-The block-hash lookup and the changeset reader hold the provider only weakly; the feed task holds
-it strongly. The provider owns the clustered database, which owns the node, so a strong
-reference would keep the node and its owner listener alive forever. Once the feed task stops (at
-shutdown) the lookup knows no block and the reader reads nothing.
-
-What a clustered node does with blocks:
-
-- It executes new payloads and downloaded blocks (or, in [apply mode](#apply-mode), applies
-  peers' results) and maintains its [trie slice](#trie-maintenance). It never computes a full
-  state root, so the header's state root is not verified when a block is inserted.
-- Before it executes a block it waits for owners (see [Pre-execution wait](#pre-execution-wait)).
-- Unless it holds every shard, it does not build blocks: payload attributes in a forkchoice
-  update are refused (the forkchoice state itself is applied) with `payload building is not
-  supported on a clustered node that does not hold every shard: it keeps only its trie slice and
-  cannot compute a block's state root; build blocks on an unclustered node`, logged as `refusing
-  payload attributes`. reth answers the forkchoice update with its invalid-payload-attributes
-  error. Blocks must be built by an unclustered node; clustered nodes follow it.
-- Proof RPCs (`eth_getProof`, witnesses) are not supported (see
-  [Unsupported on clustered nodes](#unsupported-on-clustered-nodes)).
-
-### Pre-execution wait
-
-Before a clustered node executes a block (a new payload, including an apply node's fallback, or a
-downloaded block), it reads its persisted block `P` and asks every peer that owns a shard it does
-not hold for its servable range (`Status`). It proceeds once every such shard has an owner whose
-range contains `P`. Owners unreachable, still building their history index, or behind `P` are
-waited for, polling every 20 ms for up to `read_retry_secs`; after 1 second it logs one warning,
-`cluster node waiting for owners to reach its persisted block before executing`, with `block`,
-the number of waiting `shards` and each owner's state. A node holding every shard does not wait.
-
-When the wait runs out, or at once when every owner of some shard keeps history only above `P`,
-validation fails with a processing error, logged as `not executing a block until cluster owners
-can serve this node's persisted block` and returned to the consensus client as an internal error
-of `engine_newPayload`. reth does not record the block as invalid, so the consensus client can
-deliver it again. The messages are:
-
-- `no owner of N shards this node does not hold could serve its persisted block P within T
-  (owners: node 2: L..=H, node 3: unreachable); retry once they catch up`;
-- `persisted block P is below the history every owner of shard S keeps (owners: node 2: L..=H,
-  ...); this node is more than retention_blocks behind them and must be re-cloned`.
-
-The wait narrows but does not close the window in which a read inside execution can still run
-out of time (an owner can fall behind or go down after the check); see [Limits](#limits).
-
 ## Owner side
 
 An owner answers exact reads of the rows it holds (`AccountValue`, `StorageValue`, `HasStorage`)
@@ -345,6 +273,11 @@ index's lowest and highest block and its entry count. Every 10 seconds it logs `
 with the reads `served`, refused as `behind`, and otherwise `refused` since the previous line,
 the index `entries`, and the `lowest` and `highest` servable block.
 
+An owner also answers the [state-root check](#state-root-check)'s `ShardHashes` and
+`SplitShardHashes` from its in-memory captures, for the exact block captured. While its history
+index is still being built it is not ready and answers them `NotAvailable`, as it answers state
+reads as behind, so a verifier moves on to another owner.
+
 Serving never issues a remote read: an owner serves only rows it holds.
 
 ## Wire protocol
@@ -400,6 +333,255 @@ sequenceDiagram
     O-->>A: value | absent | SnapshotUnavailable
     A-->>E: entry only if it is exactly that slot
 ```
+
+## Trie maintenance
+
+A clustered node does not compute the full state root of a block. It keeps its trie slice: the
+account-trie and storage-trie rows of the shards it holds, computed per block with reth's own
+incremental state-root code over its database and in-memory ancestors, with prefix sets
+restricted to what it holds, so unchanged and foreign subtrees are not walked. The engine's
+state-root strategy (installed on every clustered node, see `ClusterStateRoot` in
+`base-node-runner`) does this after execution and returns the block header's own state root with
+the slice's trie updates; persistence then writes them through the [write rule](#write-rule).
+
+**The header's state root is not verified when a block is inserted.** Execution, receipts root,
+logs bloom, gas and the other header checks are unchanged; a block whose state root is wrong is
+accepted. Detecting a bad state transition is the job of the background
+[state-root check](#state-root-check), which compares the header with hashes collected from the
+shards' owners while they are in sync.
+
+Per block, `TrieSlice::plan` turns the block's hashed post-state into one main computation and
+zero or more side computations (`TrieSlicePlan`):
+
+- Main computation: the account prefix set holds every changed account in a held shard, also
+  when only its storage changed. A held account whose storage is not split gets all its changed
+  slots as its storage prefix set; a split contract whose account is held gets only its changed
+  slots in held ranges. Held accounts that became empty (`None`) are destroyed accounts. Its
+  input state is exactly those held changes.
+- Side computation, one per split contract whose account shard this node does not hold but whose
+  held ranges changed: the walk computes a storage trie only when it reaches the account's leaf,
+  which the main computation never does for a foreign account. Its input state is that contract
+  with a placeholder account plus its changed slots in held ranges; its account prefix set is
+  that contract, its storage prefix set those slots. Only that contract's storage-trie updates
+  are kept.
+- A split contract whose account became empty (its storage wiped) fails the block: per-range
+  maintenance cannot delete the ranges other nodes hold. A wipe of an existing contract cannot
+  happen after Cancun.
+- A node that stores nothing (`storage = false`), and a storing node holding none of the block's
+  changes, computes nothing and returns empty trie updates.
+
+The replicated short paths (the account-trie root and its 16 children, and the same for each
+split contract's storage trie) are written exactly as this node's own computations output them,
+never taken from peers or from a side computation's account nodes.
+
+Rows on disk are either meaningful or don't-care:
+
+- Meaningful, byte for byte equal to a full node's: account-trie rows of two or more nibbles in
+  held shards, the storage tries of held accounts whose storage is not split, the rows of held
+  ranges of split contracts' storage tries, and in the replicated one-nibble nodes the hashes and
+  mask bits of held children.
+- Don't care: in replicated nodes, the hashes of children in shards this node does not hold (they
+  stay as this node last wrote them and are reused as they are, so a branch keeps its 16
+  children); the root nodes above them; and the path from a split contract's account leaf up to
+  its shard's two-nibble node, since that leaf's storage root mixes in other nodes' ranges.
+  Nothing may trust these values.
+
+Counters: blocks whose slice was computed, side computations and the time spent, in
+`ClusterNode::trie_slices`, the metrics `base_cluster_trie_slice_blocks` and
+`base_cluster_trie_slice_side_calls`, and a `cluster trie slices` log line every 10 seconds in
+which a block was computed or a check skipped.
+
+### Message-passer storage root
+
+Since Isthmus, Base checks after execution that the header's `withdrawals_root` equals the
+storage root of the L2-to-L1 message passer. A clustered node compares it only when it holds
+that account's shard and the contract is not in `split_storage`; otherwise it checks only that
+the header carries the field, skips the comparison and counts it (`message_passer_skips` in
+`ClusterNode::trie_slices`, metric `base_cluster_message_passer_root_skips`). This applies to
+execution and to apply mode alike; the block-time checks are unchanged. A clustered node logs at
+start-up whether it checks this root.
+
+### Unsupported on clustered nodes
+
+- Proofs (`eth_getProof`, witnesses): they read trie rows outside the held slice. Nothing
+  refuses them; their answers are wrong.
+- The proofs-history extension: refused at launch (see
+  [Operating requirements](#operating-requirements)).
+- Building payloads on a node that does not hold every shard: the payload builder computes a
+  full state root over don't-care rows, so payload attributes are refused (see
+  [Operating requirements](#operating-requirements)).
+- `--debug.skip-state-root` is refused: the node already uses its own state-root strategy.
+
+## State-root check
+
+A background integrity check, run by every clustered node (a node that stores nothing checks
+too, through its peers), that recent blocks' state roots add up. **What is verified:** for a
+block `N`, the trie hashes the storing nodes computed for `N`, combined across owners, equal the
+header's state root. **What is not verified:** stored values are not re-read (a value written
+wrongly but hashed correctly goes unnoticed until a later block hashes it); one owner per subtree
+is asked, so a corrupt replica that was not asked is not detected; blocks are checked only while
+every needed owner still holds them in memory (about ten minutes), so a node far behind its
+peers, or a cluster catching up, checks nothing; and nothing is checked at insertion: a block
+with a wrong state root is accepted and detected afterwards, if at all, by this check.
+
+**Capture.** When the state-root strategy finishes block `N` (see
+[Trie maintenance](#trie-maintenance)), a storing node keeps, for the last
+`RootCaptures::WINDOW_BLOCKS` (300) blocks it executed, by block hash (`TrieHashCapture`):
+
+- for each held account shard `[x, y]` that contains no split contract: child `y` of
+  account-trie node `[x]`, as one of empty, a hash (the child is a branch node whose hash is
+  stored: its `hash_mask` bit), or not-a-hashed-branch;
+- for each split contract and held range `[a, b]`: the same from its storage-trie node `[a]`;
+- for each held account shard containing split contracts: the proof nodes of paths of two or
+  more nibbles from reth's multiproof (over the engine's overlay provider for `N`'s parent with
+  `N`'s held post-state and trie updates layered on top) of those contracts, which contain their
+  leaves with nonce, balance and code hash at `N`.
+
+Shard and range values come from `N`'s own depth-1 nodes where `N`'s trie updates rewrote or
+removed them, otherwise from the parent's capture. When the parent has no capture (the first
+block after start-up, a block after a failed capture, a fork from an uncaptured block), they are
+read from the parent's depth-1 nodes through the overlay provider, which shows that parent's
+state exactly (database plus in-memory ancestors), so there is no unknown state to re-seed from
+later. A shard's proof is taken again when `N` changed an account or storage in that shard, or
+the parent has no capture, and is carried otherwise. Everything served for `N` comes from this
+capture; nothing is recomputed from later data, so persisting later blocks never changes an
+answer. A failed capture is logged and never fails the block. Cost per block: no extra reads
+except one overlay read transaction (opened anyway when the slice changes), a multiproof per
+touched held shard with split contracts (one path from the root to each contract's leaf plus
+that contract's storage-root walk over its stored root node), and 16 + 16 per split contract
+node reads when seeding. Memory: about 128 shard values and 128 range values per split contract
+(33 bytes each plus map overhead) and a few proof nodes (at most 532 bytes each, about 6 per
+contract): roughly 10-20 KB per block, a few MB for the window. A node that stores nothing
+captures nothing.
+
+**Assembly** (`RootAssembly`, alloy-trie's node encoding): a split contract's storage root is the
+root branch over the 16 branch nodes of its 256 range values; a shard containing split contracts
+is recomputed by its owner by re-encoding the captured proof nodes bottom-up with each contract's
+leaf carrying the supplied storage root (nodes shared by two contracts are rebuilt once); the
+state root is the root branch over the 16 branch nodes of the 256 shard values. Empty children
+encode as empty; a not-a-hashed-branch value, or a top branch node left with fewer than two
+children, makes the block unverifiable (skipped), never wrong.
+
+**Verifier** (`RootChecker`, `RootCheckSchedule`; started by `RootCheckTask` in
+`base-node-runner`): every 500 ms, at most one block at a time, 2 blocks behind the canonical
+head and never more than 32 further behind, starting above the head the node started at:
+captures are in memory, so owners that restarted with it have none of the blocks it inserted
+before, and each would only be retried and skipped. Round 1 asks owners for `ShardHashes` (this node
+first when it owns the subtree, then the others in placement order, falling to the next on "not
+available" or unreachable) and computes each split contract's storage root; round 2 asks the
+owners of shards containing split contracts for `SplitShardHashes` with those roots; then it
+assembles the state root and compares it with the header. An owner answers only for the exact
+`(number, hash)` it captured. A block some subtree of which no owner can supply is retried for
+20 s, then skipped; an unverifiable block is skipped at once.
+
+Signals: counters verified, skipped (`not_available`, `unverifiable`, `unreachable`) and
+mismatched, the last verified block and head minus last verified, in
+`ClusterNode::root_check_stats`, the metrics `base_cluster_root_check_*` and a
+`cluster state root checks` log line every 10 seconds in which a block was counted; a
+warning `cluster state root not verified for many blocks` at most every 60 s once
+`root_check_warn_blocks` (default 300) blocks pass unverified.
+
+**Mismatch:** an error `cluster state root mismatch` with the block, header root, assembled root
+and every subtree's `owner:value`. Then, by the config key `root_check`:
+
+- `"exit"` (default): writes `cluster-root-mismatch` in the datadir (the block, both roots and
+  every subtree's `shard=owner:value`) and exits the process with code 3. A clustered node
+  refuses to start while that file exists (see
+  [Operating requirements](#operating-requirements)); remove it after investigating.
+- `"log"`: only logs and counts.
+- `"off"`: the check does not run (captures are still kept and served to peers).
+
+## Operating requirements
+
+A clustered node refuses to start unless:
+
+- `--engine.num-state-masking-blocks` is 0 (Base's default). With masking, the state tables lag
+  the `Finish` checkpoint and `P` no longer identifies their contents.
+- `--debug.skip-state-root` is not set.
+- The proofs-history extension (`--proofs-history`) is not enabled: it reads trie rows outside
+  the node's slice. The launch fails with `the proofs-history extension reads trie rows a
+  clustered node does not hold; remove --proofs-history or the cluster config`.
+- The datadir is initialised: genesis is written (a `Finish` checkpoint exists).
+- reth's account and storage changesets are kept for at least `W` blocks (Base's full node
+  default keeps them); an owner can serve history only as far back as they reach.
+- No state-root mismatch marker (`<datadir>/cluster-root-mismatch`) exists. The start fails with
+  `a cluster state-root mismatch was recorded in <path>; investigate, then remove the file to
+  start`. The command checks it before binding the owner port, and the node launch checks it
+  again, so an embedded launch refuses too.
+
+### Configuration keys
+
+Every key of the cluster TOML (see [Placement](#placement) for the example):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `node_id` | required | this node's id, listed in `[[nodes]]` |
+| `[[nodes]]` `id`, `address`, `storage` | `storage = true` | the cluster's nodes and owner addresses |
+| `replication` | 2 | `R`, owners per shard |
+| `retention_blocks` | 30000 (at least 160) | `W`, blocks of history each owner serves; the same on every node ([Owner side](#owner-side)) |
+| `read_retry_secs` | 60 (not 0) | how long a remote read and the [pre-execution wait](#pre-execution-wait) wait for owners ([Read rule](#read-rule)) |
+| `split_storage` | `[]` | contracts whose storage is placed slot by slot; the same on every node ([Placement](#placement)) |
+| `apply_from` | `[]` (execute) | executors an apply node asks, only on `storage = false` ([Apply mode](#apply-mode)) |
+| `root_check` | `"exit"` | `"exit"`, `"log"` or `"off"`: what a state-root mismatch does ([State-root check](#state-root-check)) |
+| `root_check_warn_blocks` | 300 | blocks without a verified state root before the check warns |
+
+A node is clustered when started with `--cluster.config <FILE>` (`base rpc` and the `node`
+command); without it the database is a pass-through to MDBX. At startup a clustered node checks
+the requirements above before opening anything, opens the clustered database, starts its owner
+server on its configured address, launches, and sheds in the background. Once its provider
+exists it installs the block-hash lookup and the changeset reader (which builds the owner's
+history index, see [Owner side](#owner-side)) and feeds every canonical-state notification to its
+owner. It logs the shards it owns and shed progress, and counts remote reads and failures in the
+metrics `base_cluster_remote_reads` and `base_cluster_remote_read_failures`. Every 10 seconds in
+which any remote read happened it logs `cluster remote reads` with the reads of each kind
+(`accounts`, `storages`, `storage_probes`, `bytecodes`), the `failures`, the reads that waited
+more than 1 second on owners behind the requested block (`waits`), and the total time spent in
+them (`elapsed`) since the previous line; `ClusterNode::remote_reads` returns the same counts
+since start.
+
+The block-hash lookup and the changeset reader hold the provider only weakly; the feed task holds
+it strongly. The provider owns the clustered database, which owns the node, so a strong
+reference would keep the node and its owner listener alive forever. Once the feed task stops (at
+shutdown) the lookup knows no block and the reader reads nothing.
+
+What a clustered node does with blocks:
+
+- It executes new payloads and downloaded blocks (or, in [apply mode](#apply-mode), applies
+  peers' results) and maintains its [trie slice](#trie-maintenance). It never computes a full
+  state root, so the header's state root is not verified when a block is inserted.
+- Before it executes a block it waits for owners (see [Pre-execution wait](#pre-execution-wait)).
+- Unless it holds every shard, it does not build blocks: payload attributes in a forkchoice
+  update are refused (the forkchoice state itself is applied) with `payload building is not
+  supported on a clustered node that does not hold every shard: it keeps only its trie slice and
+  cannot compute a block's state root; build blocks on an unclustered node`, logged as `refusing
+  payload attributes`. reth answers the forkchoice update with its invalid-payload-attributes
+  error. Blocks must be built by an unclustered node; clustered nodes follow it.
+- Proof RPCs (`eth_getProof`, witnesses) are not supported (see
+  [Unsupported on clustered nodes](#unsupported-on-clustered-nodes)).
+
+### Pre-execution wait
+
+Before a clustered node executes a block (a new payload, including an apply node's fallback, or a
+downloaded block), it reads its persisted block `P` and asks every peer that owns a shard it does
+not hold for its servable range (`Status`). It proceeds once every such shard has an owner whose
+range contains `P`. Owners unreachable, still building their history index, or behind `P` are
+waited for, polling every 20 ms for up to `read_retry_secs`; after 1 second it logs one warning,
+`cluster node waiting for owners to reach its persisted block before executing`, with `block`,
+the number of waiting `shards` and each owner's state. A node holding every shard does not wait.
+
+When the wait runs out, or at once when every owner of some shard keeps history only above `P`,
+validation fails with a processing error, logged as `not executing a block until cluster owners
+can serve this node's persisted block` and returned to the consensus client as an internal error
+of `engine_newPayload`. reth does not record the block as invalid, so the consensus client can
+deliver it again. The messages are:
+
+- `no owner of N shards this node does not hold could serve its persisted block P within T
+  (owners: node 2: L..=H, node 3: unreachable); retry once they catch up`;
+- `persisted block P is below the history every owner of shard S keeps (owners: node 2: L..=H,
+  ...); this node is more than retention_blocks behind them and must be re-cloned`.
+
+The wait narrows but does not close the window in which a read inside execution can still run
+out of time (an owner can fall behind or go down after the check); see [Limits](#limits).
 
 ## Apply mode
 
@@ -576,8 +758,8 @@ reusing pages until it finishes, so prefer a stopped node.
   30,000 blocks is about 150 megabytes per owner; a network with thousands of changed rows per
   block needs a smaller `W` or a lot of memory, and the startup build reads `W` blocks of
   changesets.
-- No state-root integrity check runs yet: a wrong state transition that does not change
-  receipts, gas or logs is not detected.
+- The header's state root is verified only afterwards, by the background
+  [state-root check](#state-root-check), and only within what that section says it verifies.
 - An owner checks a block hash with the node's provider on each read below its persisted tip.
 - `entries` (table statistics) of a sharded table counts local rows only.
 - Shedding frees pages inside MDBX but does not shrink the file without a compacting copy.
@@ -587,159 +769,6 @@ reusing pages until it finishes, so prefer a stopped node.
 - Split contracts are chosen by the operator; nothing detects large contracts or rebalances.
 - A storage wipe of a split contract is applied per row and per range like any other deletion.
   A wipe of an existing contract cannot happen after Cancun, so this cost is not optimised.
-
-## Trie maintenance
-
-A clustered node does not compute the full state root of a block. It keeps its trie slice: the
-account-trie and storage-trie rows of the shards it holds, computed per block with reth's own
-incremental state-root code over its database and in-memory ancestors, with prefix sets
-restricted to what it holds, so unchanged and foreign subtrees are not walked. The engine's
-state-root strategy (installed on every clustered node, see `ClusterStateRoot` in
-`base-node-runner`) does this after execution and returns the block header's own state root with
-the slice's trie updates; persistence then writes them through the [write rule](#write-rule).
-
-**The header's state root is not verified when a block is inserted.** Execution, receipts root,
-logs bloom, gas and the other header checks are unchanged; a block whose state root is wrong is
-accepted. Detecting a bad state transition is the job of the background
-[state-root check](#state-root-check), which compares the header with hashes collected from the
-shards' owners while they are in sync.
-
-Per block, `TrieSlice::plan` turns the block's hashed post-state into one main computation and
-zero or more side computations (`TrieSlicePlan`):
-
-- Main computation: the account prefix set holds every changed account in a held shard, also
-  when only its storage changed. A held account whose storage is not split gets all its changed
-  slots as its storage prefix set; a split contract whose account is held gets only its changed
-  slots in held ranges. Held accounts that became empty (`None`) are destroyed accounts. Its
-  input state is exactly those held changes.
-- Side computation, one per split contract whose account shard this node does not hold but whose
-  held ranges changed: the walk computes a storage trie only when it reaches the account's leaf,
-  which the main computation never does for a foreign account. Its input state is that contract
-  with a placeholder account plus its changed slots in held ranges; its account prefix set is
-  that contract, its storage prefix set those slots. Only that contract's storage-trie updates
-  are kept.
-- A split contract whose account became empty (its storage wiped) fails the block: per-range
-  maintenance cannot delete the ranges other nodes hold. A wipe of an existing contract cannot
-  happen after Cancun.
-- A node that stores nothing (`storage = false`), and a storing node holding none of the block's
-  changes, computes nothing and returns empty trie updates.
-
-The replicated short paths (the account-trie root and its 16 children, and the same for each
-split contract's storage trie) are written exactly as this node's own computations output them,
-never taken from peers or from a side computation's account nodes.
-
-Rows on disk are either meaningful or don't-care:
-
-- Meaningful, byte for byte equal to a full node's: account-trie rows of two or more nibbles in
-  held shards, the storage tries of held accounts whose storage is not split, the rows of held
-  ranges of split contracts' storage tries, and in the replicated one-nibble nodes the hashes and
-  mask bits of held children.
-- Don't care: in replicated nodes, the hashes of children in shards this node does not hold (they
-  stay as this node last wrote them and are reused as they are, so a branch keeps its 16
-  children); the root nodes above them; and the path from a split contract's account leaf up to
-  its shard's two-nibble node, since that leaf's storage root mixes in other nodes' ranges.
-  Nothing may trust these values.
-
-Counters: blocks whose slice was computed, side computations and the time spent, in
-`ClusterNode::trie_slices`, the metrics `base_cluster_trie_slice_blocks` and
-`base_cluster_trie_slice_side_calls`, and a `cluster trie slices` log line every 10 seconds in
-which a block was computed or a check skipped.
-
-### Message-passer storage root
-
-Since Isthmus, Base checks after execution that the header's `withdrawals_root` equals the
-storage root of the L2-to-L1 message passer. A clustered node compares it only when it holds
-that account's shard and the contract is not in `split_storage`; otherwise it checks only that
-the header carries the field, skips the comparison and counts it (`message_passer_skips` in
-`ClusterNode::trie_slices`, metric `base_cluster_message_passer_root_skips`). This applies to
-execution and to apply mode alike; the block-time checks are unchanged. A clustered node logs at
-start-up whether it checks this root.
-
-### Unsupported on clustered nodes
-
-- Proofs (`eth_getProof`, witnesses): they read trie rows outside the held slice. Nothing
-  refuses them; their answers are wrong.
-- The proofs-history extension: refused at launch (see
-  [Operating requirements](#operating-requirements)).
-- Building payloads on a node that does not hold every shard: the payload builder computes a
-  full state root over don't-care rows, so payload attributes are refused (see
-  [Operating requirements](#operating-requirements)).
-- `--debug.skip-state-root` is refused: the node already uses its own state-root strategy.
-
-## State-root check
-
-A background integrity check, run by every clustered node (a node that stores nothing checks
-too, through its peers), that recent blocks' state roots add up. **What is verified:** for a
-block `N`, the trie hashes the storing nodes computed for `N`, combined across owners, equal the
-header's state root. **What is not verified:** stored values are not re-read (a value written
-wrongly but hashed correctly goes unnoticed until a later block hashes it); one owner per subtree
-is asked, so a corrupt replica that was not asked is not detected; blocks are checked only while
-every needed owner still holds them in memory (about ten minutes), so a node far behind its
-peers, or a cluster catching up, checks nothing; and nothing is checked at insertion: a block
-with a wrong state root is accepted and detected afterwards, if at all, by this check.
-
-**Capture.** When the state-root strategy finishes block `N` (see
-[Trie maintenance](#trie-maintenance)), a storing node keeps, for the last
-`RootCaptures::WINDOW_BLOCKS` (300) blocks it executed, by block hash (`TrieHashCapture`):
-
-- for each held account shard `[x, y]` that contains no split contract: child `y` of
-  account-trie node `[x]`, as one of empty, a hash (the child is a branch node whose hash is
-  stored: its `hash_mask` bit), or not-a-hashed-branch;
-- for each split contract and held range `[a, b]`: the same from its storage-trie node `[a]`;
-- for each held account shard containing split contracts: the proof nodes of paths of two or
-  more nibbles from reth's multiproof (over the engine's overlay provider for `N`'s parent with
-  `N`'s held post-state and trie updates layered on top) of those contracts, which contain their
-  leaves with nonce, balance and code hash at `N`.
-
-Shard and range values come from `N`'s own depth-1 nodes where `N`'s trie updates rewrote or
-removed them, otherwise from the parent's capture. When the parent has no capture (the first
-block after start-up, a block after a failed capture, a fork from an uncaptured block), they are
-read from the parent's depth-1 nodes through the overlay provider, which shows that parent's
-state exactly (database plus in-memory ancestors), so there is no unknown state to re-seed from
-later. A shard's proof is taken again when `N` changed an account or storage in that shard, or
-the parent has no capture, and is carried otherwise. Everything served for `N` comes from this
-capture; nothing is recomputed from later data, so persisting later blocks never changes an
-answer. A failed capture is logged and never fails the block. Cost per block: no extra reads
-except one overlay read transaction (opened anyway when the slice changes), a multiproof per
-touched held shard with split contracts (one path from the root to each contract's leaf plus
-that contract's storage-root walk over its stored root node), and 16 + 16 per split contract
-node reads when seeding. Memory: about 128 shard values and 128 range values per split contract
-(33 bytes each plus map overhead) and a few proof nodes (at most 532 bytes each, about 6 per
-contract): roughly 10-20 KB per block, a few MB for the window. A node that stores nothing
-captures nothing.
-
-**Assembly** (`RootAssembly`, alloy-trie's node encoding): a split contract's storage root is the
-root branch over the 16 branch nodes of its 256 range values; a shard containing split contracts
-is recomputed by its owner by re-encoding the captured proof nodes bottom-up with each contract's
-leaf carrying the supplied storage root (nodes shared by two contracts are rebuilt once); the
-state root is the root branch over the 16 branch nodes of the 256 shard values. Empty children
-encode as empty; a not-a-hashed-branch value, or a top branch node left with fewer than two
-children, makes the block unverifiable (skipped), never wrong.
-
-**Verifier** (`RootChecker`, `RootCheckSchedule`; started by `RootCheckTask` in
-`base-node-runner`): every 500 ms, at most one block at a time, 2 blocks behind the canonical
-head and never more than 32 further behind. Round 1 asks owners for `ShardHashes` (this node
-first when it owns the subtree, then the others in placement order, falling to the next on "not
-available" or unreachable) and computes each split contract's storage root; round 2 asks the
-owners of shards containing split contracts for `SplitShardHashes` with those roots; then it
-assembles the state root and compares it with the header. An owner answers only for the exact
-`(number, hash)` it captured. A block some subtree of which no owner can supply is retried for
-20 s, then skipped; an unverifiable block is skipped at once.
-
-Signals: counters verified, skipped (`not_available`, `unverifiable`, `unreachable`) and
-mismatched, the last verified block and head minus last verified, in metrics
-`base_cluster_root_check_*` and a `cluster state root checks` log line every 10 seconds; a
-warning `cluster state root not verified for many blocks` at most every 60 s once
-`root_check_warn_blocks` (default 300) blocks pass unverified.
-
-**Mismatch:** an error `cluster state root mismatch` with the block, header root, assembled root
-and every subtree's `owner:value`. Then, by the config key `root_check`:
-
-- `"exit"` (default): writes `cluster-root-mismatch` in the datadir and exits the process with
-  code 3. A clustered node refuses to start while that file exists; remove it after
-  investigating.
-- `"log"`: only logs and counts.
-- `"off"`: the check does not run (captures are still kept and served to peers).
 
 ## Design record
 
@@ -776,3 +805,10 @@ Decided after a two-seat, two-pass design review on 2026-11-12.
   (Cancun); such a contract, and one created again at the same address later, are covered by the
   end-to-end test against a full node. A wipe of a contract with persisted storage would arrive
   without a wipe flag on a full node at this reth revision too.
+- Decided on 2026-11-13 (state-root check on the integrated branch): the verifier starts above
+  the head the node started at, because owners restarted with it have no capture of earlier
+  blocks and each such block cost a 20 s retry (a restarted test cluster took minutes to reach
+  its first new block); an owner still building its history index answers hash requests
+  `NotAvailable` like every other request, although its captures would be correct, so that one
+  readiness rule covers everything an owner serves; the mismatch marker is checked by the node
+  launch as well as by the command, so every launch path refuses.
