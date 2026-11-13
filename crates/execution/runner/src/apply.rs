@@ -11,7 +11,7 @@ use std::{
 use alloy_primitives::{B256, keccak256};
 use base_common_consensus::{BasePrimitives, Predeploys};
 use base_common_rpc_types_engine::ExecutionData;
-use base_execution_cluster::{ApplyFallback, ClusterNode, ExecutedBlockResult, Shard};
+use base_execution_cluster::{ApplyFallback, ClusterNode, ExecutedBlockResult, OwnersNotReady, Shard};
 use base_node_core::{
     BaseEngineTypes, BaseNodeTypes, BasePayloadValidatorBuilder, MessagePasserRootCheck,
 };
@@ -151,7 +151,9 @@ where
 /// clustered node, before executing any block, it waits
 /// for owners able to serve its persisted block ([`ClusterNode::wait_for_owners`]); when they
 /// do not become ready in time, validation fails with a processing error, which reth does not
-/// record as an invalid block, so the same block can be delivered again.
+/// record as an invalid block, so the same block can be delivered again. A downloaded or
+/// buffered block refused this way is dropped by reth, not retried: only a later payload or
+/// forkchoice update downloads it again.
 #[derive(Debug)]
 pub struct ApplyEngineValidator<V, P, PV> {
     inner: V,
@@ -174,24 +176,19 @@ impl<V, P, PV> ApplyEngineValidator<V, P, PV>
 where
     V: EngineValidator<BaseEngineTypes, BasePrimitives>,
 {
-    /// Waits until owners can serve this node's persisted block before `block` executes; a
-    /// refusal is a processing error carrying `block`, never an invalid-block verdict.
-    fn wait_for_owners(
-        &self,
-        block: impl FnOnce() -> Result<SealedBlock<BaseBlock>, NewPayloadError>,
-    ) -> Result<(), InsertPayloadError<BaseBlock>> {
+    /// Waits until owners can serve this node's persisted block before a block executes.
+    fn wait_for_owners(&self) -> Result<(), OwnersNotReady> {
         let Some(node) = &self.cluster else { return Ok(()) };
-        let Err(error) = node.wait_for_owners(node.client().options().retry_for) else {
-            return Ok(());
-        };
-        let block = block()?;
-        warn!(
-            block = %block.hash(),
-            number = block.number(),
-            error = %error,
-            "not executing a block until cluster owners can serve this node's persisted block"
-        );
-        Err(InsertBlockError::new(block, InsertBlockErrorKind::Other(Box::new(error))).into())
+        node.wait_for_owners(node.client().options().retry_for)
+    }
+
+    /// The refusal of `block` because owners were not ready: a processing error, never an
+    /// invalid-block verdict.
+    fn not_executed(
+        block: SealedBlock<BaseBlock>,
+        error: OwnersNotReady,
+    ) -> InsertPayloadError<BaseBlock> {
+        InsertBlockError::new(block, InsertBlockErrorKind::Other(Box::new(error))).into()
     }
 
     fn execute_payload(
@@ -199,7 +196,17 @@ where
         payload: ExecutionData,
         ctx: TreeCtx<'_, BasePrimitives>,
     ) -> ValidationOutcome<BasePrimitives> {
-        self.wait_for_owners(|| self.inner.convert_payload_to_block(payload.clone()))?;
+        if let Err(error) = self.wait_for_owners() {
+            let block = self.inner.convert_payload_to_block(payload)?;
+            warn!(
+                block = %block.hash(),
+                number = block.number(),
+                error = %error,
+                "not executing a payload until cluster owners can serve this node's persisted \
+                 block; the consensus client can send it again"
+            );
+            return Err(Self::not_executed(block, error));
+        }
         self.inner.validate_payload(payload, ctx)
     }
 }
@@ -266,7 +273,18 @@ where
         block: SealedBlockWithAccessList<BaseBlock>,
         ctx: TreeCtx<'_, BasePrimitives>,
     ) -> ValidationOutcome<BasePrimitives> {
-        self.wait_for_owners(|| Ok(block.block().clone()))?;
+        if let Err(error) = self.wait_for_owners() {
+            let block = block.block().clone();
+            warn!(
+                block = %block.hash(),
+                number = block.number(),
+                error = %error,
+                "dropped a downloaded block: cluster owners cannot serve this node's persisted \
+                 block; reth does not retry it, a later payload or forkchoice update downloads \
+                 it again"
+            );
+            return Err(Self::not_executed(block, error));
+        }
         self.inner.validate_block(block, ctx)
     }
 

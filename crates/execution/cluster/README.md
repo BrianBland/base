@@ -590,10 +590,13 @@ building their history index, or behind `P` are waited for, polling every 20 ms 
 the number of waiting `shards` and each owner's state. A node holding every shard does not wait.
 
 When the wait runs out, or at once when every owner of some shard keeps history only above `P`,
-validation fails with a processing error, logged as `not executing a block until cluster owners
-can serve this node's persisted block` and returned to the consensus client as an internal error
-of `engine_newPayload`. reth does not record the block as invalid, so the consensus client can
-deliver it again. The messages are:
+validation fails with a processing error. For a new payload it is logged as `not executing a
+payload until cluster owners can serve this node's persisted block; the consensus client can send
+it again` and returned to the consensus client as an internal error of `engine_newPayload`. reth
+does not record the block as invalid, so the consensus client can deliver it again. A downloaded
+or buffered block has no caller to retry it: it is logged as `dropped a downloaded block: cluster
+owners cannot serve this node's persisted block; reth does not retry it, a later payload or
+forkchoice update downloads it again` and dropped (see [Limits](#limits)). The messages are:
 
 - `no owner of N shards this node does not hold could serve its persisted block P within T
   (owners: node 2: L..=H, node 3: unreachable); retry once they catch up`;
@@ -776,6 +779,11 @@ reusing pages until it finishes, so prefer a stopped node.
 - An owner answers a bytecode only once it has persisted it, so reading code from a block this
   node persisted before every owner of the code's shard did waits for an owner to persist it,
   and fails if none does within the client's retry budget (`read_retry_secs`, 60 s by default).
+- A downloaded or buffered block (one reth fetched to fill a gap, not one the consensus client
+  sent with `engine_newPayload`) that the [pre-execution wait](#pre-execution-wait) refuses is
+  dropped, not retried, even after the owners recover. The node makes progress again only when
+  the consensus client sends a later payload or a forkchoice update that makes reth download the
+  missing blocks again. The log line `dropped a downloaded block` marks each such drop.
 - A read that runs out of `read_retry_secs` while owners stay behind or unreachable fails. The
   [pre-execution wait](#pre-execution-wait) makes this rare, but an owner that falls behind or
   goes down after the wait can still cause it. Inside transaction execution reth retries the
