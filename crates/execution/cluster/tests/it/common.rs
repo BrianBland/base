@@ -4,14 +4,17 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    ops::RangeInclusive,
+    sync::{Arc, Mutex, mpsc},
+    thread::JoinHandle,
+    time::Duration,
 };
 
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256, map::B256Map};
 use base_execution_cluster::{
-    CanonicalBlock, Cluster, ClusterConfig, NodeConfig, NodeId, OwnerStore, ProviderChangesets,
-    Shard,
+    CanonicalBlock, ChangesetSource, Cluster, ClusterConfig, NodeConfig, NodeId, OwnerStore,
+    PlainChangesets, ProviderChangesets, Shard,
 };
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use reth_db::{DatabaseEnv, test_utils::TempDatabase};
@@ -528,6 +531,66 @@ pub(crate) fn open_owner(
     let shared = Arc::new(factory.clone());
     assert!(store.install_changesets(Box::new(ProviderChangesets::new(&shared))).unwrap());
     (store, shared)
+}
+
+/// Longest wait of a [`GatedBuild`] for its build to start or to be released.
+const GATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Changesets whose first availability check blocks until released (or [`GATE_TIMEOUT`]
+/// passes), standing in for a slow index build: every build checks availability first.
+struct GatedChangesets {
+    inner: ProviderChangesets<TestFactory>,
+    started: Mutex<Option<mpsc::Sender<()>>>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl ChangesetSource for GatedChangesets {
+    fn available(&self) -> Result<Option<RangeInclusive<u64>>, DatabaseError> {
+        if let Some(started) = self.started.lock().unwrap().take() {
+            let _ = started.send(());
+            let _ = self.release.lock().unwrap().recv_timeout(GATE_TIMEOUT);
+        }
+        self.inner.available()
+    }
+
+    fn read(&self, blocks: RangeInclusive<u64>) -> Result<PlainChangesets, DatabaseError> {
+        self.inner.read(blocks)
+    }
+}
+
+/// A history index build of an owner store, stopped at its start.
+pub(crate) struct GatedBuild {
+    release: mpsc::Sender<()>,
+    build: JoinHandle<bool>,
+    /// The changeset reader holds the factory weakly.
+    _factory: Arc<TestFactory>,
+}
+
+impl GatedBuild {
+    /// Installs `factory`'s changesets on `store` on another thread and returns once the build
+    /// has started.
+    pub(crate) fn start(store: &Arc<Store>, factory: &TestFactory) -> Self {
+        let factory = Arc::new(factory.clone());
+        let (started, building) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let source = GatedChangesets {
+            inner: ProviderChangesets::new(&factory),
+            started: Mutex::new(Some(started)),
+            release: Mutex::new(gate),
+        };
+        let build = std::thread::spawn({
+            let store = Arc::clone(store);
+            move || store.install_changesets(Box::new(source)).unwrap()
+        });
+        building.recv_timeout(GATE_TIMEOUT).expect("the history build did not start");
+        Self { release, build, _factory: factory }
+    }
+
+    /// Lets the build finish and waits for it; returns whether the changesets were installed.
+    pub(crate) fn finish(self) -> bool {
+        let _ = self.release.send(());
+        self.build.join().unwrap()
+    }
 }
 
 /// Persists `blocks` (changesets, hashed state, `Finish`) in one commit, through `store`'s

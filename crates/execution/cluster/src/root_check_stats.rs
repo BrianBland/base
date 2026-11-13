@@ -198,6 +198,10 @@ pub enum StepOutcome {
 /// Which recent block to check next: one at a time, [`Self::LAG_BLOCKS`] behind the canonical
 /// head, never more than [`Self::MAX_BEHIND_BLOCKS`] further behind; a block whose owners cannot
 /// answer is tried again until [`Self::RETRY_FOR`] has passed, then skipped.
+///
+/// Checking starts above the head the node started at. Captures are kept in memory, so owners
+/// that restarted with this node have none of the blocks it inserted before; each such block
+/// would only be retried for [`Self::RETRY_FOR`] and skipped.
 #[derive(Debug)]
 pub struct RootCheckSchedule {
     stats: Arc<RootCheckStats>,
@@ -206,8 +210,8 @@ pub struct RootCheckSchedule {
     next: u64,
     /// The block being retried and when it was first tried.
     pending: Option<(u64, Instant)>,
-    /// The last verified block or, before the first, the first head seen.
-    verified_or_start: Option<u64>,
+    /// The last verified block or, before the first, the head the node started at.
+    verified_or_start: u64,
     last_warning: Option<Instant>,
 }
 
@@ -223,14 +227,15 @@ impl RootCheckSchedule {
     /// Least time between two "not verified" warnings.
     pub const WARN_INTERVAL: Duration = Duration::from_secs(60);
 
-    /// A schedule counting into `stats` that warns once `warn_blocks` blocks pass unverified.
-    pub const fn new(stats: Arc<RootCheckStats>, warn_blocks: u64) -> Self {
+    /// A schedule counting into `stats` that warns once `warn_blocks` blocks pass unverified, for
+    /// a node that started at head `started_at`.
+    pub const fn new(stats: Arc<RootCheckStats>, warn_blocks: u64, started_at: u64) -> Self {
         Self {
             stats,
             warn_blocks,
-            next: 1,
+            next: started_at + 1,
             pending: None,
-            verified_or_start: None,
+            verified_or_start: started_at,
             last_warning: None,
         }
     }
@@ -250,8 +255,7 @@ impl RootCheckSchedule {
         check: impl FnOnce(CheckedBlock) -> CheckOutcome,
     ) -> StepOutcome {
         self.stats.head.store(head, Ordering::Relaxed);
-        let start = *self.verified_or_start.get_or_insert(head);
-        self.warn_if_unverified(head, start, now);
+        self.warn_if_unverified(head, self.verified_or_start, now);
 
         let (number, since) = match self.pending {
             Some(pending) => pending,
@@ -271,7 +275,7 @@ impl RootCheckSchedule {
         let outcome = match check(block) {
             CheckOutcome::Verified => {
                 self.stats.record_verified(number);
-                self.verified_or_start = Some(number);
+                self.verified_or_start = number;
                 StepOutcome::Verified(number)
             }
             CheckOutcome::Mismatch(mismatch) => {
@@ -331,7 +335,7 @@ mod tests {
 
     #[test]
     fn checks_each_block_behind_the_head_once() {
-        let mut schedule = RootCheckSchedule::new(Arc::default(), 100);
+        let mut schedule = RootCheckSchedule::new(Arc::default(), 100, 0);
         let now = Instant::now();
         assert_eq!(schedule.step(2, now, block, |_| unreachable!()), StepOutcome::Idle);
 
@@ -352,7 +356,7 @@ mod tests {
 
     #[test]
     fn an_unavailable_block_is_retried_then_skipped_and_counted_never_mismatched() {
-        let mut schedule = RootCheckSchedule::new(Arc::default(), 100);
+        let mut schedule = RootCheckSchedule::new(Arc::default(), 100, 0);
         let start = Instant::now();
         let unavailable = |_| CheckOutcome::Skipped(SkipReason::NotAvailable);
 
@@ -381,7 +385,7 @@ mod tests {
 
     #[test]
     fn an_unverifiable_block_is_skipped_at_once() {
-        let mut schedule = RootCheckSchedule::new(Arc::default(), 100);
+        let mut schedule = RootCheckSchedule::new(Arc::default(), 100, 0);
         let outcome = schedule
             .step(3, Instant::now(), block, |_| CheckOutcome::Skipped(SkipReason::Unverifiable));
 
@@ -391,12 +395,24 @@ mod tests {
 
     #[test]
     fn a_far_behind_schedule_jumps_to_recent_blocks() {
-        let mut schedule = RootCheckSchedule::new(Arc::default(), 100);
+        let mut schedule = RootCheckSchedule::new(Arc::default(), 100, 0);
         let head = 1_000;
         let expected = head - RootCheckSchedule::LAG_BLOCKS - RootCheckSchedule::MAX_BEHIND_BLOCKS;
 
         let outcome = schedule.step(head, Instant::now(), block, |_| CheckOutcome::Verified);
 
         assert_eq!(outcome, StepOutcome::Verified(expected));
+    }
+
+    #[test]
+    fn blocks_inserted_before_the_node_started_are_not_checked() {
+        let mut schedule = RootCheckSchedule::new(Arc::default(), 100, 16);
+        let now = Instant::now();
+        assert_eq!(schedule.step(18, now, block, |_| unreachable!()), StepOutcome::Idle);
+
+        assert_eq!(
+            schedule.step(19, now, block, |_| CheckOutcome::Verified),
+            StepOutcome::Verified(17)
+        );
     }
 }

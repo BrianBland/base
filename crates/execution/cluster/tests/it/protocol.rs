@@ -18,8 +18,8 @@ use reth_db_api::{table::Compress, tables, transaction::DbTxMut};
 use reth_primitives_traits::{Bytecode, StorageEntry};
 
 use crate::common::{
-    ChainBlock, PlainKeys, PlainState, Store, TestFactory, block_hash, factory, open_owner,
-    persist_chain, plain_chain, rng,
+    ChainBlock, GatedBuild, PlainKeys, PlainState, Store, TestFactory, block_hash, factory,
+    open_owner, persist_chain, plain_chain, rng,
 };
 
 /// Storage nodes 1 and 2 at the given addresses and a stateless node 3, seen from `node_id`.
@@ -522,7 +522,8 @@ fn capture(number: u64, contract: B256) -> CapturedHashes {
 fn owner_serves_captured_hashes_for_the_exact_block_only() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let view = cluster_of(1, 2, listener.local_addr().unwrap(), closed_port());
-    let store = Arc::new(OwnerStore::new(Arc::clone(&view), create_test_rw_db(), 160).unwrap());
+    let db = factory();
+    let store = Arc::new(open_owner(&db, &view, 160).0);
     let captures = Arc::new(RootCaptures::default());
     let contract = B256::repeat_byte(0x7a);
     captures.insert(capture(5, contract));
@@ -558,4 +559,47 @@ fn owner_serves_captured_hashes_for_the_exact_block_only() {
             Err(OwnerFailure::Refused(ReadError::NotAvailable))
         ));
     }
+}
+
+/// An owner whose history index is still being built is not ready: it answers a request for a
+/// block it has captured as not available, never with a hash, and with the hash once the index
+/// is published.
+#[test]
+fn owner_building_its_history_answers_captured_hashes_as_not_available() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let view = cluster_of(1, 2, listener.local_addr().unwrap(), closed_port());
+    let db = factory();
+    let store = Arc::new(Store::new(Arc::clone(&view), Arc::clone(db.db_ref()), 160).unwrap());
+    assert!(store.install_block_hashes(Box::new(|number| Some(block_hash(0, number)))));
+    let build = GatedBuild::start(&store, &db);
+    let captures = Arc::new(RootCaptures::default());
+    let contract = B256::repeat_byte(0x7a);
+    captures.insert(capture(5, contract));
+    let _server = OwnerServer::spawn_with_root_captures(
+        listener,
+        Arc::clone(&store),
+        Arc::default(),
+        captures,
+    )
+    .unwrap();
+    let client = ClusterClient::new(
+        cluster_of(3, 2, view.address(NodeId(1)).unwrap(), closed_port()),
+        ClientOptions::default(),
+    );
+    let roots = [(contract, B256::repeat_byte(1))];
+
+    assert!(matches!(
+        client.shard_hashes(NodeId(1), 5, block_hash(1, 5)),
+        Err(OwnerFailure::Refused(ReadError::NotAvailable))
+    ));
+    assert!(matches!(
+        client.split_shard_hashes(NodeId(1), 5, block_hash(1, 5), &roots),
+        Err(OwnerFailure::Refused(ReadError::NotAvailable))
+    ));
+
+    assert!(build.finish());
+    assert_eq!(
+        client.shard_hashes(NodeId(1), 5, block_hash(1, 5)).unwrap(),
+        capture(5, contract).shard_hashes()
+    );
 }

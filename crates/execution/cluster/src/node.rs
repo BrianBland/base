@@ -26,8 +26,8 @@ use tracing::{error, info, warn};
 use crate::{
     ApplyCounts, ApplyStats, ChangesetReader, ClientOptions, Cluster, ClusterClient,
     ExecutedBlocks, KeyPlacement, NodeId, OwnerServer, OwnerState, OwnerStates, OwnerStore,
-    OwnersNotReady, RemoteReadCounts, RemoteReadStats, RootCaptures, Shard, ShardedTable,
-    TrieHashCapture, TrieSlice, TrieSliceCounts, TrieSliceStats,
+    OwnersNotReady, RemoteReadCounts, RemoteReadStats, RootCaptures, RootCheckStats, Shard,
+    ShardedTable, TrieHashCapture, TrieSlice, TrieSliceCounts, TrieSliceStats,
 };
 
 /// Returns the hash of the canonical block with the given number, when known.
@@ -99,6 +99,7 @@ pub struct ClusterNode {
     trie_slice_stats: Arc<TrieSliceStats>,
     root_captures: Arc<RootCaptures>,
     trie_hash_capture: TrieHashCapture,
+    root_check_stats: Arc<RootCheckStats>,
 }
 
 impl fmt::Debug for ClusterNode {
@@ -153,6 +154,10 @@ impl ClusterNode {
             .map_err(ClusterStartError::StatsLogger)?;
         let trie_slice = TrieSlice::new(Arc::clone(&cluster));
         let trie_hash_capture = TrieHashCapture::new(&cluster);
+        let root_check_stats = Arc::new(RootCheckStats::default());
+        root_check_stats
+            .spawn_logger(RootCheckStats::LOG_INTERVAL)
+            .map_err(ClusterStartError::StatsLogger)?;
         let owned = Shard::all().filter(|shard| cluster.owns(*shard)).count();
         info!(
             node_id = cluster.node_id().0,
@@ -175,6 +180,7 @@ impl ClusterNode {
             trie_slice_stats,
             root_captures,
             trie_hash_capture,
+            root_check_stats,
         })
     }
 
@@ -268,6 +274,11 @@ impl ClusterNode {
     /// Builds each executed block's capture for the state-root check.
     pub const fn trie_hash_capture(&self) -> &TrieHashCapture {
         &self.trie_hash_capture
+    }
+
+    /// The counters of this node's background state-root check.
+    pub const fn root_check_stats(&self) -> &Arc<RootCheckStats> {
+        &self.root_check_stats
     }
 
     /// Installs the canonical block-hash lookup on the owner store. Only the first lookup

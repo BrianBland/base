@@ -2,22 +2,21 @@
 //! writers (real changesets on disk), and refusals.
 
 use std::{
-    ops::RangeInclusive,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, mpsc},
     time::Duration,
 };
 
 use alloy_primitives::{B256, keccak256};
 use base_execution_cluster::{
-    ChangesetSource, Cluster, IndexCoverage, PlainChangesets, ProviderChangesets, Query, ReadError,
-    ReadResult, Request, Response, ServableRange, Shard, ShardedTable, SnapshotId, StoreError,
+    Cluster, IndexCoverage, Query, ReadError, ReadResult, Request, Response, ServableRange, Shard,
+    ShardedTable, SnapshotId, StoreError,
 };
 use rand::Rng;
-use reth_db_api::{Database, DatabaseError, table::Compress, tables, transaction::DbTxMut};
+use reth_db_api::{Database, table::Compress, tables, transaction::DbTxMut};
 use reth_primitives_traits::{Bytecode, StorageEntry};
 
 use crate::common::{
-    PlainKeys, PlainState, Store, TestFactory, block_hash, canonical, cluster, cluster_splitting,
+    GatedBuild, PlainKeys, PlainState, Store, block_hash, canonical, cluster, cluster_splitting,
     factory, open_owner as open, persist_chain as persist, plain_chain, rng,
 };
 
@@ -225,27 +224,6 @@ fn owner_answers_a_split_contract_like_the_true_history() {
     run_differential(3, true);
 }
 
-/// Changesets that block every read until released, standing in for a slow index build.
-struct GatedChangesets {
-    inner: ProviderChangesets<TestFactory>,
-    started: Mutex<Option<mpsc::Sender<()>>>,
-    release: Mutex<mpsc::Receiver<()>>,
-}
-
-impl ChangesetSource for GatedChangesets {
-    fn available(&self) -> Result<Option<RangeInclusive<u64>>, DatabaseError> {
-        self.inner.available()
-    }
-
-    fn read(&self, blocks: RangeInclusive<u64>) -> Result<PlainChangesets, DatabaseError> {
-        if let Some(started) = self.started.lock().unwrap().take() {
-            started.send(()).unwrap();
-            self.release.lock().unwrap().recv().unwrap();
-        }
-        self.inner.read(blocks)
-    }
-}
-
 #[test]
 fn answers_promptly_as_behind_while_its_history_is_built() {
     let mut rng = rng(7);
@@ -258,19 +236,7 @@ fn answers_promptly_as_behind_while_its_history_is_built() {
     let store =
         Arc::new(Store::new(Arc::clone(&cluster), Arc::clone(db.db_ref()), 30_000).unwrap());
     assert!(store.install_block_hashes(Box::new(|number| Some(block_hash(0, number)))));
-    let shared = Arc::new(db.clone());
-    let (started, building) = mpsc::channel();
-    let (release, gate) = mpsc::channel();
-    let source = GatedChangesets {
-        inner: ProviderChangesets::new(&shared),
-        started: Mutex::new(Some(started)),
-        release: Mutex::new(gate),
-    };
-    let build = std::thread::spawn({
-        let store = Arc::clone(&store);
-        move || store.install_changesets(Box::new(source)).unwrap()
-    });
-    building.recv().unwrap();
+    let build = GatedBuild::start(&store, &db);
 
     let held = held_address(&cluster, &keys);
     let (answered, answers) = mpsc::channel();
@@ -283,7 +249,7 @@ fn answers_promptly_as_behind_while_its_history_is_built() {
     });
     let during_build = answers.recv_timeout(Duration::from_secs(2));
     if during_build.is_err() {
-        release.send(()).unwrap();
+        build.finish();
         panic!("reads waited for the history build");
     }
     let (refused, status) = during_build.unwrap();
@@ -292,8 +258,7 @@ fn answers_promptly_as_behind_while_its_history_is_built() {
     // A commit during the build is indexed when the build publishes.
     persist(&db, Some(&store), &chain[9..=10]);
 
-    release.send(()).unwrap();
-    assert!(build.join().unwrap());
+    assert!(build.finish());
     assert_eq!(store.coverage(), Some(IndexCoverage { lowest: 0, indexed: 10 }));
     assert_history(&store, &cluster, &keys, &states, 0..=10, "after a slow build");
 }

@@ -4,15 +4,30 @@
 //! split contract, deploys and calls a contract, and destroys contracts with storage; storing
 //! nodes stop, fall behind and restart, alone and all together, and every node catches up.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use alloy_genesis::GenesisAccount;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
 use alloy_rpc_types_engine::PayloadStatusEnum;
 use base_common_rpc_types_engine::BaseExecutionPayloadEnvelopeV4;
-use base_execution_cluster::{ClusterConfig, NodeConfig as ClusterNodeConfig, NodeId, OwnerCounts};
+use base_execution_cluster::{
+    CheckOutcome, CheckedBlock, Cluster, ClusterConfig, ClusterHashSource,
+    NodeConfig as ClusterNodeConfig, NodeId, OwnerCounts, RootCheckMode, RootCheckSchedule,
+    RootChecker, RootMismatchMarker, Shard, ShardHash,
+};
 use eyre::{Result, eyre};
+use reth_db::{
+    Database, DatabaseEnv,
+    cursor::DbCursorRO,
+    tables,
+    transaction::{DbTx, DbTxMut},
+};
 use reth_provider::{AccountReader, StateProviderFactory};
+use reth_trie::PackedStoredNibbles;
+use reth_trie_common::{BranchNodeCompact, Nibbles};
 
 use crate::{
     DEPOSITOR, STORAGE_CONTRACT, TestNode, chain_spec_with, cluster_config, deposit, deposit_from,
@@ -86,7 +101,7 @@ fn child() -> Address {
 }
 
 /// The genesis of the workload: [`STORAGE_CONTRACT`] dense, the factory, empty accounts.
-fn chain_spec() -> Result<std::sync::Arc<base_execution_chainspec::BaseChainSpec>> {
+fn chain_spec() -> Result<Arc<base_execution_chainspec::BaseChainSpec>> {
     let factory =
         (FACTORY, GenesisAccount::default().with_code(Some(Bytes::from_static(&FACTORY_CODE))));
     let empties =
@@ -210,7 +225,14 @@ impl Chain {
     /// Produces the next block and imports it into `nodes`.
     async fn advance(&mut self, nodes: &[&TestNode]) -> Result<()> {
         let number = self.blocks.len() as u64 + 1;
-        let envelope = self.producer.produce(self.workload.block(number)).await?;
+        let transactions = self.workload.block(number);
+        self.advance_with(transactions, nodes).await
+    }
+
+    /// Produces the next block with `transactions` instead of the workload's, and imports it into
+    /// `nodes`.
+    async fn advance_with(&mut self, transactions: Vec<Bytes>, nodes: &[&TestNode]) -> Result<()> {
+        let envelope = self.producer.produce(transactions).await?;
         for node in nodes {
             node.import(&envelope).await?;
         }
@@ -271,8 +293,11 @@ async fn cluster_follows_the_chain_through_restarts() -> Result<()> {
     let d = TestNode::launch(&chain_spec, Some(configs[3].clone())).await?;
     let mut chain = Chain { producer, blocks: Vec::new(), workload: Workload::default() };
 
-    // Everyone follows.
+    // Everyone follows, and every node's background check verifies blocks.
     chain.advance_to(6, &[&a, &b, &c, &d]).await?;
+    for node in [&a, &b, &c, &d] {
+        node.wait_root_verified(6 - RootCheckSchedule::LAG_BLOCKS).await?;
+    }
 
     // A stops; the others go well past its persisted block; A restarts and catches up.
     a.wait_persisted(6).await?;
@@ -327,6 +352,26 @@ async fn cluster_follows_the_chain_through_restarts() -> Result<()> {
         assert!(latest.account_code(&deployed())?.is_some(), "the contract was not deployed");
     }
 
+    // The restarted nodes' checks verify blocks after every restart, the non-storing D's
+    // included, and find no mismatch. Every restarted storing node seeded its captures over
+    // replicated rows that hold stale hashes of shards it does not hold.
+    for (name, node) in [("A", &a), ("B", &b), ("C", &c), ("D", &d)] {
+        let counts = node.wait_root_verified(head.1 - RootCheckSchedule::LAG_BLOCKS).await?;
+        assert!(counts.verified > 0, "node {name}: {counts:?}");
+        assert_eq!(counts.mismatched, 0, "node {name}: {counts:?}");
+        println!(
+            "ROOTCHECK node {name}: {counts:?} last {:?}",
+            node.cluster().root_check_stats().last_verified()
+        );
+    }
+    for (name, node) in [("A", &a), ("B", &b), ("C", &c)] {
+        let cluster = node.cluster().cluster();
+        let held = foreign_child_hashes(&node.env, cluster)?;
+        let truth = foreign_child_hashes(&chain.producer.env, cluster)?;
+        let stale = held.iter().filter(|(child, hash)| truth.get(*child) != Some(*hash)).count();
+        assert!(stale > 0, "node {name}: no stale hash of a shard it does not hold");
+    }
+
     // a. Every node is at the head and reads the reference's state.
     let (accounts, slots) = chain.workload.keys();
     let expected = chain.producer.state_of(&accounts, &slots)?;
@@ -365,6 +410,25 @@ async fn cluster_follows_the_chain_through_restarts() -> Result<()> {
         node.remove().await?;
     }
     Ok(())
+}
+
+/// The hashes of the shards `cluster`'s node does not hold, as the replicated one-nibble
+/// account-trie rows in `env` store them: the node never maintains them.
+fn foreign_child_hashes(env: &DatabaseEnv, cluster: &Cluster) -> Result<BTreeMap<Shard, B256>> {
+    let mut hashes = BTreeMap::new();
+    for entry in env.tx()?.cursor_read::<tables::PackedAccountsTrie>()?.walk(None)? {
+        let (path, node) = entry?;
+        if path.0.len() != 1 {
+            continue;
+        }
+        for child in (0..16u8).filter(|child| node.hash_mask.is_bit_set(*child)) {
+            let shard = Shard(path.0.get_unchecked(0) << 4 | child);
+            if !cluster.owns(shard) {
+                hashes.insert(shard, node.hash_for_nibble(child));
+            }
+        }
+    }
+    Ok(hashes)
 }
 
 /// Blocks the owners go past a stopped node: more than the minimum history window.
@@ -455,6 +519,172 @@ async fn a_node_waits_for_its_owners_and_never_marks_the_block_invalid() -> Resu
     assert_eq!(x.head().await?, chain.producer.head().await?);
 
     for node in [chain.producer, x, b, c] {
+        node.remove().await?;
+    }
+    Ok(())
+}
+
+/// The account-trie rows of two nibbles in `env`, by path.
+fn two_nibble_rows(env: &DatabaseEnv) -> Result<BTreeMap<Nibbles, BranchNodeCompact>> {
+    let mut rows = BTreeMap::new();
+    for entry in env.tx()?.cursor_read::<tables::PackedAccountsTrie>()?.walk(None)? {
+        let (path, node) = entry?;
+        if path.0.len() == 2 {
+            rows.insert(path.0, node);
+        }
+    }
+    Ok(rows)
+}
+
+/// Every shard's hash, as the one-nibble account-trie rows of a full node's `env` store them.
+fn shard_hashes(env: &DatabaseEnv) -> Result<BTreeMap<Shard, ShardHash>> {
+    let mut hashes = BTreeMap::new();
+    for entry in env.tx()?.cursor_read::<tables::PackedAccountsTrie>()?.walk(None)? {
+        let (path, node) = entry?;
+        if path.0.len() == 1 {
+            for child in (0..16u8).filter(|child| node.hash_mask.is_bit_set(*child)) {
+                let shard = Shard(path.0.get_unchecked(0) << 4 | child);
+                hashes.insert(shard, ShardHash::Hash(node.hash_for_nibble(child)));
+            }
+        }
+    }
+    Ok(hashes)
+}
+
+/// A storing node's held trie row is corrupted on disk, and the next block touching that shard
+/// gives the node a wrong hash of it. In log mode, every node that asks that owner for the shard
+/// counts a mismatch, the other owner of the shard asks itself and verifies the block, and the
+/// mismatch names the shard and the owner. In exit mode the mismatch writes the marker, and the
+/// node then refuses to start.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrupted_trie_row_is_reported_by_the_nodes_that_ask_its_owner() -> Result<()> {
+    base_node_runner::test_utils::init_silenced_tracing();
+    let chain_spec = chain_spec()?;
+    let configs = configs()?;
+    let producer = TestNode::launch(&chain_spec, None).await?;
+    let mut storing = Vec::new();
+    for config in &configs[..3] {
+        storing.push(TestNode::launch_from_full_datadir(&chain_spec, config.clone()).await?);
+    }
+    let [a, b, c]: [TestNode; 3] = storing.try_into().map_err(|_| eyre!("three storing nodes"))?;
+    let d = TestNode::launch(&chain_spec, Some(configs[3].clone())).await?;
+    let mut chain = Chain { producer, blocks: Vec::new(), workload: Workload::default() };
+    let at_genesis = two_nibble_rows(&chain.producer.env)?;
+    for _ in 0..3 {
+        chain.advance_with(Vec::new(), &[&a, &b, &c, &d]).await?;
+    }
+    for node in [&a, &b, &c, &d] {
+        node.wait_root_verified(1).await?;
+    }
+
+    // A shard whose first owner is A, that blocks without user deposits leave alone, and whose
+    // two-nibble row has a stored child hash.
+    let cluster = Arc::clone(a.cluster().cluster());
+    let corrupt = NodeId(1);
+    let excluded = [keccak256(STORAGE_CONTRACT)[0], keccak256(DEPOSITOR)[0]];
+    chain.producer.wait_persisted(3).await?;
+    let unchanged = two_nibble_rows(&chain.producer.env)?;
+    let (path, child) = unchanged
+        .iter()
+        .filter(|(path, node)| at_genesis.get(*path) == Some(*node))
+        .filter_map(|(path, node)| {
+            let shard = path.get_unchecked(0) << 4 | path.get_unchecked(1);
+            let child = (0..16u8).find(|child| node.hash_mask.is_bit_set(*child))?;
+            (cluster.owners(Shard(shard))[0] == corrupt && !excluded.contains(&shard))
+                .then_some((*path, child))
+        })
+        .next()
+        .ok_or_else(|| eyre!("no shard to corrupt"))?;
+    let shard = Shard(path.get_unchecked(0) << 4 | path.get_unchecked(1));
+
+    // A stops; one stored child hash of the shard's row is overwritten; A restarts.
+    a.wait_persisted(3).await?;
+    let stopped = a.stop().await?;
+    {
+        let env = stopped.open().await?;
+        let tx = env.tx_mut()?;
+        let mut node = tx
+            .get::<tables::PackedAccountsTrie>(PackedStoredNibbles(path))?
+            .ok_or_else(|| eyre!("A does not hold the row"))?;
+        let mut hashes = (*node.hashes).clone();
+        hashes[0] = B256::repeat_byte(0xbd);
+        node.hashes = hashes.into();
+        tx.put::<tables::PackedAccountsTrie>(PackedStoredNibbles(path), node)?;
+        tx.commit()?;
+    }
+    let a = stopped.launch(Some(configs[0].clone())).await?;
+
+    // Block 4 creates an account in the shard under another child than the corrupted one.
+    let target = (0u64..)
+        .map(|index| Address::from_word(seed(4, 20, index)))
+        .find(|address| {
+            let hashed = keccak256(address);
+            hashed[0] == shard.0 && hashed[1] >> 4 != child
+        })
+        .ok_or_else(|| eyre!("no address in the shard"))?;
+    let deposit = deposit(seed(4, 21, 0), TxKind::Call(target), 1_000_000_000, Bytes::new());
+    let nodes = [&a, &b, &c, &d];
+    chain.advance_with(vec![deposit], &nodes).await?;
+    chain.producer.wait_persisted(4).await?;
+    let reference_row = two_nibble_rows(&chain.producer.env)?.remove(&path);
+    assert_eq!(
+        reference_row.map(|node| node.hash_for_nibble(child)),
+        Some(at_genesis[&path].hash_for_nibble(child)),
+        "block 4 recomputed the corrupted child"
+    );
+    let truth = shard_hashes(&chain.producer.env)?;
+
+    // Checked from D, which holds nothing: the mismatch names the shard and its owner A, and
+    // every other account shard has the reference's hash.
+    let header =
+        chain.blocks[3].execution_payload.payload_inner.payload_inner.payload_inner.clone();
+    let block = CheckedBlock { number: 4, hash: header.block_hash, state_root: header.state_root };
+    let source = ClusterHashSource { node: d.cluster() };
+    let outcome = tokio::task::block_in_place(|| {
+        RootChecker::new(d.cluster().cluster(), &source).check(block)
+    });
+    let CheckOutcome::Mismatch(mismatch) = outcome else {
+        return Err(eyre!("expected a mismatch, got {outcome:?}"));
+    };
+    let wrong: Vec<_> = mismatch
+        .sources
+        .iter()
+        .filter(|source| {
+            source.contract.is_none() && truth.get(&source.shard) != Some(&source.value)
+        })
+        .map(|source| (source.shard, source.owner))
+        .collect();
+    assert_eq!(wrong, vec![(shard, corrupt)]);
+
+    // In the background, the nodes that ask A for the shard count the mismatch; the other owner
+    // of the shard asks itself and verifies the block.
+    for _ in 0..RootCheckSchedule::LAG_BLOCKS {
+        chain.advance_with(Vec::new(), &nodes).await?;
+    }
+    for node in nodes {
+        let view = node.cluster().cluster();
+        let me = view.node_id();
+        let asked = if view.owns(shard) { me } else { view.owners(shard)[0] };
+        if asked == corrupt {
+            node.wait_root_checks("a mismatch", |counts, _| counts.mismatched > 0).await?;
+        } else {
+            let counts = node.wait_root_verified(4).await?;
+            assert_eq!(counts.mismatched, 0, "node {me:?} asked node {asked:?}");
+        }
+    }
+
+    // Exit mode writes the marker naming the shard and owner, and D then refuses to start.
+    let datadir = d.datadir.node_config.datadir().data_dir().to_path_buf();
+    assert!(RootCheckMode::Exit.on_mismatch(&mismatch, &datadir));
+    let marker = std::fs::read_to_string(RootMismatchMarker::path(&datadir))?;
+    assert!(marker.contains(&format!("{:02x}={}:", shard.0, corrupt.0)), "{marker}");
+    let d_path = d.datadir.path.clone();
+    let refused = d.stop().await?.launch(Some(configs[3].clone())).await;
+    let message = format!("{:?}", refused.err());
+    assert!(message.contains("cluster state-root mismatch was recorded"), "{message}");
+    let _ = std::fs::remove_dir_all(d_path);
+
+    for node in [chain.producer, a, b, c] {
         node.remove().await?;
     }
     Ok(())

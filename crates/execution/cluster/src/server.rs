@@ -13,13 +13,14 @@ use std::{
     time::Duration,
 };
 
+use alloy_primitives::B256;
 use parking_lot::Mutex;
 use reth_db_api::Database;
 use tracing::{debug, error};
 
 use crate::{
-    ExecutedBlocks, Frame, OwnerStore, Query, ReadError, ReadResult, Request, Response,
-    RootCaptures, StoreError,
+    CapturedHashes, ExecutedBlocks, Frame, OwnerStore, Query, ReadError, ReadResult, Request,
+    Response, RootCaptures, StoreError,
 };
 
 /// A running owner server. Dropping it stops accepting and closes open connections.
@@ -120,6 +121,19 @@ impl OwnerServer {
         Ok(())
     }
 
+    /// The capture of block `number` with hash `hash`, served only once `store`'s history index
+    /// is published: an owner still building it is not ready, and answers no query with data,
+    /// so a verifier moves on to another owner.
+    fn captured<DB: Database>(
+        store: &OwnerStore<DB>,
+        root_captures: &RootCaptures,
+        number: u64,
+        hash: B256,
+    ) -> Option<Arc<CapturedHashes>> {
+        store.coverage()?;
+        root_captures.get(number, hash)
+    }
+
     /// Answers requests until the peer disconnects, a frame is malformed, or the store fails.
     fn answer_requests<DB: Database>(
         mut stream: TcpStream,
@@ -140,14 +154,14 @@ impl OwnerServer {
                     .wait_for(hash, ExecutedBlocks::SERVE_WAIT)
                     .map(Response::ExecutedBlock)
                     .ok_or(ReadError::NotAvailable),
-                Query::ShardHashes { number, hash } => root_captures
-                    .get(number, hash)
-                    .map(|capture| Response::ShardHashes(capture.shard_hashes()))
-                    .ok_or(ReadError::NotAvailable),
+                Query::ShardHashes { number, hash } => {
+                    Self::captured(store, root_captures, number, hash)
+                        .map(|capture| Response::ShardHashes(capture.shard_hashes()))
+                        .ok_or(ReadError::NotAvailable)
+                }
                 Query::SplitShardHashes { number, hash, storage_roots } => {
                     let storage_roots = storage_roots.into_iter().collect();
-                    root_captures
-                        .get(number, hash)
+                    Self::captured(store, root_captures, number, hash)
                         .map(|capture| {
                             Response::SplitShardHashes(capture.split_shard_hashes(&storage_roots))
                         })

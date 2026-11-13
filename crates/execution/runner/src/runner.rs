@@ -7,7 +7,7 @@ use std::{
 
 use base_common_network::SharedEngineApi;
 use base_common_rpc_types_engine::PayloadReady;
-use base_execution_cluster::ClusteredDatabase;
+use base_execution_cluster::{ClusteredDatabase, RootMismatchMarker};
 use base_execution_payload_builder::{
     RejectionCache,
     config::{BaseDAConfig, GasLimitConfig, ResourceMeteringConfig},
@@ -217,6 +217,7 @@ impl<SB: PayloadServiceBuilder> BaseNodeRunner<SB> {
             .with_components(components)
             .with_add_ons(add_ons);
         let cluster = builder.db().cluster().cloned();
+        let datadir = builder.config().datadir().data_dir().to_path_buf();
         if let Some(node) = &cluster {
             if base_node.args.proofs_history {
                 bail!(
@@ -224,10 +225,10 @@ impl<SB: PayloadServiceBuilder> BaseNodeRunner<SB> {
                      remove --proofs-history or the cluster config"
                 );
             }
+            RootMismatchMarker::ensure_absent(&datadir)?;
             engine_validator.install_cluster(Arc::clone(node));
         }
         let owner_feed = cluster.clone();
-        let datadir = builder.config().datadir().data_dir().to_path_buf();
         let builder = builder.on_component_initialized(move |ctx| {
             if let Some(node) = owner_feed {
                 if let Some(check) =

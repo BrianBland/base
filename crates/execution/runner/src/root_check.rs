@@ -10,7 +10,7 @@ use std::{
 use alloy_primitives::{B256, Bytes, map::B256Set};
 use base_execution_cluster::{
     CaptureReads, CheckedBlock, ClusterHashSource, ClusterNode, RootCheckMode, RootCheckSchedule,
-    RootCheckStats, RootChecker, StepOutcome, TrieHashCapture,
+    RootChecker, StepOutcome, TrieHashCapture,
 };
 use reth_primitives_traits::AlloyBlockHeader;
 use reth_provider::{BlockNumReader, HeaderProvider, ProviderError, StateProofProvider};
@@ -89,21 +89,22 @@ where
     /// Exit code of a node stopped by a mismatch with `root_check = "exit"`.
     pub const MISMATCH_EXIT_CODE: i32 = 3;
 
-    /// The check of `node` over `provider`'s canonical blocks, writing the mismatch marker in
-    /// `datadir`; `None` when the configuration turns it off. Starts the counters' log line.
+    /// The check of `node` over `provider`'s canonical blocks above its current head, counting
+    /// into the node's [`ClusterNode::root_check_stats`] and writing the mismatch marker in
+    /// `datadir`; `None` when the configuration turns it off.
     pub fn new(
         node: Arc<ClusterNode>,
         provider: P,
         datadir: PathBuf,
-    ) -> eyre::Result<Option<Self>> {
+    ) -> Result<Option<Self>, ProviderError> {
         let config = node.cluster().config().root_check;
         info!(mode = ?config.mode, warn_blocks = config.warn_blocks, "cluster state root check");
         if config.mode == RootCheckMode::Off {
             return Ok(None);
         }
-        let stats = Arc::new(RootCheckStats::default());
-        stats.spawn_logger(RootCheckStats::LOG_INTERVAL)?;
-        let schedule = RootCheckSchedule::new(stats, config.warn_blocks);
+        let stats = Arc::clone(node.root_check_stats());
+        let started_at = provider.best_block_number()?;
+        let schedule = RootCheckSchedule::new(stats, config.warn_blocks, started_at);
         Ok(Some(Self { node, provider, datadir, schedule }))
     }
 

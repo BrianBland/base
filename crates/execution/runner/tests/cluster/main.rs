@@ -29,7 +29,7 @@ use base_consensus_providers::L1_RPC_TIMEOUT;
 use base_execution_chainspec::BaseChainSpec;
 use base_execution_cluster::{
     Cluster, ClusterConfig, ClusterNode, ClusteredDatabase, NodeConfig as ClusterNodeConfig,
-    NodeId, RootCheckConfig,
+    NodeId, RootCheckConfig, RootCheckCounts, RootCheckMode,
 };
 use base_node_core::args::RollupArgs;
 use base_node_runner::{
@@ -144,7 +144,14 @@ fn free_address() -> Result<SocketAddr> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?)
 }
 
-/// A cluster config of `nodes` seen from `node_id`, `R = 2`.
+/// Longest wait for a node's background state-root check to reach a block: a block an owner
+/// cannot answer yet is retried for [`RootCheckSchedule::RETRY_FOR`] before it is skipped.
+///
+/// [`RootCheckSchedule::RETRY_FOR`]: base_execution_cluster::RootCheckSchedule::RETRY_FOR
+const ROOT_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A cluster config of `nodes` seen from `node_id`, `R = 2`, with the state-root check in log
+/// mode so that a mismatch fails an assertion instead of exiting the test process.
 fn cluster_config(node_id: u64, nodes: &[ClusterNodeConfig]) -> ClusterConfig {
     ClusterConfig {
         node_id: NodeId(node_id),
@@ -154,7 +161,7 @@ fn cluster_config(node_id: u64, nodes: &[ClusterNodeConfig]) -> ClusterConfig {
         apply_from: Vec::new(),
         split_storage: Vec::new(),
         read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
-        root_check: RootCheckConfig::default(),
+        root_check: RootCheckConfig { mode: RootCheckMode::Log, ..RootCheckConfig::default() },
     }
 }
 
@@ -248,7 +255,18 @@ impl Datadir {
         let launched = tokio::task::spawn_blocking(move || {
             handle.block_on(BaseNodeRunner::new(RollupArgs::default()).launch(builder))
         })
-        .await??;
+        .await?;
+        let launched = match launched {
+            Ok(launched) => launched,
+            Err(error) => {
+                // A runtime cannot be dropped on the test's runtime.
+                tokio::task::spawn_blocking(move || {
+                    runtime.shutdown_timeout(Duration::from_secs(10))
+                })
+                .await?;
+                return Err(error);
+            }
+        };
         let endpoint = EngineEndpoint::InMemory {
             transport: InMemoryTransport { module: launched.auth_module.clone() },
             engine_api: launched.engine_api.clone(),
@@ -442,6 +460,35 @@ impl TestNode {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         Ok(())
+    }
+
+    /// Waits until this node's background state-root check satisfies `done` (given its counts
+    /// and last verified block), and returns the counts.
+    async fn wait_root_checks(
+        &self,
+        what: &str,
+        done: impl Fn(&RootCheckCounts, Option<u64>) -> bool,
+    ) -> Result<RootCheckCounts> {
+        let stats = self.cluster().root_check_stats();
+        let deadline = Instant::now() + ROOT_CHECK_TIMEOUT;
+        loop {
+            let (counts, last) = (stats.counts(), stats.last_verified());
+            if done(&counts, last) {
+                return Ok(counts);
+            }
+            if Instant::now() >= deadline {
+                return Err(eyre!("root check: {what}: {counts:?}, last verified {last:?}"));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Waits until this node's background state-root check has verified block `number`.
+    async fn wait_root_verified(&self, number: u64) -> Result<RootCheckCounts> {
+        self.wait_root_checks(&format!("block {number} verified"), |_, last| {
+            last.is_some_and(|last| last >= number)
+        })
+        .await
     }
 
     /// The head block's hash and number.
