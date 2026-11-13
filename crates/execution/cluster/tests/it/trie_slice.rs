@@ -13,7 +13,8 @@ use std::{
 
 use alloy_primitives::{B256, Bytes, U256, map::B256Map};
 use base_execution_cluster::{
-    ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, NodeConfig, NodeId, Shard, TrieSlice,
+    ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, LocalReads, NodeConfig, NodeId,
+    Shard, TrieSlice,
 };
 use rand::{Rng, rngs::StdRng, seq::IndexedRandom};
 use reth_chainspec::MAINNET;
@@ -266,13 +267,13 @@ struct SliceNode {
     slice: TrieSlice,
     env: DatabaseEnv,
     factory: NodeFactory,
-    _db: ClusteredDatabase,
+    db: ClusteredDatabase,
     _dir: TempDir,
 }
 
 impl SliceNode {
-    /// Node `node_id`, cloned from the full genesis `initial` and shed.
-    fn start(node_id: u64, split: &[B256], initial: &BlockUpdates) -> Self {
+    /// Node `node_id`, cloned from the full genesis `initial`, and shed when `shed` is set.
+    fn start(node_id: u64, split: &[B256], initial: &BlockUpdates, shed: bool) -> Self {
         let dir = TempDir::new().unwrap();
         let arguments =
             DatabaseArguments::new(ClientVersion::default()).with_geometry_max_size(Some(1 << 30));
@@ -292,10 +293,12 @@ impl SliceNode {
             ClientOptions::default(),
         )
         .unwrap();
-        assert!(db.cluster().unwrap().shed().unwrap() > 0, "node {node_id} sheds foreign rows");
+        if shed {
+            assert!(db.cluster().unwrap().shed().unwrap() > 0, "node {node_id} sheds foreign rows");
+        }
         let factory = node_factory(db.clone(), &dir.path().join("node"));
         let slice = TrieSlice::new(Arc::clone(&cluster));
-        Self { cluster, slice, env, factory, _db: db, _dir: dir }
+        Self { cluster, slice, env, factory, db, _dir: dir }
     }
 
     /// Computes and persists this node's slice of a block with hashed post-state `state`.
@@ -317,6 +320,82 @@ impl SliceNode {
         provider.write_hashed_state(&block.hashed_state).unwrap();
         provider.write_trie_updates_sorted(&block.trie_updates).unwrap();
         provider.commit().unwrap();
+    }
+
+    /// Computes this node's slice of a block with hashed post-state `state` as the engine
+    /// does: through the clustered database inside a [`LocalReads`] scope, over the unpersisted
+    /// ancestors' hashed state and this node's trie updates of them.
+    fn compute_clustered(
+        &self,
+        state: &HashedPostState,
+        ancestors: &(TrieUpdates, HashedPostState),
+    ) -> TrieUpdates {
+        let plan = self.slice.plan(state).unwrap();
+        let _local = LocalReads::enter();
+        let tx = self.db.tx().unwrap();
+        plan.compute(|mut input: TrieInput| {
+            input.prepend_cached(ancestors.0.clone(), ancestors.1.clone());
+            DbStateRoot::overlay_root_from_nodes_with_updates(
+                &tx,
+                TrieInputSorted::from_unsorted(input),
+            )
+            .map(|(_, updates)| updates)
+        })
+        .unwrap()
+    }
+
+    /// Persists `blocks` (hashed state and this node's trie updates) in order, in one commit.
+    fn persist(&self, blocks: &[(HashedPostState, TrieUpdates)]) {
+        let provider = self.factory.provider_rw().unwrap();
+        for (state, trie) in blocks {
+            let block = updates(state.clone(), trie.clone());
+            provider.write_hashed_state(&block.hashed_state).unwrap();
+            provider.write_trie_updates_sorted(&block.trie_updates).unwrap();
+        }
+        provider.commit().unwrap();
+    }
+
+    /// Overwrites every row this node does not hold, as an unfinished shed leaves them, with
+    /// garbage: foreign accounts get a different balance, foreign two-nibble account-trie nodes
+    /// [`POISON`] hashes. Returns how many rows were overwritten.
+    fn poison_leftovers(&self) -> usize {
+        let tx = self.env.tx_mut().unwrap();
+        let accounts: Vec<_> = tx
+            .cursor_read::<tables::HashedAccounts>()
+            .unwrap()
+            .walk(None)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|(address, _)| !self.cluster.owns(Shard(address[0])))
+            .collect();
+        let nodes: Vec<_> = tx
+            .cursor_read::<tables::PackedAccountsTrie>()
+            .unwrap()
+            .walk(None)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|(path, node)| {
+                path.0.len() >= 2 && !self.owns(&path.0) && !node.hashes.is_empty()
+            })
+            .collect();
+        let poisoned = accounts.len() + nodes.len();
+        for (address, account) in accounts {
+            let garbage = Account { balance: account.balance + U256::from(1), ..account };
+            tx.put::<tables::HashedAccounts>(address, garbage).unwrap();
+        }
+        for (path, node) in nodes {
+            let hashes = vec![POISON; node.hashes.len()];
+            let garbage = BranchNodeCompact::new(
+                node.state_mask,
+                node.tree_mask,
+                node.hash_mask,
+                hashes,
+                node.root_hash,
+            );
+            tx.put::<tables::PackedAccountsTrie>(path, garbage).unwrap();
+        }
+        tx.commit().unwrap();
+        poisoned
     }
 
     fn owns(&self, path: &Nibbles) -> bool {
@@ -526,7 +605,7 @@ fn held_trie_rows_match_a_full_node_after_every_block() {
     let initial = updates(genesis_state, genesis_trie);
     write(&reference, &initial);
 
-    let nodes: Vec<_> = [1, 2].map(|id| SliceNode::start(id, &split, &initial)).into();
+    let nodes: Vec<_> = [1, 2].map(|id| SliceNode::start(id, &split, &initial, true)).into();
     let at_genesis: Vec<_> =
         nodes.iter().map(|node| node.meaningful(&snapshot(&reference), &split)).collect();
     for node in &nodes {
@@ -585,5 +664,111 @@ fn held_trie_rows_match_a_full_node_after_every_block() {
              did not change"
         );
         assert!(node.still_poisoned(), "node {id:?}: the poisoned hashes were all rewritten");
+    }
+}
+
+/// Unpersisted blocks a node keeps in memory before it persists them together.
+const PERSIST_EVERY: u64 = 3;
+
+/// A shard both simulated nodes hold, without contracts, whose neighbour above is foreign to
+/// node 1: its two-nibble branch is deleted and created again at a shard boundary.
+fn boundary_shard(model: &Model, split: &[B256]) -> u8 {
+    let (one, two) = (cluster_view(1, split), cluster_view(2, split));
+    (0..255u8)
+        .find(|shard| {
+            one.owns(Shard(*shard))
+                && two.owns(Shard(*shard))
+                && !one.owns(Shard(shard + 1))
+                && !model.contracts.keys().any(|contract| contract[0] == *shard)
+        })
+        .expect("a shard held by both nodes next to one node 1 does not hold")
+}
+
+/// The engine's path: each node computes through its clustered database inside a
+/// [`LocalReads`] scope, over unpersisted ancestors held in memory, on a datadir whose rows of
+/// shards it does not hold were never shed and are garbage. Every account of one held shard is
+/// deleted in block 4 (removing its two-nibble branch) and the shard is populated again in block
+/// 7. After every persistence, held rows equal the full node's.
+#[test]
+fn held_trie_rows_match_through_the_clustered_database_with_leftovers_and_ancestors() {
+    let mut rng = rng(0x1eff);
+    let mut model = Model::default();
+    let (genesis_state, universe) = genesis(&mut rng, &mut model);
+    let split = universe.split;
+    let emptied = boundary_shard(&model, &split);
+
+    let reference = factory();
+    let genesis_trie = full_root(&reference, &genesis_state);
+    let initial = updates(genesis_state, genesis_trie);
+    write(&reference, &initial);
+
+    let nodes: Vec<_> = [1, 2].map(|id| SliceNode::start(id, &split, &initial, false)).into();
+    for node in &nodes {
+        node.poison(&split);
+        assert!(node.poison_leftovers() > 100, "few leftover rows to poison");
+    }
+    let mut pending: Vec<Vec<(HashedPostState, TrieUpdates)>> = vec![Vec::new(); nodes.len()];
+
+    for number in 1..=BLOCKS {
+        let mut state = block(&mut rng, &mut model, &universe, number);
+        match number {
+            4 => {
+                let doomed: Vec<_> = model
+                    .plain
+                    .iter()
+                    .chain(state.accounts.keys())
+                    .filter(|address| address[0] == emptied)
+                    .copied()
+                    .collect();
+                for address in doomed {
+                    state.accounts.insert(address, None);
+                    model.plain.remove(&address);
+                }
+            }
+            7 => {
+                for _ in 0..12 {
+                    let address = random_key(&mut rng, Some(emptied));
+                    state.accounts.insert(address, Some(random_account(&mut rng)));
+                    model.plain.insert(address);
+                }
+            }
+            _ => {}
+        }
+        let trie = full_root(&reference, &state);
+        write(&reference, &updates(state.clone(), trie));
+        let branch = Nibbles::from_nibbles([emptied >> 4, emptied & 0x0f]);
+        let reference_has_branch = || {
+            snapshot(&reference)
+                .get::<tables::PackedAccountsTrie>(PackedStoredNibbles(branch))
+                .unwrap()
+                .is_some()
+        };
+        if number == 4 {
+            assert!(!reference_has_branch(), "the emptied shard's branch remains");
+        }
+        if number == 7 {
+            assert!(reference_has_branch(), "the shard's branch was not recreated");
+        }
+
+        for (node, pending) in nodes.iter().zip(&mut pending) {
+            let mut ancestors = (TrieUpdates::default(), HashedPostState::default());
+            for (state, trie) in pending.iter() {
+                ancestors.0.extend(trie.clone());
+                ancestors.1.extend(state.clone());
+            }
+            let trie = node.compute_clustered(&state, &ancestors);
+            pending.push((state.clone(), trie));
+            if number % PERSIST_EVERY != 0 && number != BLOCKS {
+                continue;
+            }
+            node.persist(pending);
+            pending.clear();
+            let expected = node.meaningful(&snapshot(&reference), &split);
+            let actual = node.meaningful(&node.env.tx().unwrap(), &split);
+            let id = node.cluster.node_id();
+            assert_eq!(actual.accounts_trie, expected.accounts_trie, "block {number}: node {id:?}");
+            assert_eq!(actual.storages_trie, expected.storages_trie, "block {number}: node {id:?}");
+            assert_eq!(actual.held_children, expected.held_children, "block {number}: node {id:?}");
+        }
     }
 }
