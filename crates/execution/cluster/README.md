@@ -630,11 +630,14 @@ few or no shards.
   `ExecutedBlockAt { hash, number }` on the owner port (their snapshot and table are ignored);
   apply nodes send `ExecutedBlockAt`. The executor answers the encoded result. For a block it
   does not keep, it refuses at once with `NotRetained { oldest, newest }` (the lowest block number
-  it keeps and the highest it has inserted) when it has already inserted a block at or above the
-  requested number: that block was evicted, inserted before the executor started, dropped, or is
-  on another fork, and cannot arrive. Only for a block above everything it has inserted, the case
-  of a payload arriving at both nodes at the same time, it waits up to 250 ms (ending early if
-  such a block is inserted) and then refuses with `NotAvailable`. `ExecutedBlock` keeps its old
+  it keeps and the highest it has passed) when it has already passed a block at or above the
+  requested number and is not still encoding the requested one. A block is passed when it is
+  inserted, whether its result is kept, dropped from the full queue, too large or not encodable,
+  and every block up to the executor's persisted head counts as passed from start-up: the
+  requested block was evicted, inserted before the executor started, dropped, or is on another
+  fork, and cannot arrive. For a block above everything it has passed (the case of a payload
+  arriving at both nodes at the same time), or one still being encoded, it waits up to 250 ms
+  (ending early if such a block is inserted or passed) and then refuses with `NotAvailable`. `ExecutedBlock` keeps its old
   answer: wait up to 250 ms, then `NotAvailable`. Other requests keep their encoding.
 - Apply node, for each new payload: convert the payload and run the header, header-against-parent
   and pre-execution body checks, as execution does; ask the `apply_from` nodes in order before

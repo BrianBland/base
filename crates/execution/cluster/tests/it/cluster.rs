@@ -15,7 +15,7 @@ use std::{
 use alloy_primitives::{B256, U256, keccak256, map::B256Map};
 use base_execution_cluster::{
     ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, KeyPlacement, LocalReads, NodeConfig,
-    NodeId, OwnersNotReady, ProviderChangesets, Shard, ShardedTable,
+    NodeId, OwnersNotReady, ProviderChangesets, ReadError, Shard, ShardedTable,
 };
 use rand::{Rng, rngs::StdRng};
 use reth_chainspec::MAINNET;
@@ -1397,4 +1397,16 @@ fn the_pre_execution_wait_ends_within_its_budget_when_needed_owners_do_not_answe
     assert!(matches!(error, OwnersNotReady::Behind { .. }), "{error}");
     let waited = started.elapsed();
     assert!(waited < budget + Duration::from_millis(500), "waited {waited:?}");
+}
+
+#[test]
+fn a_restarted_node_refuses_results_of_blocks_it_persisted_at_once() {
+    let (db, _env, _full, _dir) = lone_node(1, 43);
+    let executed = db.cluster().unwrap().executed_blocks();
+    let started = Instant::now();
+
+    let refusal = executed.serve(B256::repeat_byte(0x01), 1, Duration::from_secs(5));
+
+    assert!(matches!(refusal, Err(ReadError::NotRetained { newest: 2, .. })), "{refusal:?}");
+    assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
 }

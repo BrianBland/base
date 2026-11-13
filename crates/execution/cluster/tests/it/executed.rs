@@ -110,6 +110,7 @@ fn block_hash(index: usize) -> B256 {
 
 /// A capture whose encoder holds the first block until released keeps at most its queue of later
 /// blocks, and inserts them after the held one, so the late old result cannot evict a newer one.
+/// The dropped block is passed at once, while requests for queued blocks still wait for them.
 #[test]
 fn capture_is_bounded_and_keeps_results_in_capture_order() {
     let store = Arc::new(ExecutedBlocks::default());
@@ -120,20 +121,32 @@ fn capture_is_bounded_and_keeps_results_in_capture_order() {
             encoding_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         }
-        Some((block_hash(index), index as u64, Bytes::from(index.to_be_bytes().to_vec())))
+        Some(Bytes::from(index.to_be_bytes().to_vec()))
     })
     .unwrap();
+    let submit = |index: usize| capture.submit(block_hash(index), index as u64, index);
 
-    assert!(capture.submit(0));
+    assert!(submit(0));
     encoding.recv().unwrap();
     for index in 1..=ResultCapture::<usize>::QUEUE {
-        assert!(capture.submit(index), "dropped block {index} with room in the queue");
+        assert!(submit(index), "dropped block {index} with room in the queue");
     }
     let newest = ResultCapture::<usize>::QUEUE;
-    assert!(!capture.submit(newest + 1));
+    assert!(!submit(newest + 1));
     assert_eq!(capture.dropped(), 1);
 
-    release.send(()).unwrap();
+    let started = Instant::now();
+    let dropped = store.serve(block_hash(newest + 1), newest as u64 + 1, Duration::from_secs(5));
+    assert!(matches!(dropped, Err(ReadError::NotRetained { .. })), "{dropped:?}");
+    assert!(started.elapsed() < ExecutedBlocks::SERVE_WAIT, "waited {:?}", started.elapsed());
+
+    let releasing = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        release.send(()).unwrap();
+    });
+    let queued = store.serve(block_hash(5), 5, Duration::from_secs(5));
+    assert_eq!(queued, Ok(Bytes::from(5_usize.to_be_bytes().to_vec())), "a queued block waited");
+    releasing.join().unwrap();
     assert!(store.wait_for(block_hash(newest), Duration::from_secs(5)).is_some());
     capture.stop().unwrap();
     assert_eq!(store.wait_for(block_hash(0), Duration::ZERO), None, "the late old result stayed");
@@ -144,7 +157,23 @@ fn capture_is_bounded_and_keeps_results_in_capture_order() {
 }
 
 #[test]
-fn results_too_large_to_serve_are_not_kept() {
+fn a_block_that_does_not_encode_is_passed() {
+    let store = Arc::new(ExecutedBlocks::default());
+    let capture = ResultCapture::spawn(Arc::clone(&store), |_: ()| None).unwrap();
+    assert!(capture.submit(block_hash(7), 7, ()));
+    let itself = store.serve(block_hash(7), 7, Duration::from_secs(5));
+    assert_eq!(itself, Err(ReadError::NotRetained { oldest: 7, newest: 7 }));
+    capture.stop().unwrap();
+
+    let started = Instant::now();
+    let refusal = store.serve(block_hash(6), 6, Duration::from_secs(5));
+
+    assert_eq!(refusal, Err(ReadError::NotRetained { oldest: 7, newest: 7 }));
+    assert!(started.elapsed() < ExecutedBlocks::SERVE_WAIT, "waited {:?}", started.elapsed());
+}
+
+#[test]
+fn results_too_large_to_serve_are_not_kept_but_passed() {
     let store = ExecutedBlocks::default();
     let largest = Bytes::from(vec![0; ExecutedBlocks::MAX_RESULT_LEN]);
     let answer: ReadResult = Ok(Response::ExecutedBlock(largest.clone()));
@@ -154,6 +183,23 @@ fn results_too_large_to_serve_are_not_kept() {
     let too_large = Bytes::from(vec![0; ExecutedBlocks::MAX_RESULT_LEN + 1]);
     assert!(!store.insert(block_hash(2), 2, too_large));
     assert_eq!(store.wait_for(block_hash(2), Duration::ZERO), None);
+    let started = Instant::now();
+    let refusal = store.serve(block_hash(2), 2, Duration::from_secs(5));
+    assert_eq!(refusal, Err(ReadError::NotRetained { oldest: 1, newest: 2 }));
+    assert!(started.elapsed() < ExecutedBlocks::SERVE_WAIT, "waited {:?}", started.elapsed());
+}
+
+#[test]
+fn a_store_after_a_persisted_head_refuses_missing_blocks_up_to_it_at_once() {
+    let store = ExecutedBlocks::after_persisted(10);
+
+    let started = Instant::now();
+    let refusal = store.serve(block_hash(10), 10, Duration::from_secs(5));
+    assert_eq!(refusal, Err(ReadError::NotRetained { oldest: 10, newest: 10 }));
+    assert!(started.elapsed() < ExecutedBlocks::SERVE_WAIT, "waited {:?}", started.elapsed());
+
+    let above = store.serve(block_hash(11), 11, ExecutedBlocks::SERVE_WAIT);
+    assert_eq!(above, Err(ReadError::NotAvailable));
 }
 
 /// The encoded result the tests keep for block `number`.

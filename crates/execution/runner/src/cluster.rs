@@ -4,7 +4,7 @@
 
 use std::{future::Future, sync::Arc};
 
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::Bytes;
 use base_execution_cluster::{
     CanonicalBlock, ClusterNode, ExecutedBlockResult, ProviderChangesets, ResultCapture,
 };
@@ -100,8 +100,8 @@ impl ClusterFeed {
             else {
                 continue;
             };
-            let hash = block.recovered_block.hash();
-            if !capture.submit(block) {
+            let (hash, number) = (block.recovered_block.hash(), block.recovered_block.number());
+            if !capture.submit(hash, number, block) {
                 warn!(block = %hash, "execution result capture backed up; dropped a block's result");
             }
         }
@@ -110,17 +110,14 @@ impl ClusterFeed {
         }
     }
 
-    /// `block`'s hash, number and encoded execution result, or `None` when it does not encode.
-    pub fn encode_executed_block<N: NodePrimitives>(
-        block: &ExecutedBlock<N>,
-    ) -> Option<(B256, u64, Bytes)> {
-        let hash = block.recovered_block.hash();
-        let number = block.recovered_block.number();
+    /// `block`'s encoded execution result, or `None` when it does not encode.
+    pub fn encode_executed_block<N: NodePrimitives>(block: &ExecutedBlock<N>) -> Option<Bytes> {
         let trie = block.trie_data();
         let senders = block.recovered_block.senders();
         match ExecutedBlockResult::new(&block.execution_output, senders, &trie).encode() {
-            Ok(encoded) => Some((hash, number, encoded)),
+            Ok(encoded) => Some(encoded),
             Err(error) => {
+                let hash = block.recovered_block.hash();
                 warn!(block = %hash, error = %error, "failed to encode an execution result for apply nodes");
                 None
             }

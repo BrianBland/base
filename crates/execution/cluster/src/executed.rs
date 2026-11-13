@@ -3,7 +3,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     sync::{
         Arc,
@@ -135,19 +135,25 @@ pub struct ExecutedBlocks {
     inserted: Condvar,
 }
 
-/// The retained results, oldest first, and the highest block number ever inserted.
+/// The retained results, oldest first; the blocks whose result is still being encoded; and the
+/// highest block number this node has passed: persisted before it started, or inserted since,
+/// whether or not its result was kept.
 #[derive(Debug, Default)]
 pub struct RecentResults {
     by_hash: HashMap<B256, Bytes>,
     order: VecDeque<(B256, u64)>,
+    pending: HashSet<B256>,
     newest: Option<u64>,
 }
 
 impl RecentResults {
-    /// The refusal for a missing block numbered `number` that will never be inserted, because a
-    /// block at or above its number already was: [`ReadError::NotRetained`]. `None` while no
-    /// block at or above `number` has been inserted, so the block may still arrive.
-    fn passed(&self, number: u64) -> Option<ReadError> {
+    /// The refusal for missing block `hash`, numbered `number`, that will never be kept, because
+    /// a block at or above its number was already passed and `hash` is not being encoded:
+    /// [`ReadError::NotRetained`]. `None` while the block may still arrive.
+    fn passed(&self, hash: B256, number: u64) -> Option<ReadError> {
+        if self.pending.contains(&hash) {
+            return None;
+        }
         let newest = self.newest.filter(|&newest| newest >= number)?;
         let oldest = self.order.iter().map(|&(_, number)| number).min().unwrap_or(newest);
         Some(ReadError::NotRetained { oldest, newest })
@@ -167,14 +173,41 @@ impl ExecutedBlocks {
     /// [`Frame::MAX_LEN`] bytes, which adds a few bytes of framing to the result.
     pub const MAX_RESULT_LEN: usize = Frame::MAX_LEN - 64;
 
+    /// A store for a node whose persisted head is block `persisted`: every block up to it was
+    /// inserted before this node started, so a request for a missing one is refused at once.
+    pub fn after_persisted(persisted: u64) -> Self {
+        let results = RecentResults { newest: Some(persisted), ..RecentResults::default() };
+        Self { results: Mutex::new(results), inserted: Condvar::new() }
+    }
+
+    /// Notes that the result of block `hash` is being encoded, so requests for it wait for it
+    /// even after a later block was passed. [`Self::insert`] or [`Self::pass`] ends the note.
+    pub fn expect(&self, hash: B256) {
+        self.results.lock().pending.insert(hash);
+    }
+
+    /// Notes that block `hash`, numbered `number`, was inserted but its result will not be kept
+    /// (dropped or not encodable), so requests for it and older missing blocks are refused at
+    /// once.
+    pub fn pass(&self, hash: B256, number: u64) {
+        let mut results = self.results.lock();
+        results.pending.remove(&hash);
+        results.newest = results.newest.max(Some(number));
+        drop(results);
+        self.inserted.notify_all();
+    }
+
     /// Keeps the encoded result of block `hash`, numbered `number`, dropping the oldest beyond
-    /// [`Self::CAPACITY`], and wakes requests waiting for it. Returns `false`, keeping nothing,
-    /// when the result is longer than [`Self::MAX_RESULT_LEN`].
+    /// [`Self::CAPACITY`], and wakes requests waiting for it. Returns `false`, keeping nothing
+    /// but passing the block (see [`Self::pass`]), when the result is longer than
+    /// [`Self::MAX_RESULT_LEN`].
     pub fn insert(&self, hash: B256, number: u64, encoded: Bytes) -> bool {
         if encoded.len() > Self::MAX_RESULT_LEN {
+            self.pass(hash, number);
             return false;
         }
         let mut results = self.results.lock();
+        results.pending.remove(&hash);
         if results.by_hash.insert(hash, encoded).is_none() {
             results.order.push_back((hash, number));
         }
@@ -204,10 +237,10 @@ impl ExecutedBlocks {
     }
 
     /// The encoded result of block `hash`, numbered `number`. Waits up to `wait` for it only
-    /// while no block numbered `number` or higher has been inserted: once one has, a missing
-    /// block was evicted, inserted before this node started, dropped, or is on another fork, and
-    /// the answer is [`ReadError::NotRetained`] at once. Otherwise a block still missing after
-    /// `wait` is [`ReadError::NotAvailable`].
+    /// while it is being encoded or no block numbered `number` or higher has been passed: once
+    /// one has, a missing block was evicted, inserted before this node started, dropped, or is
+    /// on another fork, and the answer is [`ReadError::NotRetained`] at once. Otherwise a block
+    /// still missing after `wait` is [`ReadError::NotAvailable`].
     pub fn serve(&self, hash: B256, number: u64, wait: Duration) -> Result<Bytes, ReadError> {
         let deadline = Instant::now() + wait;
         let mut results = self.results.lock();
@@ -216,7 +249,7 @@ impl ExecutedBlocks {
             if let Some(result) = results.by_hash.get(&hash) {
                 return Ok(result.clone());
             }
-            if let Some(refusal) = results.passed(number) {
+            if let Some(refusal) = results.passed(hash, number) {
                 return Err(refusal);
             }
             if timed_out {
@@ -229,12 +262,14 @@ impl ExecutedBlocks {
 
 /// Encodes captured blocks into an [`ExecutedBlocks`] store on one worker thread, in capture
 /// order, so a result never evicts one captured after it. At most [`Self::QUEUE`] captured blocks
-/// wait; a block captured while the queue is full is dropped and counted in the metric
-/// `base_cluster_dropped_results` (apply nodes asking for it execute instead), so a slow encoder
-/// never holds more than that many blocks.
+/// wait; a block captured while the queue is full is dropped, passed in the store (see
+/// [`ExecutedBlocks::pass`]) and counted in the metric `base_cluster_dropped_results` (apply
+/// nodes asking for it execute instead), so a slow encoder never holds more than that many
+/// blocks.
 #[derive(Debug)]
 pub struct ResultCapture<T> {
-    queue: SyncSender<T>,
+    store: Arc<ExecutedBlocks>,
+    queue: SyncSender<(B256, u64, T)>,
     stopped: Arc<AtomicBool>,
     worker: JoinHandle<()>,
     dropped: AtomicU64,
@@ -246,28 +281,33 @@ impl<T: Send + 'static> ResultCapture<T> {
     /// be evicted as soon as the newer ones are inserted.
     pub const QUEUE: usize = ExecutedBlocks::CAPACITY;
 
-    /// Starts the worker, which turns each captured block into its hash, number and encoded
-    /// result with `encode` (`None` keeps nothing) and inserts it into `store`.
+    /// Starts the worker, which turns each captured block into its encoded result with `encode`
+    /// and inserts it into `store`; a block that does not encode (`None`) is passed.
     pub fn spawn(
         store: Arc<ExecutedBlocks>,
-        mut encode: impl FnMut(T) -> Option<(B256, u64, Bytes)> + Send + 'static,
+        mut encode: impl FnMut(T) -> Option<Bytes> + Send + 'static,
     ) -> io::Result<Self> {
-        let (queue, captured) = mpsc::sync_channel(Self::QUEUE);
+        let (queue, captured) = mpsc::sync_channel::<(B256, u64, T)>(Self::QUEUE);
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = Arc::clone(&stopped);
+        let worker_store = Arc::clone(&store);
         let worker = thread::Builder::new().name("cluster-results".into()).spawn(move || {
-            while let Ok(block) = captured.recv() {
+            while let Ok((hash, number, block)) = captured.recv() {
                 if worker_stopped.load(Ordering::Relaxed) {
                     return;
                 }
-                let Some((hash, number, encoded)) = encode(block) else { continue };
+                let Some(encoded) = encode(block) else {
+                    worker_store.pass(hash, number);
+                    continue;
+                };
                 let len = encoded.len();
-                if !store.insert(hash, number, encoded) {
+                if !worker_store.insert(hash, number, encoded) {
                     warn!(block = %hash, len, "execution result too large to serve");
                 }
             }
         })?;
         Ok(Self {
+            store,
             queue,
             stopped,
             worker,
@@ -276,12 +316,14 @@ impl<T: Send + 'static> ResultCapture<T> {
         })
     }
 
-    /// Queues `block` for encoding. Returns `false`, dropping and counting it, when the queue is
-    /// full or the worker has stopped.
-    pub fn submit(&self, block: T) -> bool {
-        match self.queue.try_send(block) {
+    /// Queues `block`, whose hash is `hash` and number `number`, for encoding. Returns `false`,
+    /// dropping, passing and counting it, when the queue is full or the worker has stopped.
+    pub fn submit(&self, hash: B256, number: u64, block: T) -> bool {
+        self.store.expect(hash);
+        match self.queue.try_send((hash, number, block)) {
             Ok(()) => true,
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                self.store.pass(hash, number);
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 self.dropped_metric.increment(1);
                 false

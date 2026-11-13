@@ -134,7 +134,7 @@ impl ClusterNode {
             .stats()
             .spawn_logger(RemoteReadStats::LOG_INTERVAL)
             .map_err(ClusterStartError::StatsLogger)?;
-        let executed_blocks = Arc::new(ExecutedBlocks::default());
+        let executed_blocks = Arc::new(ExecutedBlocks::after_persisted(finish));
         let root_captures = Arc::new(RootCaptures::default());
         let server = OwnerServer::spawn_with_root_captures(
             listener,
