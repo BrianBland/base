@@ -312,14 +312,14 @@ impl<DB: Database> OwnerStore<DB> {
     }
 
     /// Installs the changeset reader and builds the history index from it. Only the first
-    /// reader installed is kept; returns whether this one was.
+    /// reader installed is kept; returns whether this one was. The index is built without the
+    /// history lock and published at once, so reads meanwhile are refused promptly as behind
+    /// instead of waiting for the build.
     pub fn install_changesets(&self, reader: ChangesetReader) -> Result<bool, DatabaseError> {
         if self.changesets.set(reader).is_err() {
             return Ok(false);
         }
-        let mut history = self.history.lock();
-        self.build(&mut history)?;
-        self.record_history(&history);
+        self.build()?;
         Ok(true)
     }
 
@@ -333,47 +333,56 @@ impl<DB: Database> OwnerStore<DB> {
         self.history.lock().servable(&|number| self.block_hash(number))
     }
 
-    fn build(&self, history: &mut OwnerHistory) -> Result<(), DatabaseError> {
+    /// Builds the index of the last `retention_blocks` persisted blocks off the history lock,
+    /// then, under it, publishes the index and extends it over the blocks persisted meanwhile.
+    fn build(&self) -> Result<(), DatabaseError> {
         let Some(reader) = self.changesets.get() else { return Ok(()) };
         let tip = ClusterNode::finish_checkpoint(&self.db.tx()?)?;
-        history.set_persisted(tip);
         let window_lowest = tip.saturating_sub(self.retention_blocks);
         let available = reader.available()?;
         let lowest = available
             .as_ref()
             .map_or(tip, |blocks| window_lowest.max(blocks.start().saturating_sub(1)));
         let through = available.map_or(lowest, |blocks| (*blocks.end()).min(tip)).max(lowest);
-        history.index = HistoryIndex::default();
-        history.coverage = Some(IndexCoverage { lowest, indexed: lowest });
-        self.index_through(history, reader.as_ref(), through)?;
+        let mut index = HistoryIndex::default();
+        let mut coverage = IndexCoverage { lowest, indexed: lowest };
+        self.index_through(&mut index, &mut coverage, reader.as_ref(), through)?;
+
+        let mut history = self.history.lock();
+        history.index = index;
+        history.coverage = Some(coverage);
+        let persisted = history.persisted.max(tip);
+        history.set_persisted(persisted);
+        if let Err(error) = self.extend(&mut history, persisted) {
+            warn!(error = %error, block = persisted, "cluster owner could not index persisted blocks");
+        }
         info!(
             owned_shards = Shard::all().filter(|shard| self.cluster.owns(*shard)).count(),
-            lowest,
-            highest = through,
+            lowest = history.coverage.map_or(lowest, |coverage| coverage.lowest),
+            highest = history.coverage.map_or(through, |coverage| coverage.indexed),
             entries = history.index.entries(),
             window_lowest,
-            persisted_tip = tip,
+            persisted_tip = persisted,
             "cluster owner history built"
         );
+        self.record_history(&history);
         Ok(())
     }
 
-    /// Indexes the blocks after the covered ones through `through`, raising the coverage after
-    /// every chunk read.
+    /// Indexes the blocks after `coverage`'s through `through` into `index`, raising the
+    /// coverage after every chunk read.
     fn index_through(
         &self,
-        history: &mut OwnerHistory,
+        index: &mut HistoryIndex,
+        coverage: &mut IndexCoverage,
         reader: &dyn ChangesetSource,
         through: u64,
     ) -> Result<(), DatabaseError> {
-        while let Some(mut coverage) =
-            history.coverage.filter(|coverage| coverage.indexed < through)
-        {
+        while coverage.indexed < through {
             let end = through.min(coverage.indexed + Self::CHANGESET_CHUNK_BLOCKS);
             let changesets = reader.read(coverage.indexed + 1..=end)?;
-            history.index.extend(&self.cluster, changesets);
+            index.extend(&self.cluster, changesets);
             coverage.indexed = end;
-            history.coverage = Some(coverage);
         }
         Ok(())
     }
@@ -411,7 +420,15 @@ impl<DB: Database> OwnerStore<DB> {
                 );
                 return Ok(());
             }
-            self.index_through(history, reader.as_ref(), tip.min(*available.end()))?;
+            let mut coverage = coverage;
+            let indexed = self.index_through(
+                &mut history.index,
+                &mut coverage,
+                reader.as_ref(),
+                tip.min(*available.end()),
+            );
+            history.coverage = Some(coverage);
+            indexed?;
         }
         let window_lowest = tip.saturating_sub(self.retention_blocks);
         if let Some(coverage) = history.coverage.as_mut()

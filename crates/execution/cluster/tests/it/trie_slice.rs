@@ -13,8 +13,7 @@ use std::{
 
 use alloy_primitives::{B256, Bytes, U256, map::B256Map};
 use base_execution_cluster::{
-    ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, NodeConfig, NodeId, Shard,
-    TrieSlice,
+    ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, NodeConfig, NodeId, Shard, TrieSlice,
 };
 use rand::{Rng, rngs::StdRng, seq::IndexedRandom};
 use reth_chainspec::MAINNET;

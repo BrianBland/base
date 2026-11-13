@@ -221,6 +221,26 @@ fn client_retries_while_every_owner_is_behind() {
     catch_up.join().unwrap();
 }
 
+#[test]
+fn client_waits_while_every_owner_is_unreachable_until_one_starts() {
+    let address = closed_port();
+    let client_view = cluster_of(3, 2, address, closed_port());
+    let owner = std::thread::spawn({
+        let client_view = Arc::clone(&client_view);
+        move || {
+            std::thread::sleep(Duration::from_millis(300));
+            owner_at_genesis(&client_view, TcpListener::bind(address).unwrap())
+        }
+    });
+    let options = ClientOptions { retry_for: Duration::from_secs(10), ..Default::default() };
+    let client = ClusterClient::new(client_view, options);
+    let genesis = SnapshotId { number: 0, hash: Some(block_hash(0, 0)) };
+    let started = Instant::now();
+    assert_eq!(client.account(genesis, B256::repeat_byte(0x42)).unwrap(), None);
+    assert!(started.elapsed() >= Duration::from_millis(300), "answered before any owner ran");
+    drop(owner.join().unwrap());
+}
+
 /// Longer than the client's former 2-second retry budget.
 const PAST_OLD_RETRY_BUDGET: Duration = Duration::from_millis(2500);
 

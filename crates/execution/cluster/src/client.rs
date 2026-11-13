@@ -90,8 +90,7 @@ pub enum ClientError {
 ///
 /// Calls block the calling thread. Owners are tried in rendezvous order, skipping this node;
 /// the round is retried within [`ClientOptions::retry_for`] only while every owner is unreachable
-/// or behind the snapshot and at least one is behind. A read that waits on behind owners for
-/// longer than
+/// (including timing out) or behind the snapshot. A read that waits on owners for longer than
 /// [`Self::SLOW_WAIT`] logs one warning and counts one wait in [`Self::remote_read_stats`].
 #[derive(Debug)]
 pub struct ClusterClient {
@@ -318,10 +317,9 @@ impl ClusterClient {
                 OwnerFailure::Refused(refusal) => refusal.is_behind(request.snapshot.number),
                 OwnerFailure::Unreachable(_) | OwnerFailure::UnexpectedResponse => false,
             };
-            let retryable = attempts.iter().any(behind)
-                && attempts.iter().all(|attempt| {
-                    behind(attempt) || matches!(attempt.failure, OwnerFailure::Unreachable(_))
-                });
+            let retryable = attempts.iter().all(|attempt| {
+                behind(attempt) || matches!(attempt.failure, OwnerFailure::Unreachable(_))
+            });
             if !retryable || Instant::now() + self.options.retry_interval > retry_until {
                 return Err(ClientError::OwnersFailed(attempts));
             }

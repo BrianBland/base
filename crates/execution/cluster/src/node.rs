@@ -1,7 +1,13 @@
 //! This node's side of a cluster: its owner store and server, its peer client, the commit
 //! guard, shedding, and the execution results it serves and applies.
 
-use std::{fmt, io, net::TcpListener, sync::Arc, thread::JoinHandle};
+use std::{
+    fmt, io,
+    net::TcpListener,
+    sync::Arc,
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::B256;
 use parking_lot::Mutex;
@@ -15,12 +21,13 @@ use reth_db::{
 };
 use reth_stages_types::StageId;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     ApplyCounts, ApplyStats, ChangesetReader, ClientOptions, Cluster, ClusterClient,
-    ExecutedBlocks, KeyPlacement, OwnerServer, OwnerStore, RemoteReadCounts, RemoteReadStats,
-    Shard, ShardedTable, TrieSlice, TrieSliceCounts, TrieSliceStats,
+    ExecutedBlocks, KeyPlacement, NodeId, OwnerServer, OwnerState, OwnerStates, OwnerStore,
+    OwnersNotReady, RemoteReadCounts, RemoteReadStats, Shard, ShardedTable, TrieSlice,
+    TrieSliceCounts, TrieSliceStats,
 };
 
 /// Returns the hash of the canonical block with the given number, when known.
@@ -415,6 +422,77 @@ impl ClusterNode {
             }
         }
         Ok(())
+    }
+
+    /// Waits, for at most `budget`, until every shard this node does not hold has an owner that
+    /// can serve state reads as of this node's persisted block `P`, so the block about to execute
+    /// does not run out of time inside a read. An owner unreachable, not ready or behind `P` is
+    /// waited for; a shard whose every owner keeps history only above `P` fails at once. A node
+    /// holding every shard returns at once.
+    pub fn wait_for_owners(&self, budget: Duration) -> Result<(), OwnersNotReady> {
+        let foreign: Vec<_> = Shard::all().filter(|shard| !self.cluster.owns(*shard)).collect();
+        if foreign.is_empty() {
+            return Ok(());
+        }
+        let me = self.cluster.node_id();
+        let mut peers: Vec<_> = foreign
+            .iter()
+            .flat_map(|shard| self.cluster.owners(*shard).iter().copied())
+            .filter(|node| *node != me)
+            .collect();
+        peers.sort_unstable();
+        peers.dedup();
+
+        let started = Instant::now();
+        let interval = self.client.options().retry_interval;
+        let mut warned = false;
+        loop {
+            let block = Self::finish_checkpoint(&self.env.tx()?)?;
+            let owners =
+                OwnerStates(peers.iter().map(|node| (*node, self.owner_state(*node))).collect());
+            let mut waiting = 0;
+            for shard in &foreign {
+                let shard_owners: Vec<_> = self
+                    .cluster()
+                    .owners(*shard)
+                    .iter()
+                    .copied()
+                    .filter(|node| *node != me)
+                    .collect();
+                if shard_owners.iter().any(|node| owners.serves(*node, block)) {
+                    continue;
+                }
+                if shard_owners.iter().all(|node| owners.below_history(*node, block)) {
+                    return Err(OwnersNotReady::BelowHistory { block, shard: shard.0, owners });
+                }
+                waiting += 1;
+            }
+            if waiting == 0 {
+                return Ok(());
+            }
+            let waited = started.elapsed();
+            if waited + interval > budget {
+                return Err(OwnersNotReady::Behind { block, shards: waiting, waited, owners });
+            }
+            if !warned && waited > ClusterClient::SLOW_WAIT {
+                warned = true;
+                warn!(
+                    block,
+                    shards = waiting,
+                    owners = %owners,
+                    "cluster node waiting for owners to reach its persisted block before executing"
+                );
+            }
+            std::thread::sleep(interval);
+        }
+    }
+
+    fn owner_state(&self, node: NodeId) -> OwnerState {
+        match self.client.status(node) {
+            Ok(Some(range)) => OwnerState::Serves(range),
+            Ok(None) => OwnerState::Nothing,
+            Err(_) => OwnerState::Unreachable,
+        }
     }
 
     /// Sheds in batches until nothing is left. Returns the number of rows deleted.
