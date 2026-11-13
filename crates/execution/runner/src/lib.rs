@@ -20,7 +20,10 @@ mod cluster;
 pub use cluster::ClusterFeed;
 
 mod apply;
-pub use apply::{ApplyEngineValidator, ApplyEngineValidatorBuilder, ApplyError, BlockApplier};
+pub use apply::{
+    ApplyEngineValidator, ApplyEngineValidatorBuilder, ApplyError, BlockApplier,
+    PayloadBuildingUnsupported,
+};
 
 mod root;
 pub use root::ClusterStateRoot;

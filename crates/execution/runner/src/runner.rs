@@ -13,7 +13,7 @@ use base_execution_payload_builder::{
     config::{BaseDAConfig, GasLimitConfig, ResourceMeteringConfig},
 };
 use base_node_core::{BaseEngineApiBuilder, args::RollupArgs};
-use eyre::{Result, eyre};
+use eyre::{Result, bail, eyre};
 use jsonrpsee::RpcModule;
 use reth_node_builder::{FullNodeComponents, Node, NodeHandle, NodeHandleFor};
 use reth_provider::providers::BlockchainProvider;
@@ -218,6 +218,12 @@ impl<SB: PayloadServiceBuilder> BaseNodeRunner<SB> {
             .with_add_ons(add_ons);
         let cluster = builder.db().cluster().cloned();
         if let Some(node) = &cluster {
+            if base_node.args.proofs_history {
+                bail!(
+                    "the proofs-history extension reads trie rows a clustered node does not hold; \
+                     remove --proofs-history or the cluster config"
+                );
+            }
             engine_validator.install_cluster(Arc::clone(node));
         }
         let owner_feed = cluster.clone();

@@ -19,7 +19,9 @@ use reth_chain_state::ExecutedBlock;
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_engine_tree::tree::{
     BasicEngineValidator, CacheWaitDurations, EngineApiTreeState, EngineValidator, TreeConfig,
-    ValidationOutcome, ValidationOutput, WaitForCaches, payload_validator::TreeCtx,
+    ValidationOutcome, ValidationOutput, WaitForCaches,
+    error::{InsertBlockError, InsertPayloadError},
+    payload_validator::TreeCtx,
 };
 use reth_evm::ConfigureEngineEvm;
 use reth_network_p2p::full_block::SealedBlockWithAccessList;
@@ -32,12 +34,12 @@ use reth_node_builder::{
     rpc::{BasicEngineValidatorBuilder, EngineValidatorBuilder, PayloadValidatorBuilder},
 };
 use reth_payload_builder::PayloadBuilderResources;
-use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader};
+use reth_primitives_traits::{AlloyBlockHeader, RecoveredBlock, SealedBlock, SealedHeader};
 use reth_provider::{HeaderProvider, ProviderError, StateProviderFactory};
 use reth_storage_overlay::OverlayManager;
 use reth_trie_common::HashedPostState;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::ClusterStateRoot;
 
@@ -130,16 +132,65 @@ where
             }),
             _ => None,
         };
-        Ok(ApplyEngineValidator { inner, applier })
+        Ok(ApplyEngineValidator { inner, cluster: cluster.cloned(), applier })
     }
 }
 
 /// An engine-tree validator that, with an applier, inserts new payloads from peers' execution
 /// results and executes through `inner` whenever applying fails; without one it is `inner`.
+///
+/// On a clustered node it also refuses payload attributes, since building a block needs the
+/// full state root ([`PayloadBuildingUnsupported`]), and before executing any block it waits
+/// for owners able to serve its persisted block ([`ClusterNode::wait_for_owners`]); when they
+/// do not become ready in time, validation fails with a processing error, which reth does not
+/// record as an invalid block, so the same block can be delivered again.
 #[derive(Debug)]
 pub struct ApplyEngineValidator<V, P, PV> {
     inner: V,
+    cluster: Option<Arc<ClusterNode>>,
     applier: Option<BlockApplier<P, PV>>,
+}
+
+/// Payload attributes sent to a clustered node: it cannot build blocks.
+#[derive(Debug, Clone, Copy, Error)]
+#[error(
+    "payload building is not supported on a clustered node: it keeps only its trie slice and \
+     cannot compute a block's state root; build blocks on an unclustered node"
+)]
+pub struct PayloadBuildingUnsupported;
+
+impl<V, P, PV> ApplyEngineValidator<V, P, PV>
+where
+    V: EngineValidator<BaseEngineTypes, BasePrimitives>,
+{
+    /// Waits until owners can serve this node's persisted block before `block` executes; a
+    /// refusal is a processing error carrying `block`, never an invalid-block verdict.
+    fn wait_for_owners(
+        &self,
+        block: impl FnOnce() -> Result<SealedBlock<BaseBlock>, NewPayloadError>,
+    ) -> Result<(), InsertPayloadError<BaseBlock>> {
+        let Some(node) = &self.cluster else { return Ok(()) };
+        let Err(error) = node.wait_for_owners(node.client().options().retry_for) else {
+            return Ok(());
+        };
+        let block = block()?;
+        warn!(
+            block = %block.hash(),
+            number = block.number(),
+            error = %error,
+            "not executing a block until cluster owners can serve this node's persisted block"
+        );
+        Err(InsertBlockError::new(block, InsertBlockErrorKind::Other(Box::new(error))).into())
+    }
+
+    fn execute_payload(
+        &mut self,
+        payload: ExecutionData,
+        ctx: TreeCtx<'_, BasePrimitives>,
+    ) -> ValidationOutcome<BasePrimitives> {
+        self.wait_for_owners(|| self.inner.convert_payload_to_block(payload.clone()))?;
+        self.inner.validate_payload(payload, ctx)
+    }
 }
 
 impl<V, P, PV> EngineValidator<BaseEngineTypes, BasePrimitives> for ApplyEngineValidator<V, P, PV>
@@ -153,6 +204,12 @@ where
         attr: &PayloadAttributes,
         header: &BaseHeader,
     ) -> Result<(), InvalidPayloadAttributesError> {
+        if self.cluster.is_some() {
+            error!(error = %PayloadBuildingUnsupported, "refusing payload attributes");
+            return Err(InvalidPayloadAttributesError::InvalidParams(Box::new(
+                PayloadBuildingUnsupported,
+            )));
+        }
         self.inner.validate_payload_attributes_against_header(attr, header)
     }
 
@@ -169,7 +226,7 @@ where
         ctx: TreeCtx<'_, BasePrimitives>,
     ) -> ValidationOutcome<BasePrimitives> {
         let Some(applier) = &self.applier else {
-            return self.inner.validate_payload(payload, ctx);
+            return self.execute_payload(payload, ctx);
         };
         let applied = applier
             .apply(&payload, ctx.state(), |payload| self.inner.convert_payload_to_block(payload));
@@ -188,7 +245,7 @@ where
                     error = %error,
                     "executing a payload instead of applying a peer's result"
                 );
-                self.inner.validate_payload(payload, ctx)
+                self.execute_payload(payload, ctx)
             }
         }
     }
@@ -198,6 +255,7 @@ where
         block: SealedBlockWithAccessList<BaseBlock>,
         ctx: TreeCtx<'_, BasePrimitives>,
     ) -> ValidationOutcome<BasePrimitives> {
+        self.wait_for_owners(|| Ok(block.block().clone()))?;
         self.inner.validate_block(block, ctx)
     }
 
