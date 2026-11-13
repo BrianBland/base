@@ -95,7 +95,9 @@ pub enum ClientError {
 ///
 /// Calls block the calling thread. Owners are tried in rendezvous order, skipping this node;
 /// the round is retried within [`ClientOptions::retry_for`] only while every owner is unreachable
-/// (including timing out) or behind the snapshot. A read that waits on owners for longer than
+/// (including timing out) or behind the snapshot, and every connect, write and read of a value
+/// read is due by the end of that budget, so one slow owner cannot stretch it. A read that waits
+/// on owners for longer than
 /// [`Self::SLOW_WAIT`] logs one warning and counts one wait in [`Self::remote_read_stats`].
 #[derive(Debug)]
 pub struct ClusterClient {
@@ -194,14 +196,14 @@ impl ClusterClient {
         }
     }
 
-    /// The range of blocks `node` can serve state reads as of, asked once.
-    pub fn status(&self, node: NodeId) -> Result<Option<ServableRange>, OwnerFailure> {
-        let request = Request {
-            snapshot: SnapshotId { number: 0, hash: None },
-            table: ShardedTable::HashedAccounts,
-            query: Query::Status,
-        };
-        match self.ask(node, &request)? {
+    /// The range of blocks `node` can serve state reads as of, asked once, with the answer due
+    /// by `deadline`.
+    pub fn status(
+        &self,
+        node: NodeId,
+        deadline: Instant,
+    ) -> Result<Option<ServableRange>, OwnerFailure> {
+        match self.ask_by(node, &Self::unsnapshotted(Query::Status), deadline)? {
             Response::Status(servable) => Ok(servable),
             _ => unreachable!("checked by ask"),
         }
@@ -385,7 +387,7 @@ impl ClusterClient {
         loop {
             let mut attempts = Vec::with_capacity(owners.len());
             for &node in &owners {
-                match self.ask(node, &request) {
+                match self.ask_by(node, &request, retry_until) {
                     Ok(response) => return Ok(response),
                     Err(failure) => attempts.push(OwnerAttempt { node, failure }),
                 }
@@ -436,7 +438,24 @@ impl ClusterClient {
     /// Asks one owner, on a pooled connection when one is idle. A pooled connection that fails is
     /// replaced by a fresh one once, since the owner may have closed it while idle.
     fn ask(&self, node: NodeId, request: &Request) -> Result<Response, OwnerFailure> {
-        let result = self.ask_within_timeouts(node, request);
+        Self::checked(request, self.ask_within_timeouts(node, request))
+    }
+
+    /// Like [`Self::ask`], with the whole exchange due by `deadline` (see [`Self::ask_before`]).
+    fn ask_by(
+        &self,
+        node: NodeId,
+        request: &Request,
+        deadline: Instant,
+    ) -> Result<Response, OwnerFailure> {
+        Self::checked(request, self.ask_before(node, request, deadline))
+    }
+
+    /// The response in `result` when it is of the kind `request` expects.
+    fn checked(
+        request: &Request,
+        result: Result<ReadResult, FrameError>,
+    ) -> Result<Response, OwnerFailure> {
         let response = result.map_err(OwnerFailure::Unreachable)?.map_err(OwnerFailure::Refused)?;
         let expected = matches!(
             (&request.query, &response),

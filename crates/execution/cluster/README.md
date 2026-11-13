@@ -573,10 +573,14 @@ What a clustered node does with blocks:
 ### Pre-execution wait
 
 Before a clustered node executes a block (a new payload, including an apply node's fallback, or a
-downloaded block), it reads its persisted block `P` and asks every peer that owns a shard it does
-not hold for its servable range (`Status`). It proceeds once every such shard has an owner whose
-range contains `P`. Owners unreachable, still building their history index, or behind `P` are
-waited for, polling every 20 ms for up to `read_retry_secs`; after 1 second it logs one warning,
+downloaded block), it reads its persisted block `P` and asks the peers that own shards it does
+not hold for their servable range (`Status`). It proceeds once every such shard has an owner whose
+range contains `P`. Each round asks peers that answered their last request first, skips a peer
+once every shard it owns is covered, and stops as soon as every shard is, so an unresponsive
+replica costs one timeout and then nothing while other owners cover its shards. Every answer is
+due by the end of the budget; a later one counts as unreachable. Owners unreachable, still
+building their history index, or behind `P` are waited for, polling every 20 ms for up to
+`read_retry_secs`; after 1 second it logs one warning,
 `cluster node waiting for owners to reach its persisted block before executing`, with `block`,
 the number of waiting `shards` and each owner's state. A node holding every shard does not wait.
 

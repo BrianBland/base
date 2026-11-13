@@ -188,7 +188,9 @@ fn client_fails_over_when_the_first_owner_is_down() {
     }
     assert!(client.has_storage(tip, address).unwrap());
     assert!(client.bytecode(tip, code_hash.as_slice()).unwrap().is_some());
-    assert_eq!(client.status(NodeId(1)).unwrap(), Some(ServableRange { lowest: 0, highest: 4 }));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = client.status(NodeId(1), deadline).unwrap();
+    assert_eq!(status, Some(ServableRange { lowest: 0, highest: 4 }));
 }
 
 /// An owner of node 1 at persisted block 0 over a fresh database, with the chain that follows.
@@ -240,6 +242,23 @@ fn client_waits_while_every_owner_is_unreachable_until_one_starts() {
     assert_eq!(client.account(genesis, B256::repeat_byte(0x42)).unwrap(), None);
     assert!(started.elapsed() >= Duration::from_millis(300), "answered before any owner ran");
     drop(owner.join().unwrap());
+}
+
+#[test]
+fn a_read_from_owners_that_never_answer_ends_within_its_retry_budget() {
+    let silent =
+        [TcpListener::bind("127.0.0.1:0").unwrap(), TcpListener::bind("127.0.0.1:0").unwrap()];
+    let client_view =
+        cluster_of(3, 2, silent[0].local_addr().unwrap(), silent[1].local_addr().unwrap());
+    let retry_for = Duration::from_secs(1);
+    let client = ClusterClient::new(client_view, ClientOptions { retry_for, ..Default::default() });
+    let started = Instant::now();
+
+    let read = client.account(SnapshotId { number: 0, hash: None }, B256::repeat_byte(0x42));
+
+    assert!(matches!(read, Err(ClientError::OwnersFailed(_))), "{read:?}");
+    let waited = started.elapsed();
+    assert!(waited < retry_for + Duration::from_millis(500), "waited {waited:?}");
 }
 
 /// Longer than the client's former 2-second retry budget.

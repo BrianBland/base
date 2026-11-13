@@ -9,13 +9,13 @@ use std::{
     net::TcpListener,
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use alloy_primitives::{B256, U256, keccak256, map::B256Map};
 use base_execution_cluster::{
     ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, KeyPlacement, LocalReads, NodeConfig,
-    NodeId, ProviderChangesets, Shard, ShardedTable,
+    NodeId, OwnersNotReady, ProviderChangesets, Shard, ShardedTable,
 };
 use rand::{Rng, rngs::StdRng};
 use reth_chainspec::MAINNET;
@@ -48,8 +48,8 @@ use revm::database::states::PlainStateReverts;
 use tempfile::TempDir;
 
 use crate::common::{
-    BlockUpdates, ChainBlock, KeyUniverse, PlainKeys, TableDump, block_hash, canonical, factory,
-    next_block, packed, random_node, random_updates, rng, snapshot,
+    BlockUpdates, ChainBlock, KeyUniverse, PlainKeys, PlainState, TableDump, block_hash, canonical,
+    factory, next_block, packed, random_node, random_updates, rng, snapshot,
 };
 
 /// Blocks applied while every node runs, and after one storing node stops.
@@ -606,10 +606,23 @@ fn check_node(
 /// (hashed addresses), each with its owner history built from its changesets. Nodes listed in
 /// `unshed` never shed.
 fn start_nodes(genesis: &Block, split: &[B256], unshed: &[u64]) -> Vec<Node> {
+    start_nodes_but(genesis, split, unshed, &[]).0
+}
+
+/// Like [`start_nodes`], except that the nodes listed in `silent` are not started: their
+/// listeners are returned unserved, so connections to them complete but are never answered.
+fn start_nodes_but(
+    genesis: &Block,
+    split: &[B256],
+    unshed: &[u64],
+    silent: &[u64],
+) -> (Vec<Node>, Vec<TcpListener>) {
     let listeners: Vec<_> = (0..NODES).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
     let addresses: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
-    (1..=NODES)
-        .zip(listeners)
+    let (silent, started): (Vec<_>, Vec<_>) =
+        (1..=NODES).zip(listeners).partition(|(id, _)| silent.contains(id));
+    let nodes = started
+        .into_iter()
         .map(|(id, listener)| {
             let dir = TempDir::new().unwrap();
             let env = populated_env(dir.path(), std::slice::from_ref(genesis));
@@ -635,7 +648,8 @@ fn start_nodes(genesis: &Block, split: &[B256], unshed: &[u64]) -> Vec<Node> {
                 _dir: dir,
             }
         })
-        .collect()
+        .collect();
+    (nodes, silent.into_iter().map(|(_, listener)| listener).collect())
 }
 
 /// The trie paths of a run: account paths in its shards and storage paths of its contracts.
@@ -660,7 +674,7 @@ fn run_cluster(seed: u64, unshed: &[u64], split: bool) {
     let keys = ReadKeys { plain, accounts, contracts, trie, shards };
 
     let split_paths = split.then(|| DenseContract::new(&mut rng).paths);
-    let mut state = crate::common::PlainState::default();
+    let mut state = PlainState::default();
     let mut new_block = |rng: &mut StdRng, number: u64| {
         let (chain, after): (ChainBlock, _) = next_block(rng, &keys.plain, &state, number);
         state = after;
@@ -1337,4 +1351,50 @@ fn shedding_a_split_contract_one_row_at_a_time_keeps_exactly_the_held_rows() {
     let after = TableDump::read_tx(&env.tx().unwrap());
     assert_eq!(after.hashed_storages, want_storages);
     assert_eq!(after.storages_trie, want_trie);
+}
+
+/// A genesis block over a few random shards, with changesets.
+fn small_genesis(seed: u64) -> Block {
+    let mut rng = rng(seed);
+    let shards: Vec<_> = (0..8).map(|_| Shard(rng.random())).collect();
+    let plain = PlainKeys::new(&mut rng, &shards, false);
+    let (chain, _) = next_block(&mut rng, &plain, &PlainState::default(), 0);
+    let trie_keys = KeyUniverse::new(&mut rng, &shards);
+    let trie_updates = random_updates(&mut rng, &trie_keys).trie_updates;
+    Block {
+        number: 0,
+        reverts: Some(chain.reverts),
+        updates: BlockUpdates { hashed_state: chain.hashed, trie_updates },
+        codes: random_codes(&mut rng),
+    }
+}
+
+#[test]
+fn the_pre_execution_wait_stops_asking_an_unresponsive_replica_whose_shards_are_covered() {
+    let (nodes, _silent) = start_nodes_but(&small_genesis(41), &[], &[], &[1]);
+    let stateless = nodes.iter().find(|node| !node.storing()).unwrap();
+    let node = stateless.db.cluster().unwrap();
+    let budget = Duration::from_secs(30);
+    node.wait_for_owners(budget).unwrap();
+
+    let started = Instant::now();
+    node.wait_for_owners(budget).unwrap();
+
+    let waited = started.elapsed();
+    assert!(waited < Duration::from_secs(1), "the silent replica delayed the wait by {waited:?}");
+}
+
+#[test]
+fn the_pre_execution_wait_ends_within_its_budget_when_needed_owners_do_not_answer() {
+    let (nodes, _silent) = start_nodes_but(&small_genesis(42), &[], &[], &[1, 2]);
+    let stateless = nodes.iter().find(|node| !node.storing()).unwrap();
+    let node = stateless.db.cluster().unwrap();
+    let budget = Duration::from_secs(1);
+    let started = Instant::now();
+
+    let error = node.wait_for_owners(budget).unwrap_err();
+
+    assert!(matches!(error, OwnersNotReady::Behind { .. }), "{error}");
+    let waited = started.elapsed();
+    assert!(waited < budget + Duration::from_millis(500), "waited {waited:?}");
 }

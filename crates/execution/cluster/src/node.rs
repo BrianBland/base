@@ -2,6 +2,7 @@
 //! guard, shedding, and the execution results it serves and applies.
 
 use std::{
+    collections::BTreeSet,
     fmt, io,
     net::TcpListener,
     sync::Arc,
@@ -100,6 +101,8 @@ pub struct ClusterNode {
     root_captures: Arc<RootCaptures>,
     trie_hash_capture: TrieHashCapture,
     root_check_stats: Arc<RootCheckStats>,
+    /// Peers that did not answer their last status request.
+    silent_peers: Mutex<BTreeSet<NodeId>>,
 }
 
 impl fmt::Debug for ClusterNode {
@@ -181,6 +184,7 @@ impl ClusterNode {
             root_captures,
             trie_hash_capture,
             root_check_stats,
+            silent_peers: Mutex::default(),
         })
     }
 
@@ -460,40 +464,28 @@ impl ClusterNode {
     /// does not run out of time inside a read. An owner unreachable, not ready or behind `P` is
     /// waited for; a shard whose every owner keeps history only above `P` fails at once. A node
     /// holding every shard returns at once.
+    ///
+    /// Each round asks only the owners still needed (see [`Self::ask_owners`]), and every answer
+    /// is due by the end of `budget`: one that arrives later counts as unreachable, so a round
+    /// that runs over budget never succeeds.
     pub fn wait_for_owners(&self, budget: Duration) -> Result<(), OwnersNotReady> {
         let foreign: Vec<_> = Shard::all().filter(|shard| !self.cluster.owns(*shard)).collect();
         if foreign.is_empty() {
             return Ok(());
         }
-        let me = self.cluster.node_id();
-        let mut peers: Vec<_> = foreign
-            .iter()
-            .flat_map(|shard| self.cluster.owners(*shard).iter().copied())
-            .filter(|node| *node != me)
-            .collect();
-        peers.sort_unstable();
-        peers.dedup();
-
         let started = Instant::now();
+        let deadline = started + budget;
         let interval = self.client.options().retry_interval;
         let mut warned = false;
         loop {
             let block = Self::finish_checkpoint(&self.env.tx()?)?;
-            let owners =
-                OwnerStates(peers.iter().map(|node| (*node, self.owner_state(*node))).collect());
+            let owners = self.ask_owners(&foreign, block, deadline);
             let mut waiting = 0;
             for shard in &foreign {
-                let shard_owners: Vec<_> = self
-                    .cluster()
-                    .owners(*shard)
-                    .iter()
-                    .copied()
-                    .filter(|node| *node != me)
-                    .collect();
-                if shard_owners.iter().any(|node| owners.serves(*node, block)) {
+                if self.covers(&owners, *shard, block) {
                     continue;
                 }
-                if shard_owners.iter().all(|node| owners.below_history(*node, block)) {
+                if self.peer_owners(*shard).all(|node| owners.below_history(node, block)) {
                     return Err(OwnersNotReady::BelowHistory { block, shard: shard.0, owners });
                 }
                 waiting += 1;
@@ -502,7 +494,7 @@ impl ClusterNode {
                 return Ok(());
             }
             let waited = started.elapsed();
-            if waited + interval > budget {
+            if Instant::now() + interval > deadline {
                 return Err(OwnersNotReady::Behind { block, shards: waiting, waited, owners });
             }
             if !warned && waited > ClusterClient::SLOW_WAIT {
@@ -518,12 +510,51 @@ impl ClusterNode {
         }
     }
 
-    fn owner_state(&self, node: NodeId) -> OwnerState {
-        match self.client.status(node) {
-            Ok(Some(range)) => OwnerState::Serves(range),
-            Ok(None) => OwnerState::Nothing,
-            Err(_) => OwnerState::Unreachable,
+    /// Asks the owners of `foreign` shards for their servable range, each answer due by
+    /// `deadline`, until every shard has an owner serving `block`. Owners that answered their
+    /// last request are asked first, and an owner none of whose shards is still uncovered is not
+    /// asked, so an unresponsive replica costs nothing while other owners cover its shards.
+    fn ask_owners(&self, foreign: &[Shard], block: u64, deadline: Instant) -> OwnerStates {
+        let mut peers: Vec<_> = foreign.iter().flat_map(|shard| self.peer_owners(*shard)).collect();
+        peers.sort_unstable();
+        peers.dedup();
+        let silent = self.silent_peers.lock().clone();
+        peers.sort_by_key(|node| silent.contains(node));
+
+        let mut owners = OwnerStates::default();
+        for node in peers {
+            let needed = foreign.iter().any(|shard| {
+                self.cluster.owners(*shard).contains(&node) && !self.covers(&owners, *shard, block)
+            });
+            if !needed {
+                continue;
+            }
+            let state = match self.client.status(node, deadline) {
+                Ok(Some(range)) => OwnerState::Serves(range),
+                Ok(None) => OwnerState::Nothing,
+                Err(_) => OwnerState::Unreachable,
+            };
+            let mut silent = self.silent_peers.lock();
+            if state == OwnerState::Unreachable {
+                silent.insert(node);
+            } else {
+                silent.remove(&node);
+            }
+            drop(silent);
+            owners.0.insert(node, state);
         }
+        owners
+    }
+
+    /// The owners of `shard` other than this node.
+    fn peer_owners(&self, shard: Shard) -> impl Iterator<Item = NodeId> + '_ {
+        let me = self.cluster.node_id();
+        self.cluster.owners(shard).iter().copied().filter(move |node| *node != me)
+    }
+
+    /// Whether some owner of `shard` reported, in `owners`, that it serves `block`.
+    fn covers(&self, owners: &OwnerStates, shard: Shard, block: u64) -> bool {
+        self.peer_owners(shard).any(|node| owners.serves(node, block))
     }
 
     /// Sheds in batches until nothing is left. Returns the number of rows deleted.
