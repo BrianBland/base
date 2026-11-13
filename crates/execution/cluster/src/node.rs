@@ -198,6 +198,15 @@ impl ClusterNode {
         })
     }
 
+    /// Whether this node holds encoded `key` of `table`, placed by key alone: the caller knows it
+    /// is not a key of a split contract. A key that is not valid for the table is an error.
+    pub fn holds_by_key(&self, table: ShardedTable, key: &[u8]) -> Result<bool, DatabaseError> {
+        let placement = table.placement(key).ok_or_else(|| {
+            DatabaseError::Other(format!("key of length {} is not a {table:?} key", key.len()))
+        })?;
+        Ok(self.cluster.holds_placement(placement))
+    }
+
     /// The counters of this node's remote reads.
     pub const fn remote_read_stats(&self) -> &Arc<RemoteReadStats> {
         &self.remote_reads

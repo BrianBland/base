@@ -110,8 +110,14 @@ local MDBX only (see [Write rule](#write-rule)).
   a `SeekDupGe` page otherwise. When the range has no such duplicate, the read continues with the
   next range, local or remote as placement says, until a duplicate is found or the contract's
   256 ranges are exhausted. Local reads of a split contract use a second MDBX cursor of the same
-  table, which works on encoded keys. Contracts outside `split_storage` are read as before, by
-  key, with no continuation.
+  table, which works on encoded keys and is opened only when the cursor first reads a split
+  contract. Contracts outside `split_storage` are read as before, by key, with no continuation.
+- One read of a split contract (one `seek_exact`, `get`, `seek_by_key_subkey`, or `next_dup` that
+  continues past the current page or local range) has one deadline, 2 seconds after it starts
+  (the default retry budget of one remote read). Every range it visits, owner it asks, connect,
+  frame write and frame read, and retry pause inside it finishes by that deadline, each socket
+  operation waiting only the time left. Running out of time is a `DatabaseError`, never
+  "absent".
 - The cursor keeps its own position; after a remote answer the MDBX cursor's position is
   meaningless.
 - A remote failure is a `DatabaseError`, never "absent".
@@ -268,10 +274,13 @@ is a key or subkey of the wrong length.
   database error) closes the connection, and the asker treats it like an unreachable owner.
 - The asker tries the owners in rendezvous order, skipping itself. It retries the round, for a
   bounded time, only when every owner was unreachable or behind (`SnapshotUnavailable` with no
-  range or a range below `P`) and at least one was behind. Any other refusal is returned.
+  range or a range below `P`) and at least one was behind. Any other refusal is returned. Within a
+  read of a split contract the retries also end at that read's deadline (see [Routing](#routing)).
 
 Transport is blocking sockets with a small connection pool, because reads happen inside
 synchronous cursor calls on engine and trie worker threads. Owners serve from their own threads.
+The owner's accepting thread polls its listener every 10 ms instead of blocking in `accept`, so
+stopping the server never depends on a connection arriving.
 
 ```mermaid
 sequenceDiagram
@@ -370,7 +379,10 @@ scale-down sheds it.
 - A read of a split contract that finds nothing in a range asks the next range, so a seek past
   the last slot of a range that this node does not hold costs one more remote read per empty
   range crossed. Large contracts are dense, so this is rare. A seek past a contract's last slot
-  visits every remaining range.
+  visits every remaining range, and a read of a contract with no storage visits all 256: with
+  1 ms round trips that is about 256 ms, and with slow owners the read fails at its 2-second
+  deadline. Ranges are asked one after another, and an owner that timed out is asked again for
+  the next range.
 - A storage wipe of a split contract is applied per row and per range like any other deletion.
   A wipe of an existing contract cannot happen after Cancun, so this cost is not optimised.
 

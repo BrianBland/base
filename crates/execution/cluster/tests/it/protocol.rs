@@ -202,7 +202,7 @@ fn client_fails_over_when_the_first_owner_is_down() {
         expected(ShardedTable::HashedAccounts, Query::SeekGe { key: address.clone(), limit: 8 })
     );
     let values =
-        client.seek_dup_ge(tip, ShardedTable::HashedStorages, &address, &[0; 32], 8).unwrap();
+        client.seek_dup_ge(tip, ShardedTable::HashedStorages, &address, &[0; 32], 8, None).unwrap();
     assert_eq!(
         Response::Duplicates(values),
         expected(

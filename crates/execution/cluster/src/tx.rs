@@ -42,7 +42,7 @@ impl<K: TransactionKind> ClusteredTx<K> {
     }
 
     /// How a cursor over `T` is sharded. A read-only cursor of a duplicate-key table gets a split
-    /// cursor of its own when any contract's storage is split.
+    /// cursor of its own, opened on first use, when any contract's storage is split.
     fn cursor_sharding<T: Table>(&self) -> Result<CursorSharding<K>, DatabaseError> {
         let Some(table) = ShardedTable::from_table_name(T::NAME) else {
             return Ok(CursorSharding::PassThrough);
@@ -51,7 +51,7 @@ impl<K: TransactionKind> ClusteredTx<K> {
             TxSharding::PassThrough => CursorSharding::PassThrough,
             TxSharding::Reads(snapshot) => {
                 let split = if snapshot.node().cluster().splits_storage() {
-                    SplitCursor::open(&self.inner, table)?
+                    SplitCursor::new(&self.inner, table)?
                 } else {
                     None
                 };
@@ -74,7 +74,7 @@ impl<K: TransactionKind> ClusteredTx<K> {
             let first = self.cursor_read::<T>()?.seek_exact(T::Key::decode(key)?)?;
             return Ok(Some(first.map(|(_, value)| value)));
         }
-        if snapshot.node().holds(table, key, &[])? {
+        if snapshot.node().holds_by_key(table, key)? {
             return Ok(None);
         }
         let value = snapshot.value(table, key)?;

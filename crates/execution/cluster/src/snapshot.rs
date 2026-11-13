@@ -2,7 +2,7 @@
 
 use std::{
     sync::{Arc, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use alloy_primitives::B256;
@@ -25,6 +25,12 @@ pub struct ReadSnapshot {
 impl ReadSnapshot {
     /// Entries asked for per remote `SeekGe` or `SeekDupGe`.
     pub const PAGE_LEN: u32 = 64;
+
+    /// The time one read of a split contract may take across every range it visits, owner it
+    /// asks, connection it opens and frame it exchanges: the default retry budget of one remote
+    /// read ([`ClientOptions::retry_for`](crate::ClientOptions::retry_for)). Running out of it is
+    /// an error, never "absent".
+    pub const SPLIT_READ_BUDGET: Duration = Duration::from_secs(2);
 
     /// A snapshot at block `number`, the `Finish` checkpoint of the transaction.
     pub const fn new(node: Arc<ClusterNode>, number: u64) -> Self {
@@ -83,22 +89,24 @@ impl ReadSnapshot {
     /// table, the key's first duplicate.
     pub fn value(&self, table: ShardedTable, key: &[u8]) -> Result<Option<Vec<u8>>, DatabaseError> {
         if table.is_duplicate() {
-            let first = self.seek_dup_ge(table, key, &table.first_subkey(), 1)?;
+            let first = self.seek_dup_ge(table, key, &table.first_subkey(), 1, None)?;
             return Ok(first.values.into_iter().next());
         }
         self.get(table, key)
     }
 
-    /// Up to `limit` duplicates of `key` with subkeys `>= subkey` at `P`, read from an owner.
+    /// Up to `limit` duplicates of `key` with subkeys `>= subkey` at `P`, read from an owner, by
+    /// `deadline` when there is one.
     pub fn seek_dup_ge(
         &self,
         table: ShardedTable,
         key: &[u8],
         subkey: &[u8],
         limit: u32,
+        deadline: Option<Instant>,
     ) -> Result<DuplicateValues, DatabaseError> {
         self.remote(table, RemoteReadKind::DuplicateSeek, |snapshot| {
-            self.node.client().seek_dup_ge(snapshot, table, key, subkey, limit)
+            self.node.client().seek_dup_ge(snapshot, table, key, subkey, limit, deadline)
         })
     }
 }

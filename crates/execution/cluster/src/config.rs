@@ -221,10 +221,16 @@ impl Cluster {
     /// Whether this node holds the row with encoded `key` and `subkey` of `table` (see
     /// [`Self::placement`]): the row is replicated or in a shard this node owns.
     pub fn holds(&self, table: ShardedTable, key: &[u8], subkey: &[u8]) -> Option<bool> {
-        Some(match self.placement(table, key, subkey)? {
+        self.placement(table, key, subkey).map(|placement| self.holds_placement(placement))
+    }
+
+    /// Whether this node holds the rows at `placement`: they are replicated or in a shard this
+    /// node owns.
+    pub fn holds_placement(&self, placement: KeyPlacement) -> bool {
+        match placement {
             KeyPlacement::Replicated => true,
             KeyPlacement::Shard(shard) => self.owns(shard),
-        })
+        }
     }
 
     /// Address of `node`'s owner server, if the node is listed.

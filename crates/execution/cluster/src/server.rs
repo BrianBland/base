@@ -10,6 +10,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
+    time::Duration,
 };
 
 use parking_lot::Mutex;
@@ -30,6 +31,10 @@ pub struct OwnerServer {
 }
 
 impl OwnerServer {
+    /// How long the accepting thread waits between polls for a connection, and so at most how
+    /// long it takes to notice that the server is dropped.
+    pub const ACCEPT_POLL: Duration = Duration::from_millis(10);
+
     /// Serves `store` and `executed` on `listener`: one thread accepts, and each connection is
     /// served on its own thread, one request at a time.
     pub fn spawn<TX: DbTx + Sync + 'static>(
@@ -38,25 +43,29 @@ impl OwnerServer {
         executed: Arc<ExecutedBlocks>,
     ) -> io::Result<Self> {
         let local_addr = listener.local_addr()?;
+        // Accepting never blocks, so the acceptor notices the stop flag without a connection.
+        listener.set_nonblocking(true)?;
         let stopping = Arc::new(AtomicBool::new(false));
         let connections = Arc::new(Mutex::new(HashMap::new()));
         let acceptor = {
             let stopping = Arc::clone(&stopping);
             let connections = Arc::clone(&connections);
             std::thread::Builder::new().name("cluster-owner-accept".into()).spawn(move || {
-                for (id, stream) in (0u64..).zip(listener.incoming()) {
-                    if stopping.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let stream = match stream {
-                        Ok(stream) => stream,
+                let mut next_id = 0u64;
+                while !stopping.load(Ordering::Acquire) {
+                    let stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
                         Err(error) => {
-                            debug!(error = %error, "cluster owner accept failed");
+                            if error.kind() != io::ErrorKind::WouldBlock {
+                                debug!(error = %error, "cluster owner accept failed");
+                            }
+                            std::thread::sleep(Self::ACCEPT_POLL);
                             continue;
                         }
                     };
                     let served =
-                        Self::serve_connection(id, stream, &store, &executed, &connections);
+                        Self::serve_connection(next_id, stream, &store, &executed, &connections);
+                    next_id += 1;
                     if let Err(error) = served {
                         error!(error = %error, "failed to start cluster owner connection");
                     }
@@ -78,6 +87,8 @@ impl OwnerServer {
         executed: &Arc<ExecutedBlocks>,
         connections: &Arc<Mutex<HashMap<u64, TcpStream>>>,
     ) -> io::Result<()> {
+        // Some platforms hand out accepted connections non-blocking like their listener.
+        stream.set_nonblocking(false)?;
         stream.set_nodelay(true)?;
         connections.lock().insert(id, stream.try_clone()?);
         let store = Arc::clone(store);
@@ -131,8 +142,6 @@ impl OwnerServer {
 impl Drop for OwnerServer {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
-        // Wake the blocked accept so the acceptor sees the stop flag.
-        let _ = TcpStream::connect(self.local_addr);
         if let Some(acceptor) = self.acceptor.take() {
             let _ = acceptor.join();
         }

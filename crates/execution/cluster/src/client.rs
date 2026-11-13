@@ -77,13 +77,17 @@ pub enum ClientError {
     /// Every owner failed in the last round tried.
     #[error("every owner failed: {0:?}")]
     OwnersFailed(Vec<OwnerAttempt>),
+    /// The read's deadline passed before an owner answered.
+    #[error("deadline passed before an owner answered")]
+    DeadlineExpired,
 }
 
 /// Reads keys of shards this node does not own from their owners.
 ///
 /// Calls block the calling thread. Owners are tried in rendezvous order, skipping this node;
 /// the round is retried within [`ClientOptions::retry_for`] only while every owner is unreachable
-/// or behind the snapshot and at least one is behind.
+/// or behind the snapshot and at least one is behind. A read given a deadline also finishes every
+/// connect, write, read and retry by it.
 #[derive(Debug)]
 pub struct ClusterClient {
     cluster: Arc<Cluster>,
@@ -107,7 +111,7 @@ impl ClusterClient {
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, ClientError> {
         let query = Query::Get { key: key.to_vec() };
-        match self.read(Request { snapshot, table, query }, Self::key_shard(table, key)?)? {
+        match self.read(Request { snapshot, table, query }, Self::key_shard(table, key)?, None)? {
             Response::Value(value) => Ok(value),
             Response::Entries(_) | Response::Duplicates(_) | Response::ExecutedBlock(_) => {
                 unreachable!("checked by read")
@@ -124,7 +128,7 @@ impl ClusterClient {
         limit: u32,
     ) -> Result<ShardEntries, ClientError> {
         let query = Query::SeekGe { key: key.to_vec(), limit };
-        match self.read(Request { snapshot, table, query }, Self::key_shard(table, key)?)? {
+        match self.read(Request { snapshot, table, query }, Self::key_shard(table, key)?, None)? {
             Response::Entries(entries) => Ok(entries),
             Response::Value(_) | Response::Duplicates(_) | Response::ExecutedBlock(_) => {
                 unreachable!("checked by read")
@@ -133,7 +137,8 @@ impl ClusterClient {
     }
 
     /// Up to `limit` duplicate values of `key` with subkey `>= subkey`, as of `snapshot`. For a
-    /// split contract the owners of the subkey's range answer, within that range only.
+    /// split contract the owners of the subkey's range answer, within that range only. With a
+    /// `deadline`, the read fails once it passes.
     pub fn seek_dup_ge(
         &self,
         snapshot: SnapshotId,
@@ -141,6 +146,7 @@ impl ClusterClient {
         key: &[u8],
         subkey: &[u8],
         limit: u32,
+        deadline: Option<Instant>,
     ) -> Result<DuplicateValues, ClientError> {
         let shard = if self.cluster.is_split(table, key) {
             self.cluster.placement(table, key, subkey).ok_or(ClientError::InvalidKey)?;
@@ -149,7 +155,7 @@ impl ClusterClient {
             Self::key_shard(table, key)?
         };
         let query = Query::SeekDupGe { key: key.to_vec(), subkey: subkey.to_vec(), limit };
-        match self.read(Request { snapshot, table, query }, shard)? {
+        match self.read(Request { snapshot, table, query }, shard, deadline)? {
             Response::Duplicates(values) => Ok(values),
             Response::Value(_) | Response::Entries(_) | Response::ExecutedBlock(_) => {
                 unreachable!("checked by read")
@@ -251,8 +257,13 @@ impl ClusterClient {
     }
 
     /// Sends `request` to the owners of `shard` until one answers with the response kind the
-    /// query expects.
-    fn read(&self, request: Request, shard: Shard) -> Result<Response, ClientError> {
+    /// query expects, finishing by `deadline` when there is one.
+    fn read(
+        &self,
+        request: Request,
+        shard: Shard,
+        deadline: Option<Instant>,
+    ) -> Result<Response, ClientError> {
         let owners: Vec<_> = self
             .cluster
             .owners(shard)
@@ -264,11 +275,15 @@ impl ClusterClient {
             return Err(ClientError::NoOwner(shard));
         }
 
-        let deadline = Instant::now() + self.options.retry_for;
+        let retry_until = Instant::now() + self.options.retry_for;
+        let retry_until = deadline.map_or(retry_until, |deadline| retry_until.min(deadline));
         loop {
             let mut attempts = Vec::with_capacity(owners.len());
             for &node in &owners {
-                match self.ask(node, &request) {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(ClientError::DeadlineExpired);
+                }
+                match self.ask(node, &request, deadline) {
                     Ok(response) => return Ok(response),
                     Err(failure) => attempts.push(OwnerAttempt { node, failure }),
                 }
@@ -281,7 +296,7 @@ impl ClusterClient {
                 && attempts.iter().all(|attempt| {
                     behind(attempt) || matches!(attempt.failure, OwnerFailure::Unreachable(_))
                 });
-            if !retryable || Instant::now() + self.options.retry_interval > deadline {
+            if !retryable || Instant::now() + self.options.retry_interval > retry_until {
                 return Err(ClientError::OwnersFailed(attempts));
             }
             std::thread::sleep(self.options.retry_interval);
@@ -289,18 +304,19 @@ impl ClusterClient {
     }
 
     /// Asks one owner, on a pooled connection when one is idle. A pooled connection that fails is
-    /// replaced by a fresh one once, since the owner may have closed it while idle.
-    fn ask(&self, node: NodeId, request: &Request) -> Result<Response, OwnerFailure> {
-        let pool = &self.pools[&node];
-        let idle = pool.lock().pop();
-        let result = match idle.map(|stream| self.exchange(node, stream, request)) {
-            Some(Ok(result)) => result,
-            Some(Err(_)) | None => {
-                let stream = self.connect(node).map_err(OwnerFailure::Unreachable)?;
-                self.exchange(node, stream, request).map_err(OwnerFailure::Unreachable)?
-            }
-        };
-        let response = result.map_err(OwnerFailure::Refused)?;
+    /// replaced by a fresh one once, since the owner may have closed it while idle. With a
+    /// `deadline`, the owner must answer by it.
+    fn ask(
+        &self,
+        node: NodeId,
+        request: &Request,
+        deadline: Option<Instant>,
+    ) -> Result<Response, OwnerFailure> {
+        let result = deadline.map_or_else(
+            || self.ask_within_timeouts(node, request),
+            |deadline| self.ask_before(node, request, deadline),
+        );
+        let response = result.map_err(OwnerFailure::Unreachable)?.map_err(OwnerFailure::Refused)?;
         let expected = matches!(
             (&request.query, &response),
             (Query::Get { .. }, Response::Value(_))
@@ -311,8 +327,18 @@ impl ClusterClient {
         if expected { Ok(response) } else { Err(OwnerFailure::UnexpectedResponse) }
     }
 
-    fn connect(&self, node: NodeId) -> Result<TcpStream, FrameError> {
-        self.connect_within(node, self.options.connect_timeout)
+    /// Asks `node`, each connect, write and read waiting at most its configured timeout.
+    fn ask_within_timeouts(
+        &self,
+        node: NodeId,
+        request: &Request,
+    ) -> Result<ReadResult, FrameError> {
+        let idle = self.pools[&node].lock().pop();
+        if let Some(Ok(result)) = idle.map(|stream| self.exchange(node, stream, request)) {
+            return Ok(result);
+        }
+        let stream = self.connect_within(node, self.options.connect_timeout)?;
+        self.exchange(node, stream, request)
     }
 
     /// Connects to `node`, waiting at most `within` (and never longer than the configured connect

@@ -3,36 +3,35 @@
 
 use reth_db::{
     DatabaseError,
-    cursor::DbDupCursorRO,
-    mdbx::{TransactionKind, cursor::Cursor, tx::Tx},
-    table::DupSort,
-    tables::{self, RawDupSort, RawKey, RawValue},
-    transaction::DbTx,
+    mdbx::{Cursor, Transaction, TransactionKind, ffi::MDBX_dbi, tx::Tx},
+    table::Table,
+    tables,
 };
 
 use crate::ShardedTable;
 
-/// A second, raw MDBX cursor of a duplicate-key sharded table, opened next to a read-only
-/// cursor so that duplicates of split contracts can be sought by subkey whatever the typed table
-/// view of that cursor is.
+/// A second, raw MDBX cursor of a duplicate-key sharded table, kept next to a read-only cursor so
+/// that duplicates of split contracts can be sought by subkey whatever the typed table view of
+/// that cursor is. The MDBX cursor is opened when a split contract is first read, so a cursor that
+/// reads only other contracts never opens it.
 #[derive(Debug)]
-pub enum SplitCursor<K: TransactionKind> {
-    /// Over `HashedStorages`.
-    HashedStorages(Cursor<K, RawDupSort<tables::HashedStorages>>),
-    /// Over `PackedStoragesTrie`.
-    StoragesTrie(Cursor<K, RawDupSort<tables::PackedStoragesTrie>>),
+pub struct SplitCursor<K: TransactionKind> {
+    tx: Transaction<K>,
+    table: MDBX_dbi,
+    cursor: Option<Cursor<K>>,
 }
 
 impl<K: TransactionKind> SplitCursor<K> {
-    /// Opens a cursor over `table` in `tx`, or `None` when the table has no duplicates.
-    pub fn open(tx: &Tx<K>, table: ShardedTable) -> Result<Option<Self>, DatabaseError> {
-        Ok(match table {
-            ShardedTable::HashedStorages => Some(Self::HashedStorages(tx.cursor_dup_read()?)),
-            ShardedTable::StoragesTrie => Some(Self::StoragesTrie(tx.cursor_dup_read()?)),
+    /// A split cursor over `table` in `tx`, or `None` when the table has no duplicates.
+    pub fn new(tx: &Tx<K>, table: ShardedTable) -> Result<Option<Self>, DatabaseError> {
+        let name = match table {
+            ShardedTable::HashedStorages => tables::HashedStorages::NAME,
+            ShardedTable::StoragesTrie => tables::PackedStoragesTrie::NAME,
             ShardedTable::HashedAccounts | ShardedTable::AccountsTrie | ShardedTable::Bytecodes => {
-                None
+                return Ok(None);
             }
-        })
+        };
+        Ok(Some(Self { tx: tx.inner().clone(), table: tx.get_dbi_raw(name)?, cursor: None }))
     }
 
     /// The encoded value of the first duplicate of `key` with subkey `>= subkey`.
@@ -41,35 +40,25 @@ impl<K: TransactionKind> SplitCursor<K> {
         key: &[u8],
         subkey: &[u8],
     ) -> Result<Option<Vec<u8>>, DatabaseError> {
-        match self {
-            Self::HashedStorages(cursor) => Self::seek(cursor, key, subkey),
-            Self::StoragesTrie(cursor) => Self::seek(cursor, key, subkey),
-        }
+        self.cursor()?
+            .get_both_range(key, subkey)
+            .map_err(|error| DatabaseError::Read(error.into()))
     }
 
     /// The encoded value of the next duplicate of the current key.
     pub fn next_dup(&mut self) -> Result<Option<Vec<u8>>, DatabaseError> {
-        match self {
-            Self::HashedStorages(cursor) => Self::next(cursor),
-            Self::StoragesTrie(cursor) => Self::next(cursor),
-        }
+        let next = self.cursor()?.next_dup::<(), Vec<u8>>();
+        Ok(next.map_err(|error| DatabaseError::Read(error.into()))?.map(|(_, value)| value))
     }
 
-    fn seek<T: DupSort>(
-        cursor: &mut Cursor<K, RawDupSort<T>>,
-        key: &[u8],
-        subkey: &[u8],
-    ) -> Result<Option<Vec<u8>>, DatabaseError> {
-        let found = cursor.seek_by_key_subkey(
-            RawKey::from_vec(key.to_vec()),
-            RawKey::from_vec(subkey.to_vec()),
-        )?;
-        Ok(found.map(RawValue::into_value))
-    }
-
-    fn next<T: DupSort>(
-        cursor: &mut Cursor<K, RawDupSort<T>>,
-    ) -> Result<Option<Vec<u8>>, DatabaseError> {
-        Ok(cursor.next_dup()?.map(|(_, value)| value.into_value()))
+    fn cursor(&mut self) -> Result<&mut Cursor<K>, DatabaseError> {
+        let cursor = match self.cursor.take() {
+            Some(cursor) => cursor,
+            None => self
+                .tx
+                .cursor(self.table)
+                .map_err(|error| DatabaseError::InitCursor(error.into()))?,
+        };
+        Ok(self.cursor.insert(cursor))
     }
 }

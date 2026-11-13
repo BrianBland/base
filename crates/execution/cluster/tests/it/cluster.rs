@@ -1,19 +1,21 @@
 //! Clustered databases: a seeded differential test of five clustered nodes against a full
 //! reference MDBX, with and without a split contract, the write rule, the commit guard, and
-//! shedding.
+//! shedding; and for split contracts, the read deadline, storage roots and proofs, cursor states
+//! at range boundaries, and shedding in small batches.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::TcpListener,
+    net::{SocketAddr, TcpListener},
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use alloy_primitives::{B256, Bytes, U256, keccak256, map::B256Map};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256, map::B256Map};
 use base_execution_cluster::{
-    BlockUpdates, ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, KeyPlacement,
-    NodeConfig, NodeId, ReadSnapshot, Shard, ShardedTable,
+    BlockUpdates, ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, DuplicateValues, Frame,
+    KeyPlacement, NodeConfig, NodeId, ReadResult, ReadSnapshot, Request, Response, Shard,
+    ShardedTable,
 };
 use rand::{Rng, rngs::StdRng};
 use reth_chainspec::MAINNET;
@@ -22,7 +24,7 @@ use reth_db_api::{
     Database,
     cursor::{DbCursorRO, DbDupCursorRO},
     models::StorageSettings,
-    table::{Decode, Decompress, DupSort, Table},
+    table::{Decode, Decompress, DupSort, Table, TableRow},
     tables::{self, RawDupSort, RawKey, RawTable},
     transaction::{DbTx, DbTxMut},
 };
@@ -36,17 +38,21 @@ use reth_provider::{
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_trie::{
     BranchNodeCompact, HashedPostStateSorted, HashedStorageSorted, Nibbles, PackedStorageTrieEntry,
-    PackedStoredNibbles,
+    PackedStoredNibbles, StorageMultiProof, StorageRoot, TrieInputSorted,
     hashed_cursor::{HashedCursor, HashedCursorFactory, HashedStorageCursor},
+    proof::StorageProof,
     trie_cursor::{TrieCursor, TrieCursorFactory},
     updates::{StorageTrieUpdatesSorted, TrieUpdatesSorted},
 };
-use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseTrieCursorFactory, PackedKeyAdapter};
+use reth_trie_db::{
+    DatabaseHashedCursorFactory, DatabaseStorageProof, DatabaseStorageRoot,
+    DatabaseTrieCursorFactory, PackedKeyAdapter,
+};
 use tempfile::TempDir;
 
 use crate::common::{
     KeyUniverse, TableDump, block_hash, canonical, factory, packed, random_node, random_updates,
-    rng,
+    rng, snapshot,
 };
 
 /// Blocks applied while every node runs, and after one storing node stops.
@@ -655,6 +661,40 @@ fn assert_holds_only_own_keys(env: &DatabaseEnv, cluster: &Cluster, context: &st
     keys
 }
 
+/// Five clustered nodes over the state of `genesis` at block 0, splitting the storage of `split`
+/// (hashed addresses), each serving that persistence point. Nodes listed in `unshed` never shed.
+fn start_nodes(genesis: &Block, split: &[B256], unshed: &[u64]) -> Vec<Node> {
+    let listeners: Vec<_> = (0..NODES).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+    let addresses: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+    (1..=NODES)
+        .zip(listeners)
+        .map(|(id, listener)| {
+            let dir = TempDir::new().unwrap();
+            let env = populated_env(dir.path(), std::slice::from_ref(genesis));
+            let cluster = cluster_view(id, &addresses, split);
+            let db =
+                ClusteredDatabase::clustered(env.clone(), cluster, listener, options()).unwrap();
+            let node = db.cluster().unwrap();
+            if !unshed.contains(&id) {
+                assert!(node.shed().unwrap() > 0, "node {id} sheds the keys it does not hold");
+            }
+            assert!(node.install_block_hashes(Box::new(|number| Some(block_hash(0, number)))));
+            assert!(node.register_persistence_point().unwrap().is_some());
+            let factory = provider_factory(db.clone(), dir.path());
+            Node {
+                id,
+                cadence: CADENCES[id as usize - 1],
+                env,
+                db,
+                factory,
+                persisted: 0,
+                pending: Vec::new(),
+                _dir: dir,
+            }
+        })
+        .collect()
+}
+
 /// Runs the cluster differential test, with a split contract when `split`. Nodes listed in
 /// `unshed` never shed.
 fn run_cluster(seed: u64, unshed: &[u64], split: bool) {
@@ -679,35 +719,7 @@ fn run_cluster(seed: u64, unshed: &[u64], split: bool) {
     persist(reference.provider_rw().unwrap(), std::slice::from_ref(&genesis));
     let mut history = vec![TableDump::read(&reference)];
 
-    let listeners: Vec<_> = (0..NODES).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
-    let addresses: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
-    let mut nodes: Vec<Node> = (1..=NODES)
-        .zip(listeners)
-        .map(|(id, listener)| {
-            let dir = TempDir::new().unwrap();
-            let env = populated_env(dir.path(), std::slice::from_ref(&genesis));
-            let cluster = cluster_view(id, &addresses, &keys.split_contracts);
-            let db =
-                ClusteredDatabase::clustered(env.clone(), cluster, listener, options()).unwrap();
-            let node = db.cluster().unwrap();
-            if !unshed.contains(&id) {
-                assert!(node.shed().unwrap() > 0, "node {id} sheds the keys it does not hold");
-            }
-            assert!(node.install_block_hashes(Box::new(|number| Some(block_hash(0, number)))));
-            assert!(node.register_persistence_point().unwrap().is_some());
-            let factory = provider_factory(db.clone(), dir.path());
-            Node {
-                id,
-                cadence: CADENCES[id as usize - 1],
-                env,
-                db,
-                factory,
-                persisted: 0,
-                pending: Vec::new(),
-                _dir: dir,
-            }
-        })
-        .collect();
+    let mut nodes = start_nodes(&genesis, &keys.split_contracts, unshed);
     if let Some(dense) = &dense
         && unshed.is_empty()
     {
@@ -795,10 +807,13 @@ fn unshed_nodes_read_like_shed_nodes() {
     run_cluster(3, &[2, 5], false);
 }
 
-/// Shed and unshed nodes, one after the other to bound how many nodes run at once.
 #[test]
 fn split_contracts_spread_over_nodes_and_read_like_a_full_database() {
     run_cluster(4, &[], true);
+}
+
+#[test]
+fn unshed_nodes_read_a_split_contract_like_shed_nodes() {
     run_cluster(5, &[2, 5], true);
 }
 
@@ -1022,4 +1037,425 @@ fn remote_walks_continue_across_pages() {
     assert!(counts.seeks >= 3, "{counts:?}");
     assert!(counts.duplicate_seeks >= 3, "{counts:?}");
     assert_eq!(counts.failures, 0, "{counts:?}");
+}
+
+/// How long a fake owner takes to answer each request.
+const SLOW_ANSWER: Duration = Duration::from_millis(20);
+
+/// How late past its budget a split read may return.
+const SPLIT_READ_SLACK: Duration = Duration::from_millis(500);
+
+/// A peer that answers every request after [`SLOW_ANSWER`] with an empty, complete duplicate
+/// page: each answer is quick, but one per range adds up to longer than a split read may take.
+fn slow_owner() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            std::thread::spawn(move || {
+                while Frame::read::<Request>(&mut stream).is_ok() {
+                    std::thread::sleep(SLOW_ANSWER);
+                    let empty = DuplicateValues { values: Vec::new(), end_of_key: true };
+                    let answer: ReadResult = Ok(Response::Duplicates(empty));
+                    if Frame::write(&mut stream, &answer).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    address
+}
+
+#[test]
+fn a_split_read_through_slow_owners_fails_within_its_budget() {
+    let mut addresses: Vec<_> = (1..NODES).map(|_| slow_owner()).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    addresses.push(listener.local_addr().unwrap());
+    let contract = B256::repeat_byte(0x33);
+    let empty = Block {
+        number: 0,
+        updates: BlockUpdates { hashed_state: Arc::default(), trie_updates: Arc::default() },
+        codes: Vec::new(),
+    };
+    let dir = TempDir::new().unwrap();
+    let env = populated_env(dir.path(), &[empty]);
+    // Node 5 stores nothing, so every range of the empty contract is asked of a slow owner.
+    let view = cluster_view(NODES, &addresses, &[contract]);
+    let db = ClusteredDatabase::clustered(env, view, listener, options()).unwrap();
+
+    let tx = db.tx().unwrap();
+    let mut storages = tx.cursor_dup_read::<tables::HashedStorages>().unwrap();
+    let started = Instant::now();
+    let found = storages.seek_exact(contract);
+    let elapsed = started.elapsed();
+    assert!(found.is_err(), "running out of time is an error, not absence: {found:?}");
+    assert!(elapsed < ReadSnapshot::SPLIT_READ_BUDGET + SPLIT_READ_SLACK, "took {elapsed:?}");
+}
+
+/// A reth storage root calculator over a database transaction with storage v2 trie keys.
+type DbStorageRoot<'a, TX> = StorageRoot<
+    DatabaseTrieCursorFactory<&'a TX, PackedKeyAdapter>,
+    DatabaseHashedCursorFactory<&'a TX>,
+>;
+/// A reth storage proof calculator over a database transaction with storage v2 trie keys.
+type DbStorageProof<'a, TX> = StorageProof<
+    DatabaseTrieCursorFactory<&'a TX, PackedKeyAdapter>,
+    DatabaseHashedCursorFactory<&'a TX>,
+>;
+
+/// The storage root and storage multiproof of `address` that live execution computes over `tx`
+/// with `changes` laid over it, for the slots `targets` (not hashed).
+fn overlay_root_and_proof<TX: DbTx>(
+    tx: &TX,
+    address: Address,
+    changes: &TrieInputSorted,
+    targets: &[B256],
+) -> (B256, StorageMultiProof) {
+    let root = DbStorageRoot::overlay_root(tx, address, changes.clone()).unwrap();
+    let proof =
+        DbStorageProof::overlay_storage_multiproof(tx, address, targets, changes.clone()).unwrap();
+    (root, proof)
+}
+
+/// The storage root and storage multiproof of `address` over the trie stored in `tx`.
+fn stored_root_and_proof<TX: DbTx>(
+    tx: &TX,
+    address: Address,
+    targets: &[B256],
+) -> (B256, StorageMultiProof) {
+    let root = DbStorageRoot::from_tx_hashed(tx, keccak256(address)).root().unwrap();
+    let hashed_targets = targets.iter().map(keccak256).collect();
+    let proof = DbStorageProof::from_tx(tx, address).storage_multiproof(hashed_targets).unwrap();
+    (root, proof)
+}
+
+/// Slots of the contract whose real storage trie the root test builds: enough for branch nodes
+/// two nibbles deep in every range.
+const TRIE_SLOTS: usize = 1500;
+
+/// One block writing `slots` (hashed) of the contract at `hashed` and its storage-trie `nodes`.
+fn storage_block(
+    number: u64,
+    hashed: B256,
+    slots: Vec<(B256, U256)>,
+    nodes: StorageTrieUpdatesSorted,
+) -> Block {
+    let storage = HashedStorageSorted { storage_slots: slots };
+    Block {
+        number,
+        updates: BlockUpdates {
+            hashed_state: Arc::new(HashedPostStateSorted::new(
+                Vec::new(),
+                std::iter::once((hashed, storage)).collect(),
+            )),
+            trie_updates: Arc::new(TrieUpdatesSorted::new(
+                Vec::new(),
+                std::iter::once((hashed, nodes)).collect(),
+            )),
+        },
+        codes: Vec::new(),
+    }
+}
+
+/// Writes `slots` of the contract at `hashed` to `reference` at block `number`, then computes its
+/// storage trie there with reth's code, only below the changed slots when `changed_only`, and
+/// writes it too. Returns the block the nodes persist: the slots and the trie nodes written.
+fn persist_with_trie(
+    reference: &crate::common::TestFactory,
+    number: u64,
+    hashed: B256,
+    slots: Vec<(B256, U256)>,
+    changed_only: bool,
+) -> Block {
+    let block = storage_block(number, hashed, slots, StorageTrieUpdatesSorted::default());
+    persist(reference.provider_rw().unwrap(), std::slice::from_ref(&block));
+    let tx = snapshot(reference);
+    let mut calculator = DbStorageRoot::from_tx_hashed(&tx, hashed);
+    if changed_only {
+        let mut prefix_sets = block.updates.hashed_state.construct_prefix_sets();
+        let changed = prefix_sets.storage_prefix_sets.remove(&hashed).unwrap();
+        calculator = calculator.with_prefix_set(changed.freeze());
+    }
+    let (_, _, nodes) = calculator.root_with_updates().unwrap();
+    drop(tx);
+    let nodes = nodes.into_sorted();
+    let slots = block.updates.hashed_state.storages[&hashed].storage_slots.clone();
+    let trie_only = storage_block(number, hashed, Vec::new(), nodes.clone());
+    persist(reference.provider_rw().unwrap(), std::slice::from_ref(&trie_only));
+    storage_block(number, hashed, slots, nodes)
+}
+
+#[test]
+fn split_storage_roots_and_proofs_match_the_reference() {
+    let mut rng = rng(11);
+    let address = Address::from(rng.random::<[u8; 20]>());
+    let hashed = keccak256(address);
+    let preimages: Vec<B256> =
+        (0..TRIE_SLOTS).map(|_| B256::from(rng.random::<[u8; 32]>())).collect();
+    let value = |rng: &mut StdRng| U256::from(rng.random_range(1..u64::MAX));
+    let mut slots: Vec<_> =
+        preimages.iter().map(|slot| (keccak256(slot), value(&mut rng))).collect();
+    slots.sort();
+
+    let reference = factory();
+    let genesis = persist_with_trie(&reference, 0, hashed, slots, false);
+    let nodes = start_nodes(&genesis, &[hashed], &[]);
+    let storing = &nodes[0];
+    let stateless = nodes.last().unwrap();
+    assert!(!stateless.storing());
+
+    // Block 1 rewrites and deletes slots, and adds new ones, in held and non-held ranges alike.
+    let added: Vec<B256> = (0..100).map(|_| B256::from(rng.random::<[u8; 32]>())).collect();
+    let mut changes: BTreeMap<B256, U256> = BTreeMap::new();
+    for slot in &preimages {
+        if !rng.random_bool(0.2) {
+            continue;
+        }
+        let new = if rng.random_bool(0.3) { U256::ZERO } else { value(&mut rng) };
+        changes.insert(keccak256(slot), new);
+    }
+    for slot in &added {
+        changes.insert(keccak256(slot), value(&mut rng));
+    }
+    let cluster = storing.db.cluster().unwrap().cluster();
+    let held = changes
+        .keys()
+        .filter(|slot| {
+            cluster.holds(ShardedTable::HashedStorages, hashed.as_slice(), slot.as_slice())
+                == Some(true)
+        })
+        .count();
+    assert!(0 < held && held < changes.len(), "{held} of {} changes held", changes.len());
+    let changes: Vec<_> = changes.into_iter().collect();
+    let overlay = storage_block(1, hashed, changes.clone(), StorageTrieUpdatesSorted::default());
+    let state = Arc::clone(&overlay.updates.hashed_state);
+    let input =
+        TrieInputSorted::new(Arc::default(), Arc::clone(&state), state.construct_prefix_sets());
+    let mut targets: Vec<B256> = preimages.iter().step_by(97).copied().collect();
+    targets.extend(added.iter().take(3));
+    targets.push(B256::repeat_byte(0x77));
+
+    // At block 0, the root and proof with block 1's changes laid over the stored trie.
+    let want = overlay_root_and_proof(&snapshot(&reference), address, &input, &targets);
+    for node in [storing, stateless] {
+        let found = overlay_root_and_proof(&node.db.tx().unwrap(), address, &input, &targets);
+        assert_eq!(found, want, "node {}: overlay root and proof at block 0", node.id);
+    }
+
+    // At block 1, with block 1's slots and trie nodes persisted, the root and proof over the
+    // stored trie.
+    let block = persist_with_trie(&reference, 1, hashed, changes, true);
+    let want_stored = stored_root_and_proof(&snapshot(&reference), address, &targets);
+    assert_eq!(want_stored.0, want.0, "the persisted trie has the overlay's root");
+    for node in &nodes {
+        let owner_store = node.db.cluster().unwrap().owner_store();
+        owner_store.insert_block(canonical(1, block_hash(0, 1), block_hash(0, 0), &block.updates));
+        persist(node.factory.provider_rw().unwrap(), std::slice::from_ref(&block));
+    }
+    for node in [storing, stateless] {
+        let found = stored_root_and_proof(&node.db.tx().unwrap(), address, &targets);
+        assert_eq!(found, want_stored, "node {}: stored root and proof at block 1", node.id);
+    }
+}
+
+/// The last subkey of a 32-byte slot that is not the largest possible, so that a seek from the
+/// largest finds nothing.
+const fn near_last_slot() -> B256 {
+    let mut slot = B256::repeat_byte(0xff);
+    slot.0[31] = 0xfe;
+    slot
+}
+
+/// The smallest slot of range `0xff`.
+fn last_range_slot() -> Vec<u8> {
+    let mut slot = vec![0; 32];
+    slot[0] = 0xff;
+    slot
+}
+
+/// One step of a cursor script run on the reference and on a node, with what it returned.
+type Step = (&'static str, Option<Vec<u8>>);
+
+/// Runs a fixed script of positioning calls, duplicate walks and `current` over duplicate-key
+/// table `T` through `tx`: misses, walks to the end of split `contract` through its `0xff`
+/// range, and reseeks of `other` (an unlisted contract) and of an absent key afterwards.
+fn boundary_script<T: DupSort>(
+    tx: &impl DbTx,
+    contract: B256,
+    other: B256,
+    mid: Vec<u8>,
+    last_range: Vec<u8>,
+    past_last: Vec<u8>,
+) -> Vec<Step> {
+    let value = |row: Option<TableRow<RawDupSort<T>>>| row.map(|(_, value)| value.into_value());
+    let mut cursor = tx.cursor_dup_read::<RawDupSort<T>>().unwrap();
+    let mut steps = Vec::new();
+    let key = |hash: B256| RawKey::<T::Key>::from_vec(hash.to_vec());
+
+    let missed = cursor
+        .seek_by_key_subkey(key(contract), RawKey::from_vec(past_last))
+        .unwrap()
+        .map(|found| found.into_value());
+    steps.push(("seek past the last duplicate", missed));
+    steps.push(("current after a miss", value(cursor.current().unwrap())));
+
+    let found = cursor
+        .seek_by_key_subkey(key(contract), RawKey::from_vec(mid))
+        .unwrap()
+        .map(|found| found.into_value());
+    steps.push(("seek inside a range", found));
+    for _ in 0..3 {
+        steps.push(("next_dup across ranges", value(cursor.next_dup().unwrap())));
+    }
+    steps.push(("current inside a range", value(cursor.current().unwrap())));
+
+    let found = cursor
+        .seek_by_key_subkey(key(contract), RawKey::from_vec(last_range))
+        .unwrap()
+        .map(|found| found.into_value());
+    steps.push(("seek into the 0xff range", found));
+    loop {
+        let next = value(cursor.next_dup().unwrap());
+        let end = next.is_none();
+        steps.push(("next_dup to the end", next));
+        if end {
+            break;
+        }
+    }
+    steps.push(("current after exhaustion", value(cursor.current().unwrap())));
+    steps.push(("next_dup after exhaustion", value(cursor.next_dup().unwrap())));
+    steps.push(("current still at the last duplicate", value(cursor.current().unwrap())));
+
+    steps.push(("seek_exact another contract", value(cursor.seek_exact(key(other)).unwrap())));
+    let mut walked = vec![value(cursor.next_dup().unwrap())];
+    while walked.last().unwrap().is_some() {
+        walked.push(value(cursor.next_dup().unwrap()));
+    }
+    steps.extend(walked.into_iter().map(|next| ("its next_dup to the end", next)));
+    steps.push(("its current after exhaustion", value(cursor.current().unwrap())));
+    steps.push(("seek_exact the split contract", value(cursor.seek_exact(key(contract)).unwrap())));
+    steps.push(("its next_dup", value(cursor.next_dup().unwrap())));
+    let absent = B256::repeat_byte(0x01);
+    steps.push(("seek_exact an absent key", value(cursor.seek_exact(key(absent)).unwrap())));
+    steps.push(("current after that miss", value(cursor.current().unwrap())));
+    steps
+}
+
+#[test]
+fn split_cursor_states_at_range_boundaries_match_the_reference() {
+    let mut rng = rng(12);
+    let mut dense = DenseContract::new(&mut rng);
+    dense.slots.push(near_last_slot());
+    dense.slots.sort();
+    dense.slots.dedup();
+    dense.paths.push(Nibbles::from_nibbles([0xf, 0xf, 0xf]));
+    dense.paths.sort();
+    dense.paths.dedup();
+    let other = B256::from(rng.random::<[u8; 32]>());
+    let mut other_slots: Vec<_> =
+        (0..5).map(|n| (B256::from(rng.random::<[u8; 32]>()), U256::from(n + 1))).collect();
+    other_slots.sort();
+    let other_nodes = vec![(Nibbles::from_nibbles([1, 2, 3]), Some(random_node(&mut rng)))];
+    let unlisted = DenseContract { address: other, slots: Vec::new(), paths: Vec::new() }
+        .updates(other_slots, other_nodes);
+    let genesis_updates = with_storage(&unlisted, &dense.genesis(&mut rng));
+    let genesis = Block { number: 0, updates: genesis_updates, codes: Vec::new() };
+    let reference = factory();
+    persist(reference.provider_rw().unwrap(), std::slice::from_ref(&genesis));
+    let nodes = start_nodes(&genesis, &[dense.address], &[]);
+
+    let want = boundary_scripts(&snapshot(&reference), dense.address, other);
+    let (storage, trie) = &want;
+    assert_eq!(storage[0], ("seek past the last duplicate", None));
+    let last = storage.iter().find(|(step, _)| *step == "current after exhaustion").unwrap();
+    assert_eq!(last.1.as_deref().map(|value| &value[..32]), Some(near_last_slot().as_slice()));
+    assert!(trie.iter().filter(|(step, _)| *step == "next_dup to the end").count() > 1);
+    for node in [&nodes[0], &nodes[1], nodes.last().unwrap()] {
+        let found = boundary_scripts(&node.db.tx().unwrap(), dense.address, other);
+        assert_eq!(found, want, "node {}: cursor scripts", node.id);
+    }
+}
+
+/// [`boundary_script`] over both duplicate-key tables, seeking inside the crowded range (more
+/// than a page), into range `0xff`, and past the last slot or path.
+fn boundary_scripts(tx: &impl DbTx, contract: B256, other: B256) -> (Vec<Step>, Vec<Step>) {
+    let mut mid_slot = vec![CROWDED_RANGE; 32];
+    mid_slot[1] = 0x80;
+    let storage = boundary_script::<tables::HashedStorages>(
+        tx,
+        contract,
+        other,
+        mid_slot,
+        last_range_slot(),
+        vec![0xff; 32],
+    );
+    let mid_path = packed(Nibbles::from_nibbles([CROWDED_RANGE >> 4, CROWDED_RANGE & 0xf, 8]));
+    let trie = boundary_script::<tables::PackedStoragesTrie>(
+        tx,
+        contract,
+        other,
+        mid_path,
+        packed(Nibbles::from_nibbles([0xf, 0xf])),
+        packed(Nibbles::from_nibbles([0xf; 6])),
+    );
+    (storage, trie)
+}
+
+#[test]
+fn shedding_a_split_contract_one_row_at_a_time_keeps_exactly_the_held_rows() {
+    let mut rng = rng(13);
+    let dense = DenseContract::new(&mut rng);
+    let genesis = Block { number: 0, updates: dense.genesis(&mut rng), codes: Vec::new() };
+    let dir = TempDir::new().unwrap();
+    let env = populated_env(dir.path(), std::slice::from_ref(&genesis));
+    let full = TableDump::read_tx(&env.tx().unwrap());
+    let listeners: Vec<_> = (0..NODES).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+    let addresses: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+    let view = cluster_view(2, &addresses, &[dense.address]);
+    let held = |table: ShardedTable, rows: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>| {
+        let mut kept = rows.clone();
+        for (key, values) in &mut kept {
+            values.retain(|value| {
+                view.holds(table, key, table.subkey_of(value).unwrap()) == Some(true)
+            });
+        }
+        kept.retain(|_, values| !values.is_empty());
+        kept
+    };
+    let want_storages = held(ShardedTable::HashedStorages, &full.hashed_storages);
+    let want_trie = held(ShardedTable::StoragesTrie, &full.storages_trie);
+    let rows = |dump: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>| dump.values().map(Vec::len).sum::<usize>();
+    let to_delete = rows(&full.hashed_storages) + rows(&full.storages_trie)
+        - rows(&want_storages)
+        - rows(&want_trie);
+    assert!(to_delete > 100, "{to_delete} rows to shed");
+
+    let open = |listener: TcpListener| {
+        ClusteredDatabase::clustered(env.clone(), Arc::clone(&view), listener, options()).unwrap()
+    };
+    let mut listeners = listeners.into_iter();
+    let db = open(listeners.nth(1).unwrap());
+    let node = db.cluster().unwrap();
+    for _ in 0..to_delete / 2 {
+        assert_eq!(node.shed_batch(1).unwrap(), 1);
+    }
+    drop(db);
+
+    // Reopened mid-shed, the node resumes where it stopped.
+    let db = open(TcpListener::bind("127.0.0.1:0").unwrap());
+    let node = db.cluster().unwrap();
+    let mut deleted = to_delete / 2;
+    loop {
+        match node.shed_batch(1).unwrap() {
+            0 => break,
+            1 => deleted += 1,
+            more => panic!("a batch of one deleted {more} rows"),
+        }
+    }
+    assert_eq!(deleted, to_delete);
+    let after = TableDump::read_tx(&env.tx().unwrap());
+    assert_eq!(after.hashed_storages, want_storages);
+    assert_eq!(after.storages_trie, want_trie);
 }

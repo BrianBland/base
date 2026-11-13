@@ -1,7 +1,7 @@
 //! Read-only cursor routing over one sharded table: local MDBX for held keys, owners for the
 //! rest, with the cursor position kept here rather than in MDBX.
 
-use std::{collections::VecDeque, mem, sync::Arc};
+use std::{collections::VecDeque, mem, sync::Arc, time::Instant};
 
 use reth_db::{
     DatabaseError,
@@ -211,10 +211,12 @@ impl<K: TransactionKind> ShardedReads<K> {
     pub fn seek_exact<T: Table>(&mut self, inner: &mut Cursor<K, T>, key: T::Key) -> PairResult<T> {
         let encoded = Self::encode::<T>(&key);
         if self.is_split(&encoded) {
-            let found = self.find_split::<T>(&encoded, &self.table.first_subkey(), false)?;
+            let deadline = Instant::now() + ReadSnapshot::SPLIT_READ_BUDGET;
+            let first = self.table.first_subkey();
+            let found = self.find_split::<T>(&encoded, &first, false, deadline)?;
             return Ok(self.settle::<T>(found));
         }
-        if self.snapshot.node().holds(self.table, &encoded, &[])? {
+        if self.snapshot.node().holds_by_key(self.table, &encoded)? {
             let row = inner.seek_exact(key)?;
             self.position = if row.is_some() || self.table.is_duplicate() {
                 CursorPosition::Local { key: encoded }
@@ -224,7 +226,7 @@ impl<K: TransactionKind> ShardedReads<K> {
             return Ok(row);
         }
         let found = if self.table.is_duplicate() {
-            self.remote_duplicates::<T>(encoded, &self.table.first_subkey(), false)?
+            self.remote_duplicates::<T>(encoded, &self.table.first_subkey(), false, None)?
         } else {
             match self.snapshot.get(self.table, &encoded)? {
                 Some(value) => {
@@ -250,18 +252,22 @@ impl<K: TransactionKind> ShardedReads<K> {
     ) -> ValueOnlyResult<T> {
         let encoded = Self::encode::<T>(&key);
         if self.is_split(&encoded) {
-            let found = self.find_split::<T>(&encoded, &subkey.encode().into_vec(), false)?;
+            let deadline = Instant::now() + ReadSnapshot::SPLIT_READ_BUDGET;
+            let subkey = subkey.encode().into_vec();
+            let found = self.find_split::<T>(&encoded, &subkey, false, deadline)?;
             return Ok(self.settle::<T>(found).map(|(_, value)| value));
         }
-        if self.snapshot.node().holds(self.table, &encoded, &[])? {
+        if self.snapshot.node().holds_by_key(self.table, &encoded)? {
             self.position = CursorPosition::Local { key: encoded };
             return inner.seek_by_key_subkey(key, subkey);
         }
-        let found = self.remote_duplicates::<T>(encoded, &subkey.encode().into_vec(), false)?;
+        let subkey = subkey.encode().into_vec();
+        let found = self.remote_duplicates::<T>(encoded, &subkey, false, None)?;
         Ok(self.settle::<T>(found).map(|(_, value)| value))
     }
 
-    /// `DbDupCursorRO::next_dup`. For a split contract the next duplicate may be in a later range.
+    /// `DbDupCursorRO::next_dup`. For a split contract the next duplicate may be in a later range,
+    /// and the search for it is one split read with its own deadline.
     pub fn next_dup<T: DupSort>(&mut self, inner: &mut Cursor<K, T>) -> PairResult<T> {
         if let CursorPosition::Remote { key, value, rest, .. } = &mut self.position
             && let Some((next_key, next_value)) = rest.pop_front()
@@ -271,26 +277,35 @@ impl<K: TransactionKind> ShardedReads<K> {
             *value = next_value;
             return Ok(Some(row));
         }
-        let position = mem::replace(&mut self.position, CursorPosition::Missed);
+        let mut position = mem::replace(&mut self.position, CursorPosition::Missed);
+        let mut unsplit_key_ended = false;
         let found = match &position {
             CursorPosition::Local { .. } => {
                 self.position = position;
                 return inner.next_dup();
             }
-            CursorPosition::LocalSplit { key, value } => self.next_local_split::<T>(key, value)?,
+            CursorPosition::LocalSplit { key, value } => {
+                let deadline = Instant::now() + ReadSnapshot::SPLIT_READ_BUDGET;
+                self.next_local_split::<T>(key, value, deadline)?
+            }
             CursorPosition::Remote { key, value, complete, .. } => {
                 let subkey = self.subkey_of(value)?;
+                let deadline =
+                    self.is_split(key).then(|| Instant::now() + ReadSnapshot::SPLIT_READ_BUDGET);
                 let in_page = if *complete {
                     None
                 } else {
-                    self.remote_duplicates::<T>(key.clone(), subkey, true)?
+                    self.remote_duplicates::<T>(key.clone(), subkey, true, deadline)?
                 };
-                match in_page {
-                    Some(found) => Some(found),
-                    None if self.is_split(key) => {
-                        self.find_split_after_range::<T>(key, Shard(subkey[0]))?
+                match (in_page, deadline) {
+                    (Some(found), _) => Some(found),
+                    (None, Some(deadline)) => {
+                        self.find_split_after_range::<T>(key, Shard(subkey[0]), deadline)?
                     }
-                    None => None,
+                    (None, None) => {
+                        unsplit_key_ended = true;
+                        None
+                    }
                 }
             }
             CursorPosition::Unset | CursorPosition::Missed | CursorPosition::PastEnd { .. } => {
@@ -302,6 +317,14 @@ impl<K: TransactionKind> ShardedReads<K> {
             Some((row, next)) => {
                 self.position = next;
                 Some(row)
+            }
+            // The last remote duplicate stays current, as in an exhausted MDBX duplicate walk.
+            None if unsplit_key_ended => {
+                if let CursorPosition::Remote { complete, .. } = &mut position {
+                    *complete = true;
+                }
+                self.position = position;
+                None
             }
             None => {
                 self.position = CursorPosition::PastEnd { last: Box::new(position) };
@@ -338,11 +361,12 @@ impl<K: TransactionKind> ShardedReads<K> {
         &mut self,
         key: &[u8],
         value: &[u8],
+        deadline: Instant,
     ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
         let subkey = self.subkey_of(value)?;
         let range = match self.split_placement(subkey) {
             Some(KeyPlacement::Shard(range)) => range,
-            _ => return self.find_split::<T>(key, subkey, true),
+            _ => return self.find_split::<T>(key, subkey, true, deadline),
         };
         if let Some(next) = self.split_cursor()?.next_dup()?
             && self.split_placement(self.subkey_of(&next)?) == Some(KeyPlacement::Shard(range))
@@ -350,32 +374,36 @@ impl<K: TransactionKind> ShardedReads<K> {
             let row = Self::decode::<T>(key, &next)?;
             return Ok(Some((row, CursorPosition::LocalSplit { key: key.to_vec(), value: next })));
         }
-        self.find_split_after_range::<T>(key, range)
+        self.find_split_after_range::<T>(key, range, deadline)
     }
 
     /// The first duplicate of split contract `key` with subkey `>= start` (`> start` when
-    /// `after`), from `start`'s range on.
+    /// `after`), from `start`'s range on, with every remote read finished by `deadline`.
     fn find_split<T: Table>(
         &mut self,
         key: &[u8],
         start: &[u8],
         after: bool,
+        deadline: Instant,
     ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
         let range = Shard(*start.first().ok_or_else(|| self.unsupported("an empty subkey"))?);
-        if let Some(found) = self.find_split_in_range::<T>(key, range, Some((start, after)))? {
+        let bound = Some((start, after));
+        if let Some(found) = self.find_split_in_range::<T>(key, range, bound, deadline)? {
             return Ok(Some(found));
         }
-        self.find_split_after_range::<T>(key, range)
+        self.find_split_after_range::<T>(key, range, deadline)
     }
 
-    /// The first duplicate of split contract `key` in the first non-empty range after `range`.
+    /// The first duplicate of split contract `key` in the first non-empty range after `range`,
+    /// with every remote read finished by `deadline`.
     fn find_split_after_range<T: Table>(
         &mut self,
         key: &[u8],
         range: Shard,
+        deadline: Instant,
     ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
         for next in (range.0..=u8::MAX).skip(1) {
-            if let Some(found) = self.find_split_in_range::<T>(key, Shard(next), None)? {
+            if let Some(found) = self.find_split_in_range::<T>(key, Shard(next), None, deadline)? {
                 return Ok(Some(found));
             }
         }
@@ -384,12 +412,13 @@ impl<K: TransactionKind> ShardedReads<K> {
 
     /// The first duplicate of split contract `key` in `range` at or after the bound: replicated
     /// storage-trie paths first (local), then the range (local when owned, otherwise from an
-    /// owner, whose page ends at the range boundary).
+    /// owner by `deadline`, whose page ends at the range boundary).
     fn find_split_in_range<T: Table>(
         &mut self,
         key: &[u8],
         range: Shard,
         bound: Option<(&[u8], bool)>,
+        deadline: Instant,
     ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
         let layout = self.table.subkey_layout().ok_or_else(|| self.unsupported("a split key"))?;
         let beyond = |subkey: &[u8]| match bound {
@@ -413,7 +442,7 @@ impl<K: TransactionKind> ShardedReads<K> {
             _ => (floor, false),
         };
         if !self.owns(range) {
-            return self.remote_duplicates::<T>(key.to_vec(), &from, after);
+            return self.remote_duplicates::<T>(key.to_vec(), &from, after, Some(deadline));
         }
         let split = self.split_cursor()?;
         let mut value = split.seek_by_key_subkey(key, &from)?;
@@ -511,14 +540,16 @@ impl<K: TransactionKind> ShardedReads<K> {
     }
 
     /// The first duplicate of an owner's `SeekDupGe` page of `key` from `subkey` (skipping
-    /// `subkey` when `after`).
+    /// `subkey` when `after`), read by `deadline` when there is one.
     fn remote_duplicates<T: Table>(
         &self,
         key: Vec<u8>,
         subkey: &[u8],
         after: bool,
+        deadline: Option<Instant>,
     ) -> Result<Option<FoundEntry<T>>, DatabaseError> {
-        let page = self.snapshot.seek_dup_ge(self.table, &key, subkey, ReadSnapshot::PAGE_LEN)?;
+        let limit = ReadSnapshot::PAGE_LEN;
+        let page = self.snapshot.seek_dup_ge(self.table, &key, subkey, limit, deadline)?;
         let subkey_len = self.table.subkey_len();
         let mut rest: VecDeque<_> =
             page.values.into_iter().map(|value| (key.clone(), value)).collect();
