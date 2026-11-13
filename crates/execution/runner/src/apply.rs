@@ -408,7 +408,8 @@ where
         self.validate_pre_execution(&block, &parent).map_err(ApplyError::PreExecution)?;
 
         let started = Instant::now();
-        let fetched = self.node.client().executed_block(block.hash(), Self::FETCH_BUDGET);
+        let fetched =
+            self.node.client().executed_block(block.hash(), block.number(), Self::FETCH_BUDGET);
         self.node.apply_stats().record_fetch(started.elapsed());
         let parts = ExecutedBlockResult::decode(&fetched.map_err(ApplyError::Fetch)?)
             .map_err(|error| ApplyError::Decode(error.to_string()))?

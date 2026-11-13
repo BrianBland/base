@@ -110,15 +110,16 @@ impl ClusterFeed {
         }
     }
 
-    /// `block`'s hash and encoded execution result, or `None` when it does not encode.
+    /// `block`'s hash, number and encoded execution result, or `None` when it does not encode.
     pub fn encode_executed_block<N: NodePrimitives>(
         block: &ExecutedBlock<N>,
-    ) -> Option<(B256, Bytes)> {
+    ) -> Option<(B256, u64, Bytes)> {
         let hash = block.recovered_block.hash();
+        let number = block.recovered_block.number();
         let trie = block.trie_data();
         let senders = block.recovered_block.senders();
         match ExecutedBlockResult::new(&block.execution_output, senders, &trie).encode() {
-            Ok(encoded) => Some((hash, encoded)),
+            Ok(encoded) => Some((hash, number, encoded)),
             Err(error) => {
                 warn!(block = %hash, error = %error, "failed to encode an execution result for apply nodes");
                 None

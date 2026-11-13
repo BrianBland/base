@@ -365,10 +365,10 @@ fn executor_serves_a_stored_result_by_hash() {
     let client = applying_client(listener.local_addr().unwrap());
     let (executed, _server) = serve_results(listener);
     let result = Bytes::from_static(b"encoded result");
-    executed.insert(B256::repeat_byte(1), result.clone());
-    executed.insert(B256::repeat_byte(2), Bytes::from_static(b"another block"));
+    executed.insert(B256::repeat_byte(1), 1, result.clone());
+    executed.insert(B256::repeat_byte(2), 2, Bytes::from_static(b"another block"));
 
-    assert_eq!(client.executed_block(B256::repeat_byte(1), FETCH_BUDGET), Ok(result));
+    assert_eq!(client.executed_block(B256::repeat_byte(1), 1, FETCH_BUDGET), Ok(result));
 }
 
 #[test]
@@ -378,7 +378,7 @@ fn unknown_block_is_not_available_once_the_executor_stops_waiting() {
     let (_executed, _server) = serve_results(listener);
 
     let started = Instant::now();
-    let result = client.executed_block(B256::repeat_byte(9), FETCH_BUDGET);
+    let result = client.executed_block(B256::repeat_byte(9), 1, FETCH_BUDGET);
     let elapsed = started.elapsed();
     assert_eq!(result, Err(ApplyFallback::Unavailable));
     assert!(elapsed >= ExecutedBlocks::SERVE_WAIT, "answered before waiting: {elapsed:?}");
@@ -393,7 +393,7 @@ fn fetch_gives_up_at_its_budget_while_the_executor_still_waits() {
 
     let budget = Duration::from_millis(50);
     let started = Instant::now();
-    let result = client.executed_block(B256::repeat_byte(9), budget);
+    let result = client.executed_block(B256::repeat_byte(9), 1, budget);
     let elapsed = started.elapsed();
     assert_eq!(result, Err(ApplyFallback::Unavailable));
     assert!(elapsed < ExecutedBlocks::SERVE_WAIT, "waited {elapsed:?}");
@@ -412,10 +412,10 @@ fn result_stored_after_the_request_arrives_answers_that_request() {
         let result = result.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
-            executed.insert(hash, result);
+            executed.insert(hash, 3, result);
         })
     };
-    assert_eq!(client.executed_block(hash, FETCH_BUDGET), Ok(result));
+    assert_eq!(client.executed_block(hash, 3, FETCH_BUDGET), Ok(result));
     finish.join().unwrap();
 }
 
@@ -423,7 +423,7 @@ fn result_stored_after_the_request_arrives_answers_that_request() {
 fn unreachable_executor_is_reported_as_unreachable() {
     let client = applying_client(closed_port());
     assert_eq!(
-        client.executed_block(B256::repeat_byte(1), FETCH_BUDGET),
+        client.executed_block(B256::repeat_byte(1), 1, FETCH_BUDGET),
         Err(ApplyFallback::Unreachable)
     );
 }
@@ -433,7 +433,7 @@ fn executor_keeps_only_its_most_recent_results() {
     let executed = ExecutedBlocks::default();
     let hash = |index: usize| B256::left_padding_from(&index.to_be_bytes());
     for index in 0..=ExecutedBlocks::CAPACITY {
-        executed.insert(hash(index), Bytes::from(index.to_be_bytes().to_vec()));
+        executed.insert(hash(index), index as u64, Bytes::from(index.to_be_bytes().to_vec()));
     }
     assert_eq!(executed.wait_for(hash(0), Duration::ZERO), None);
     for index in 1..=ExecutedBlocks::CAPACITY {
@@ -482,7 +482,7 @@ fn fetch_budget_bounds_a_result_that_arrives_in_slow_chunks() {
     let client = applying_client(trickling_executor());
 
     let started = Instant::now();
-    let result = client.executed_block(B256::repeat_byte(1), FETCH_BUDGET);
+    let result = client.executed_block(B256::repeat_byte(1), 1, FETCH_BUDGET);
     let elapsed = started.elapsed();
     assert_eq!(result, Err(ApplyFallback::Unavailable));
     assert!(elapsed < FETCH_BUDGET + DEADLINE_SLACK, "waited {elapsed:?}");
@@ -493,7 +493,7 @@ fn fetch_budget_is_shared_by_every_source() {
     let client = client_applying_from(trickling_executor(), trickling_executor());
 
     let started = Instant::now();
-    let result = client.executed_block(B256::repeat_byte(1), FETCH_BUDGET);
+    let result = client.executed_block(B256::repeat_byte(1), 1, FETCH_BUDGET);
     let elapsed = started.elapsed();
     assert_eq!(result, Err(ApplyFallback::Unavailable));
     assert!(elapsed < FETCH_BUDGET + DEADLINE_SLACK, "waited {elapsed:?}");
@@ -602,4 +602,52 @@ fn owner_building_its_history_answers_captured_hashes_as_not_available() {
         client.shard_hashes(NodeId(1), 5, block_hash(1, 5)).unwrap(),
         capture(5, contract).shard_hashes()
     );
+}
+
+/// The hash and encoded result the catch-up test's executors keep for block `number`.
+fn chain_block(number: u64) -> (B256, Bytes) {
+    (B256::left_padding_from(&number.to_be_bytes()), Bytes::from(number.to_be_bytes().to_vec()))
+}
+
+/// Node 1 serving the results of blocks `numbers` on `listener`.
+fn serve_chain(
+    listener: TcpListener,
+    numbers: std::ops::RangeInclusive<u64>,
+) -> (Arc<ExecutedBlocks>, OwnerServer) {
+    let (executed, server) = serve_results(listener);
+    for number in numbers {
+        let (hash, result) = chain_block(number);
+        executed.insert(hash, number, result);
+    }
+    (executed, server)
+}
+
+/// An apply node 200 blocks behind executors that keep 64 results each, as after a restart of
+/// every node, asks only once for a block they no longer keep, executes the older blocks without
+/// asking, and is served again once its blocks are within the executors' window (the lower of
+/// the two windows, since the lagging executor still has blocks the leading one dropped).
+#[test]
+fn apply_node_far_behind_catches_up_without_waiting() {
+    let leading = TcpListener::bind("127.0.0.1:0").unwrap();
+    let lagging = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = client_applying_from(leading.local_addr().unwrap(), lagging.local_addr().unwrap());
+    let (_leading, _leading_server) = serve_chain(leading, 1..=300);
+    let (_lagging, _lagging_server) = serve_chain(lagging, 1..=290);
+    let window_start = 290 - ExecutedBlocks::CAPACITY as u64 + 1;
+
+    let started = Instant::now();
+    let results: Vec<_> = (101..=300)
+        .map(|number| (number, client.executed_block(chain_block(number).0, number, FETCH_BUDGET)))
+        .collect();
+    let elapsed = started.elapsed();
+
+    assert!(elapsed < ExecutedBlocks::SERVE_WAIT, "fetching 200 blocks took {elapsed:?}");
+    for (number, result) in results {
+        let expected = match number {
+            101 => Err(ApplyFallback::Unavailable),
+            _ if number < window_start => Err(ApplyFallback::Behind),
+            _ => Ok(chain_block(number).1),
+        };
+        assert_eq!(result, expected, "block {number}");
+    }
 }

@@ -167,6 +167,9 @@ impl OwnerServer {
                         })
                         .ok_or(ReadError::NotAvailable)
                 }
+                Query::ExecutedBlockAt { hash, number } => executed
+                    .serve(hash, number, ExecutedBlocks::SERVE_WAIT)
+                    .map(Response::ExecutedBlock),
                 _ => match store.read(&request) {
                     Ok(response) => Ok(response),
                     Err(StoreError::Refused(refusal)) => Err(refusal),

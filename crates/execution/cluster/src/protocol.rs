@@ -18,8 +18,8 @@ pub struct SnapshotId {
 }
 
 /// A read of one sharded table as of a snapshot, or a request for a block's execution result
-/// ([`Query::ExecutedBlock`]) or an owner's servable range ([`Query::Status`]), which ignore the
-/// snapshot and the table.
+/// ([`Query::ExecutedBlock`], [`Query::ExecutedBlockAt`]) or an owner's servable range
+/// ([`Query::Status`]), which ignore the snapshot and the table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     /// The block the read is answered as of.
@@ -109,6 +109,15 @@ pub enum Query {
         /// `(hashed address, storage root)` of each split contract.
         storage_roots: Vec<(B256, B256)>,
     },
+    /// [`Self::ExecutedBlock`] of a block also identified by its number, which lets a node that
+    /// has already inserted a block at or above that number refuse at once with
+    /// [`ReadError::NotRetained`] instead of waiting for a block that cannot arrive.
+    ExecutedBlockAt {
+        /// Hash of the block.
+        hash: B256,
+        /// Number of the block.
+        number: u64,
+    },
 }
 
 /// Entries of the refused [`Query::SeekGe`]; kept for the encoding of [`Response`].
@@ -139,7 +148,8 @@ pub enum Response {
     Entries(ShardEntries),
     /// Answer to [`Query::SeekDupGe`].
     Duplicates(DuplicateValues),
-    /// Answer to [`Query::ExecutedBlock`]: the encoded execution result.
+    /// Answer to [`Query::ExecutedBlock`] and [`Query::ExecutedBlockAt`]: the encoded execution
+    /// result.
     ExecutedBlock(Bytes),
     /// Answer to [`Query::HasStorage`].
     HasStorage(bool),
@@ -184,6 +194,16 @@ pub enum ReadError {
     /// The node has no execution result, or no captured hashes, for the requested block.
     #[error("not available for this block")]
     NotAvailable,
+    /// Answer to [`Query::ExecutedBlockAt`]: the node has no execution result for the requested
+    /// block and will not get one, because it has already inserted a block at or above its
+    /// number.
+    #[error("execution result not retained, retained blocks {oldest}..={newest}")]
+    NotRetained {
+        /// Lowest block number whose result the node keeps.
+        oldest: u64,
+        /// Highest block number the node has inserted.
+        newest: u64,
+    },
 }
 
 impl ReadError {
@@ -194,7 +214,11 @@ impl ReadError {
             Self::SnapshotUnavailable { servable } => {
                 servable.is_none_or(|range| range.highest < number)
             }
-            Self::WrongFork | Self::NotOwner | Self::Unsupported | Self::NotAvailable => false,
+            Self::WrongFork
+            | Self::NotOwner
+            | Self::Unsupported
+            | Self::NotAvailable
+            | Self::NotRetained { .. } => false,
         }
     }
 }
@@ -267,6 +291,61 @@ mod tests {
         frame.extend_from_slice(&[0; 8]);
         let result: Result<Request, _> = Frame::read(&mut frame.as_slice());
         assert!(matches!(result, Err(FrameError::TooLarge(_))));
+    }
+
+    /// The variant index bincode writes first, after the frame's length prefix.
+    fn discriminant<T: Serialize>(message: &T) -> u8 {
+        let mut frame = Vec::new();
+        Frame::write(&mut frame, message).unwrap();
+        frame[4]
+    }
+
+    /// Nodes of one version decode each other's messages by variant position, so a merge that
+    /// reorders or inserts a variant must fail here rather than silently renumber the wire.
+    #[test]
+    fn variant_positions_on_the_wire_never_shift() {
+        let hash = B256::ZERO;
+        let queries = [
+            (Query::Get { key: Vec::new() }, 0),
+            (Query::SeekGe { key: Vec::new(), limit: 0 }, 1),
+            (Query::SeekDupGe { key: Vec::new(), subkey: Vec::new(), limit: 0 }, 2),
+            (Query::ExecutedBlock { hash }, 3),
+            (Query::AccountValue { address: hash }, 4),
+            (Query::StorageValue { address: hash, slot: hash }, 5),
+            (Query::HasStorage { address: hash }, 6),
+            (Query::Status, 7),
+            (Query::ShardHashes { number: 0, hash }, 8),
+            (Query::SplitShardHashes { number: 0, hash, storage_roots: Vec::new() }, 9),
+            (Query::ExecutedBlockAt { hash, number: 0 }, 10),
+        ];
+        let responses = [
+            (Response::Value(None), 0),
+            (Response::Entries(ShardEntries::default()), 1),
+            (Response::Duplicates(DuplicateValues::default()), 2),
+            (Response::ExecutedBlock(Bytes::new()), 3),
+            (Response::HasStorage(false), 4),
+            (Response::Status(None), 5),
+            (Response::ShardHashes(BlockShardHashes::default()), 6),
+            (Response::SplitShardHashes(Vec::new()), 7),
+        ];
+        let errors = [
+            (ReadError::SnapshotUnavailable { servable: None }, 0),
+            (ReadError::WrongFork, 1),
+            (ReadError::NotOwner, 2),
+            (ReadError::Unsupported, 3),
+            (ReadError::NotAvailable, 4),
+            (ReadError::NotRetained { oldest: 0, newest: 0 }, 5),
+        ];
+
+        for (query, position) in queries {
+            assert_eq!(discriminant(&query), position, "{query:?}");
+        }
+        for (response, position) in responses {
+            assert_eq!(discriminant(&response), position, "{response:?}");
+        }
+        for (error, position) in errors {
+            assert_eq!(discriminant(&error), position, "{error:?}");
+        }
     }
 
     #[test]

@@ -294,14 +294,17 @@ Keys and values travel as the encoded table bytes MDBX stores.
 | `ExecutedBlock { hash }` (see [Apply mode](#apply-mode)) | the block's encoded execution result |
 | `ShardHashes { number, hash }` (see [State-root check](#state-root-check)) | the block's captured subtree hashes |
 | `SplitShardHashes { number, hash, storage_roots }` | the block's held split-contract shards, recomputed |
+| `ExecutedBlockAt { hash, number }` (see [Apply mode](#apply-mode)) | the block's encoded execution result |
 
 Every request carries the snapshot `P` and a table (`HashedAccounts` or `HashedStorages` for the
-exact reads; ignored by `Status`, `ExecutedBlock` and the two hash requests). Errors:
-`SnapshotUnavailable` (with the range the owner can serve), `WrongFork`, `NotOwner`,
-`Unsupported`, and `NotAvailable` for `ExecutedBlock` and the hash requests. The new requests and responses are appended to the end of the enums, so the
-encoding of the older ones is unchanged; an owner refuses the older ordered and trie requests
-(`Get` of a table other than `Bytecodes`, `SeekGe`, `SeekDupGe`) with `Unsupported`, so a node of
-the previous version fails loudly. Mixed versions are not supported: upgrade every node together.
+exact reads; ignored by `Status`, `ExecutedBlock`, `ExecutedBlockAt` and the two hash requests).
+Errors: `SnapshotUnavailable` (with the range the owner can serve), `WrongFork`, `NotOwner`,
+`Unsupported`, `NotAvailable` for `ExecutedBlock`, `ExecutedBlockAt` and the hash requests, and
+`NotRetained` for `ExecutedBlockAt`. New requests, responses and errors are appended to the end
+of their enums, so the encoding of the older ones is unchanged (a unit test pins every variant's
+position); an owner refuses the older ordered and trie requests (`Get` of a table other than
+`Bytecodes`, `SeekGe`, `SeekDupGe`) with `Unsupported`, so a node of the previous version fails
+loudly. Mixed versions are not supported: upgrade every node together.
 
 - `HasStorage` of a split contract is `Unsupported`; a `StorageValue` of a split contract is
   served by the owners of the slot's range.
@@ -606,9 +609,16 @@ few or no shards.
   inserted blocks wait for it. A block inserted while 64 wait is not kept (apply nodes asking
   for it execute it) and is counted in `base_cluster_dropped_results`. A result that would not
   fit in a response frame (`Frame::MAX_LEN`) is not kept. The worker stops with the event stream.
-- Wire: `Get` gains a sibling query `ExecutedBlock { hash }` on the owner port (its snapshot and
-  table are ignored). The executor answers the encoded result, waiting up to 250 ms for a block
-  it has not inserted yet, or refuses with `NotAvailable`. Other requests keep their encoding.
+- Wire: `Get` gains sibling queries `ExecutedBlock { hash }` and, appended after it,
+  `ExecutedBlockAt { hash, number }` on the owner port (their snapshot and table are ignored);
+  apply nodes send `ExecutedBlockAt`. The executor answers the encoded result. For a block it
+  does not keep, it refuses at once with `NotRetained { oldest, newest }` (the lowest block number
+  it keeps and the highest it has inserted) when it has already inserted a block at or above the
+  requested number: that block was evicted, inserted before the executor started, dropped, or is
+  on another fork, and cannot arrive. Only for a block above everything it has inserted, the case
+  of a payload arriving at both nodes at the same time, it waits up to 250 ms (ending early if
+  such a block is inserted) and then refuses with `NotAvailable`. `ExecutedBlock` keeps its old
+  answer: wait up to 250 ms, then `NotAvailable`. Other requests keep their encoding.
 - Apply node, for each new payload: convert the payload and run the header, header-against-parent
   and pre-execution body checks, as execution does; ask the `apply_from` nodes in order before
   one deadline 400 ms from the first request; then check the result: it carries no execution
@@ -616,6 +626,11 @@ few or no shards.
   the post-execution checks execution runs: gas used, receipts root and logs bloom (reth's
   consensus), and Base's message-passer storage root and block-time checks against the result's
   hashed state.
+- Catching up: when every `apply_from` node answers `NotRetained` with its oldest kept block
+  above the requested one, the apply node is behind them all; it then executes every block below
+  the lowest of those oldest numbers without asking (`behind`) and asks again from there, so a
+  node that fell behind the executors' 64-block window catches up at execution speed instead of
+  paying a fetch per block.
 - Fetch deadline: the deadline bounds every connect, write and read of every node asked, each
   socket operation waiting only the time left, and an answer completed after it is a miss
   (`unavailable`). A pooled connection gets its usual timeouts back afterwards.
@@ -627,7 +642,7 @@ few or no shards.
   after the [pre-execution wait](#pre-execution-wait). Apply mode never changes what a node
   accepts. Blocks downloaded from the network (not new payloads) are always executed.
 - Counters: applied blocks, fallbacks by reason (`unavailable`, `unreachable`, `invalid`,
-  `ineligible`) and time spent fetching, in `ClusterNode::applied_blocks`, the metrics
+  `ineligible`, and `behind` for blocks executed without asking) and time spent fetching, in `ClusterNode::applied_blocks`, the metrics
   `base_cluster_applied_blocks` and `base_cluster_apply_fallbacks{reason}`, and a `cluster apply`
   log line every 10 seconds in which a block was applied or fell back.
 

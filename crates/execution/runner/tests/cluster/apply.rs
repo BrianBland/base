@@ -149,7 +149,7 @@ async fn apply_node_matches_the_executor(split: bool) -> Result<()> {
     applier.wait_persisted(BLOCKS).await?;
 
     assert_eq!(applier.cluster().applied_blocks().applied, BLOCKS);
-    assert_eq!(applier.cluster().applied_blocks().fallbacks, [0; 4]);
+    assert_eq!(applier.cluster().applied_blocks().fallbacks, [0; ApplyFallback::ALL.len()]);
     assert_eq!(executor.cluster().applied_blocks(), ApplyCounts::default());
     assert_eq!(applier.head().await?, executor.head().await?);
     assert_eq!(applier.head().await?.1, BLOCKS);
@@ -228,7 +228,7 @@ async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
     };
     receipt.inner.cumulative_gas_used += 1;
     let corrupt = ExecutedBlockResult::new(&parts.output, &parts.senders, &parts.trie).encode()?;
-    corrupt_results.insert(hash, corrupt);
+    corrupt_results.insert(hash, 1, corrupt);
     assert_eq!(applier.import(&envelope).await?, hash);
     assert_eq!(applier.cluster().applied_blocks().fallbacks(ApplyFallback::Invalid), 1);
 
@@ -243,7 +243,7 @@ async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
     let mut parts = ExecutedBlockResult::decode(&result)?.into_parts::<BaseReceipt>()?;
     parts.output.result.requests = Requests::new(vec![Bytes::from_static(&[0x01, 0xaa])]);
     let corrupt = ExecutedBlockResult::new(&parts.output, &parts.senders, &parts.trie).encode()?;
-    corrupt_results.insert(hash, corrupt);
+    corrupt_results.insert(hash, 2, corrupt);
     assert_eq!(applier.import(&envelope).await?, hash);
     assert_eq!(applier.cluster().applied_blocks().fallbacks(ApplyFallback::Invalid), 2);
 

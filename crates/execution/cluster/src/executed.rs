@@ -28,7 +28,7 @@ use revm::database::BundleState;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::Frame;
+use crate::{Frame, ReadError};
 
 /// What an apply node needs, besides the block it already has, to insert a block as executed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,11 +135,23 @@ pub struct ExecutedBlocks {
     inserted: Condvar,
 }
 
-/// The retained results, oldest first.
+/// The retained results, oldest first, and the highest block number ever inserted.
 #[derive(Debug, Default)]
 pub struct RecentResults {
     by_hash: HashMap<B256, Bytes>,
-    order: VecDeque<B256>,
+    order: VecDeque<(B256, u64)>,
+    newest: Option<u64>,
+}
+
+impl RecentResults {
+    /// The refusal for a missing block numbered `number` that will never be inserted, because a
+    /// block at or above its number already was: [`ReadError::NotRetained`]. `None` while no
+    /// block at or above `number` has been inserted, so the block may still arrive.
+    fn passed(&self, number: u64) -> Option<ReadError> {
+        let newest = self.newest.filter(|&newest| newest >= number)?;
+        let oldest = self.order.iter().map(|&(_, number)| number).min().unwrap_or(newest);
+        Some(ReadError::NotRetained { oldest, newest })
+    }
 }
 
 impl ExecutedBlocks {
@@ -155,19 +167,20 @@ impl ExecutedBlocks {
     /// [`Frame::MAX_LEN`] bytes, which adds a few bytes of framing to the result.
     pub const MAX_RESULT_LEN: usize = Frame::MAX_LEN - 64;
 
-    /// Keeps the encoded result of block `hash`, dropping the oldest beyond
+    /// Keeps the encoded result of block `hash`, numbered `number`, dropping the oldest beyond
     /// [`Self::CAPACITY`], and wakes requests waiting for it. Returns `false`, keeping nothing,
     /// when the result is longer than [`Self::MAX_RESULT_LEN`].
-    pub fn insert(&self, hash: B256, encoded: Bytes) -> bool {
+    pub fn insert(&self, hash: B256, number: u64, encoded: Bytes) -> bool {
         if encoded.len() > Self::MAX_RESULT_LEN {
             return false;
         }
         let mut results = self.results.lock();
         if results.by_hash.insert(hash, encoded).is_none() {
-            results.order.push_back(hash);
+            results.order.push_back((hash, number));
         }
+        results.newest = results.newest.max(Some(number));
         while results.order.len() > Self::CAPACITY {
-            if let Some(oldest) = results.order.pop_front() {
+            if let Some((oldest, _)) = results.order.pop_front() {
                 results.by_hash.remove(&oldest);
             }
         }
@@ -187,6 +200,29 @@ impl ExecutedBlocks {
             if self.inserted.wait_until(&mut results, deadline).timed_out() {
                 return results.by_hash.get(&hash).cloned();
             }
+        }
+    }
+
+    /// The encoded result of block `hash`, numbered `number`. Waits up to `wait` for it only
+    /// while no block numbered `number` or higher has been inserted: once one has, a missing
+    /// block was evicted, inserted before this node started, dropped, or is on another fork, and
+    /// the answer is [`ReadError::NotRetained`] at once. Otherwise a block still missing after
+    /// `wait` is [`ReadError::NotAvailable`].
+    pub fn serve(&self, hash: B256, number: u64, wait: Duration) -> Result<Bytes, ReadError> {
+        let deadline = Instant::now() + wait;
+        let mut results = self.results.lock();
+        let mut timed_out = false;
+        loop {
+            if let Some(result) = results.by_hash.get(&hash) {
+                return Ok(result.clone());
+            }
+            if let Some(refusal) = results.passed(number) {
+                return Err(refusal);
+            }
+            if timed_out {
+                return Err(ReadError::NotAvailable);
+            }
+            timed_out = self.inserted.wait_until(&mut results, deadline).timed_out();
         }
     }
 }
@@ -210,11 +246,11 @@ impl<T: Send + 'static> ResultCapture<T> {
     /// be evicted as soon as the newer ones are inserted.
     pub const QUEUE: usize = ExecutedBlocks::CAPACITY;
 
-    /// Starts the worker, which turns each captured block into its hash and encoded result with
-    /// `encode` (`None` keeps nothing) and inserts it into `store`.
+    /// Starts the worker, which turns each captured block into its hash, number and encoded
+    /// result with `encode` (`None` keeps nothing) and inserts it into `store`.
     pub fn spawn(
         store: Arc<ExecutedBlocks>,
-        mut encode: impl FnMut(T) -> Option<(B256, Bytes)> + Send + 'static,
+        mut encode: impl FnMut(T) -> Option<(B256, u64, Bytes)> + Send + 'static,
     ) -> io::Result<Self> {
         let (queue, captured) = mpsc::sync_channel(Self::QUEUE);
         let stopped = Arc::new(AtomicBool::new(false));
@@ -224,9 +260,9 @@ impl<T: Send + 'static> ResultCapture<T> {
                 if worker_stopped.load(Ordering::Relaxed) {
                     return;
                 }
-                let Some((hash, encoded)) = encode(block) else { continue };
+                let Some((hash, number, encoded)) = encode(block) else { continue };
                 let len = encoded.len();
-                if !store.insert(hash, encoded) {
+                if !store.insert(hash, number, encoded) {
                     warn!(block = %hash, len, "execution result too large to serve");
                 }
             }

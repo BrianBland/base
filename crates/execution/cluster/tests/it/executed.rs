@@ -2,7 +2,7 @@
 
 use std::{
     sync::{Arc, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use alloy_consensus::{Eip658Value, Receipt};
@@ -10,8 +10,8 @@ use alloy_eips::eip7685::Requests;
 use alloy_primitives::{Address, B256, Bytes, Log, U256, map::HashMap};
 use base_common_consensus::{BaseReceipt, DepositReceipt};
 use base_execution_cluster::{
-    ExecutedBlockParts, ExecutedBlockResult, ExecutedBlocks, Frame, ReadResult, Response,
-    ResultCapture, Shard,
+    ExecutedBlockParts, ExecutedBlockResult, ExecutedBlocks, Frame, ReadError, ReadResult,
+    Response, ResultCapture, Shard,
 };
 use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_trie_common::SortedTrieData;
@@ -120,7 +120,7 @@ fn capture_is_bounded_and_keeps_results_in_capture_order() {
             encoding_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         }
-        Some((block_hash(index), Bytes::from(index.to_be_bytes().to_vec())))
+        Some((block_hash(index), index as u64, Bytes::from(index.to_be_bytes().to_vec())))
     })
     .unwrap();
 
@@ -149,8 +149,81 @@ fn results_too_large_to_serve_are_not_kept() {
     let largest = Bytes::from(vec![0; ExecutedBlocks::MAX_RESULT_LEN]);
     let answer: ReadResult = Ok(Response::ExecutedBlock(largest.clone()));
     assert!(Frame::write(&mut std::io::sink(), &answer).is_ok());
-    assert!(store.insert(block_hash(1), largest));
+    assert!(store.insert(block_hash(1), 1, largest));
 
-    assert!(!store.insert(block_hash(2), Bytes::from(vec![0; ExecutedBlocks::MAX_RESULT_LEN + 1])));
+    let too_large = Bytes::from(vec![0; ExecutedBlocks::MAX_RESULT_LEN + 1]);
+    assert!(!store.insert(block_hash(2), 2, too_large));
     assert_eq!(store.wait_for(block_hash(2), Duration::ZERO), None);
+}
+
+/// The encoded result the tests keep for block `number`.
+fn numbered_result(number: u64) -> Bytes {
+    Bytes::from(number.to_be_bytes().to_vec())
+}
+
+/// A store that has inserted blocks `numbers`, each under `block_hash(number)`.
+fn store_of(numbers: std::ops::RangeInclusive<u64>) -> ExecutedBlocks {
+    let store = ExecutedBlocks::default();
+    for number in numbers {
+        assert!(store.insert(block_hash(number as usize), number, numbered_result(number)));
+    }
+    store
+}
+
+#[test]
+fn missing_block_at_or_below_the_newest_inserted_is_refused_without_waiting() {
+    let newest = 100;
+    let store = store_of(1..=newest);
+    let oldest = newest - ExecutedBlocks::CAPACITY as u64 + 1;
+    let not_retained = Err(ReadError::NotRetained { oldest, newest });
+
+    let started = Instant::now();
+    assert_eq!(store.serve(block_hash(1), 1, ExecutedBlocks::SERVE_WAIT), not_retained);
+    let other_fork = B256::repeat_byte(0xff);
+    assert_eq!(store.serve(other_fork, newest, ExecutedBlocks::SERVE_WAIT), not_retained);
+    assert!(started.elapsed() < ExecutedBlocks::SERVE_WAIT, "waited {:?}", started.elapsed());
+
+    let kept = store.serve(block_hash(oldest as usize), oldest, ExecutedBlocks::SERVE_WAIT);
+    assert_eq!(kept, Ok(numbered_result(oldest)));
+}
+
+#[test]
+fn missing_block_above_the_newest_inserted_is_waited_for() {
+    let store = Arc::new(store_of(1..=10));
+
+    let started = Instant::now();
+    assert_eq!(
+        store.serve(block_hash(11), 11, ExecutedBlocks::SERVE_WAIT),
+        Err(ReadError::NotAvailable)
+    );
+    assert!(started.elapsed() >= ExecutedBlocks::SERVE_WAIT, "answered before waiting");
+
+    let finish = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            store.insert(block_hash(11), 11, numbered_result(11));
+        })
+    };
+    assert_eq!(store.serve(block_hash(11), 11, Duration::from_secs(5)), Ok(numbered_result(11)));
+    finish.join().unwrap();
+}
+
+/// A wait for a block ends as soon as another block at its number is inserted: the awaited one is
+/// on a fork this node did not take.
+#[test]
+fn wait_ends_when_a_sibling_block_is_inserted() {
+    let store = Arc::new(store_of(1..=10));
+    let sibling = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            store.insert(B256::repeat_byte(0xee), 11, numbered_result(11));
+        })
+    };
+    let started = Instant::now();
+    let refusal = store.serve(block_hash(11), 11, Duration::from_secs(5));
+    assert_eq!(refusal, Err(ReadError::NotRetained { oldest: 1, newest: 11 }));
+    assert!(started.elapsed() < Duration::from_secs(5), "waited {:?}", started.elapsed());
+    sibling.join().unwrap();
 }

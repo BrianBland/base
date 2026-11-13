@@ -287,12 +287,16 @@ pub enum ApplyFallback {
     /// The payload could not be applied: it failed a pre-execution check, carries a block access
     /// list, or its parent's header or state is not available.
     Ineligible,
+    /// Not asked for: the block is older than every `apply_from` node's kept results, as their
+    /// answers for an earlier block showed, so this node is behind them and catches up by
+    /// executing.
+    Behind,
 }
 
 impl ApplyFallback {
     /// Every reason, in the order [`ApplyCounts::fallbacks`] counts them.
-    pub const ALL: [Self; 4] =
-        [Self::Unavailable, Self::Unreachable, Self::Invalid, Self::Ineligible];
+    pub const ALL: [Self; 5] =
+        [Self::Unavailable, Self::Unreachable, Self::Invalid, Self::Ineligible, Self::Behind];
 
     /// The reason's metric label.
     pub const fn label(self) -> &'static str {
@@ -301,6 +305,7 @@ impl ApplyFallback {
             Self::Unreachable => "unreachable",
             Self::Invalid => "invalid",
             Self::Ineligible => "ineligible",
+            Self::Behind => "behind",
         }
     }
 
@@ -315,7 +320,7 @@ pub struct ApplyCounts {
     /// Blocks inserted from a peer's result.
     pub applied: u64,
     /// Blocks executed instead, indexed like [`ApplyFallback::ALL`].
-    pub fallbacks: [u64; 4],
+    pub fallbacks: [u64; ApplyFallback::ALL.len()],
     /// Total time spent fetching results, whether or not one arrived.
     pub fetch_elapsed: Duration,
 }
@@ -348,10 +353,10 @@ impl ApplyCounts {
 #[derive(Debug)]
 pub struct ApplyStats {
     applied: AtomicU64,
-    fallbacks: [AtomicU64; 4],
+    fallbacks: [AtomicU64; ApplyFallback::ALL.len()],
     fetch_nanos: AtomicU64,
     applied_metric: Counter,
-    fallback_metrics: [Counter; 4],
+    fallback_metrics: [Counter; ApplyFallback::ALL.len()],
 }
 
 impl Default for ApplyStats {
@@ -419,6 +424,7 @@ impl ApplyStats {
                     unreachable = new.fallbacks(ApplyFallback::Unreachable),
                     invalid = new.fallbacks(ApplyFallback::Invalid),
                     ineligible = new.fallbacks(ApplyFallback::Ineligible),
+                    behind = new.fallbacks(ApplyFallback::Behind),
                     fetch_elapsed = ?new.fetch_elapsed,
                     "cluster apply"
                 );

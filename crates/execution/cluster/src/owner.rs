@@ -475,8 +475,8 @@ impl<DB: Database> OwnerStore<DB> {
     }
 
     /// Answers `request` as of its snapshot in fresh read transactions, and counts the answer.
-    /// Execution results are not state, so [`Query::ExecutedBlock`] is `Unsupported` here; the
-    /// owner server answers it.
+    /// Execution results are not state, so [`Query::ExecutedBlock`] and [`Query::ExecutedBlockAt`]
+    /// are `Unsupported` here; the owner server answers them.
     pub fn read(&self, request: &Request) -> Result<Response, StoreError> {
         let result = self.read_fresh(request);
         match &result {
@@ -521,7 +521,8 @@ impl<DB: Database> OwnerStore<DB> {
             | Query::SeekDupGe { .. }
             | Query::ExecutedBlock { .. }
             | Query::ShardHashes { .. }
-            | Query::SplitShardHashes { .. } => Err(ReadError::Unsupported.into()),
+            | Query::SplitShardHashes { .. }
+            | Query::ExecutedBlockAt { .. } => Err(ReadError::Unsupported.into()),
             Query::Status => Ok(Some(Response::Status(self.servable()))),
             Query::AccountValue { address } => {
                 Self::check_table(request, ShardedTable::HashedAccounts)?;

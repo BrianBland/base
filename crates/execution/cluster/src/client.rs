@@ -4,7 +4,10 @@ use std::{
     collections::HashMap,
     io::{self, Read, Write},
     net::TcpStream,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -99,6 +102,7 @@ pub struct ClusterClient {
     options: ClientOptions,
     pools: HashMap<NodeId, Mutex<Vec<TcpStream>>>,
     remote_reads: Arc<RemoteReadStats>,
+    execute_below: AtomicU64,
 }
 
 impl ClusterClient {
@@ -109,7 +113,13 @@ impl ClusterClient {
     pub fn new(cluster: Arc<Cluster>, options: ClientOptions) -> Self {
         let pools =
             cluster.config().nodes.iter().map(|node| (node.id, Mutex::new(Vec::new()))).collect();
-        Self { cluster, options, pools, remote_reads: Arc::default() }
+        Self {
+            cluster,
+            options,
+            pools,
+            remote_reads: Arc::default(),
+            execute_below: AtomicU64::new(0),
+        }
     }
 
     /// The options this client was created with.
@@ -235,19 +245,34 @@ impl ClusterClient {
         }
     }
 
-    /// The encoded execution result of block `hash` from the first of the cluster's `apply_from`
-    /// nodes that has it, asking them in order. One deadline, `budget` from now, bounds every
-    /// connect, write and read across all of them, and an answer completed after it is a miss.
-    /// Fails with [`ApplyFallback::Unavailable`] when a node was reached but none answered with
-    /// the result in time, and [`ApplyFallback::Unreachable`] when no node was reached.
-    pub fn executed_block(&self, hash: B256, budget: Duration) -> Result<Bytes, ApplyFallback> {
+    /// The encoded execution result of block `hash`, numbered `number`, from the first of the
+    /// cluster's `apply_from` nodes that has it, asking them in order. One deadline, `budget`
+    /// from now, bounds every connect, write and read across all of them, and an answer completed
+    /// after it is a miss. Fails with [`ApplyFallback::Unavailable`] when a node was reached but
+    /// none answered with the result in time, and [`ApplyFallback::Unreachable`] when no node was
+    /// reached.
+    ///
+    /// When every node answers that it keeps no block that old ([`ReadError::NotRetained`] with
+    /// its oldest kept block above `number`), this node is behind them all: later blocks below
+    /// the lowest of those oldest numbers fail with [`ApplyFallback::Behind`] without asking, so
+    /// catching up costs no fetch time until the blocks are back within the nodes' window.
+    pub fn executed_block(
+        &self,
+        hash: B256,
+        number: u64,
+        budget: Duration,
+    ) -> Result<Bytes, ApplyFallback> {
+        if number < self.execute_below.load(Ordering::Relaxed) {
+            return Err(ApplyFallback::Behind);
+        }
         let deadline = Instant::now() + budget;
         let request = Request {
             snapshot: SnapshotId { number: 0, hash: None },
             table: ShardedTable::HashedAccounts,
-            query: Query::ExecutedBlock { hash },
+            query: Query::ExecutedBlockAt { hash, number },
         };
         let mut failure = ApplyFallback::Unreachable;
+        let mut retained_from = Some(u64::MAX);
         for &node in self.cluster.apply_from() {
             if Instant::now() >= deadline {
                 return Err(ApplyFallback::Unavailable);
@@ -255,19 +280,30 @@ impl ClusterClient {
             match self.ask_before(node, &request, deadline) {
                 Ok(Ok(Response::ExecutedBlock(result))) => return Ok(result),
                 Ok(Ok(_)) => {
-                    debug!(node = node.0, "unexpected answer to an execution result request")
+                    debug!(node = node.0, "unexpected answer to an execution result request");
+                    retained_from = None;
                 }
                 Ok(Err(refusal)) => {
                     debug!(node = node.0, refusal = %refusal, "execution result refused");
                     failure = ApplyFallback::Unavailable;
+                    retained_from = match refusal {
+                        ReadError::NotRetained { oldest, .. } => {
+                            retained_from.map(|lowest| lowest.min(oldest))
+                        }
+                        _ => None,
+                    };
                 }
                 Err(error) => {
                     debug!(node = node.0, error = %error, "execution result request failed");
                     if Self::timed_out(&error) {
                         failure = ApplyFallback::Unavailable;
                     }
+                    retained_from = None;
                 }
             }
+        }
+        if let Some(oldest) = retained_from.filter(|&oldest| oldest > number) {
+            self.execute_below.fetch_max(oldest, Ordering::Relaxed);
         }
         Err(failure)
     }
@@ -408,7 +444,10 @@ impl ClusterClient {
                 Response::Value(_)
             ) | (Query::HasStorage { .. }, Response::HasStorage(_))
                 | (Query::Status, Response::Status(_))
-                | (Query::ExecutedBlock { .. }, Response::ExecutedBlock(_))
+                | (
+                    Query::ExecutedBlock { .. } | Query::ExecutedBlockAt { .. },
+                    Response::ExecutedBlock(_)
+                )
                 | (Query::ShardHashes { .. }, Response::ShardHashes(_))
                 | (Query::SplitShardHashes { .. }, Response::SplitShardHashes(_))
         );
