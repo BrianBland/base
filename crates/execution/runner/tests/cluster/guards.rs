@@ -13,18 +13,22 @@ use reth_tasks::Runtime;
 
 use crate::{Datadir, TestNode, chain_spec_with, cluster_config, free_address};
 
-fn one_node() -> Result<ClusterConfig> {
-    let node = NodeConfig { id: NodeId(1), address: free_address()?, storage: true };
-    Ok(ClusterConfig { replication: 1, ..cluster_config(1, &[node]) })
+/// Node 1 of two storing nodes with one copy per shard: it holds about half of the shards.
+fn half_of_two() -> Result<ClusterConfig> {
+    let node = |id| -> Result<_> {
+        Ok(NodeConfig { id: NodeId(id), address: free_address()?, storage: true })
+    };
+    Ok(ClusterConfig { replication: 1, ..cluster_config(1, &[node(1)?, node(2)?]) })
 }
 
-/// Payload attributes sent to a clustered node are refused, since the block's state root would
-/// be computed over rows it does not hold; the forkchoice state is still applied.
+/// Payload attributes sent to a clustered node that does not hold every shard are refused, since
+/// the block's state root would be computed over rows it does not hold; the forkchoice state is
+/// still applied. (A node holding every shard builds, see `in_memory_engine.rs`.)
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clustered_node_refuses_to_build_blocks() -> Result<()> {
     base_node_runner::test_utils::init_silenced_tracing();
     let chain_spec = chain_spec_with(16, 0, [])?;
-    let node = TestNode::launch(&chain_spec, Some(one_node()?)).await?;
+    let node = TestNode::launch(&chain_spec, Some(half_of_two()?)).await?;
     let (state, attributes) = node.next_block(vec![L1_BLOCK_INFO_DEPOSIT_TX]).await?;
     let refused = node.engine.fork_choice_updated_v3(state, Some(attributes)).await;
     let message = format!("{refused:?}");
@@ -41,7 +45,7 @@ async fn a_clustered_node_refuses_the_proofs_history_extension() -> Result<()> {
     let chain_spec = chain_spec_with(16, 0, [])?;
     let datadir = Datadir::fresh(&chain_spec);
     let env = datadir.open().await?;
-    let cluster = Arc::new(Cluster::new(one_node()?)?);
+    let cluster = Arc::new(Cluster::new(half_of_two()?)?);
     let address = cluster.address(cluster.node_id()).expect("listed");
     let db = ClusteredDatabase::clustered(
         env,

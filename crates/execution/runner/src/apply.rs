@@ -11,7 +11,7 @@ use std::{
 use alloy_primitives::{B256, keccak256};
 use base_common_consensus::{BasePrimitives, Predeploys};
 use base_common_rpc_types_engine::ExecutionData;
-use base_execution_cluster::{ApplyFallback, ClusterNode, ExecutedBlockResult};
+use base_execution_cluster::{ApplyFallback, ClusterNode, ExecutedBlockResult, Shard};
 use base_node_core::{
     BaseEngineTypes, BaseNodeTypes, BasePayloadValidatorBuilder, MessagePasserRootCheck,
 };
@@ -132,15 +132,23 @@ where
             }),
             _ => None,
         };
-        Ok(ApplyEngineValidator { inner, cluster: cluster.cloned(), applier })
+        let refuses_payload_building =
+            cluster.is_some_and(|node| !Shard::all().all(|shard| node.cluster().owns(shard)));
+        Ok(ApplyEngineValidator {
+            inner,
+            cluster: cluster.cloned(),
+            refuses_payload_building,
+            applier,
+        })
     }
 }
 
 /// An engine-tree validator that, with an applier, inserts new payloads from peers' execution
 /// results and executes through `inner` whenever applying fails; without one it is `inner`.
 ///
-/// On a clustered node it also refuses payload attributes, since building a block needs the
-/// full state root ([`PayloadBuildingUnsupported`]), and before executing any block it waits
+/// On a clustered node that does not hold every shard it also refuses payload attributes, since
+/// building a block needs the full state root ([`PayloadBuildingUnsupported`]); and on every
+/// clustered node, before executing any block, it waits
 /// for owners able to serve its persisted block ([`ClusterNode::wait_for_owners`]); when they
 /// do not become ready in time, validation fails with a processing error, which reth does not
 /// record as an invalid block, so the same block can be delivered again.
@@ -148,14 +156,17 @@ where
 pub struct ApplyEngineValidator<V, P, PV> {
     inner: V,
     cluster: Option<Arc<ClusterNode>>,
+    refuses_payload_building: bool,
     applier: Option<BlockApplier<P, PV>>,
 }
 
-/// Payload attributes sent to a clustered node: it cannot build blocks.
+/// Payload attributes sent to a clustered node that does not hold every shard: it cannot build
+/// blocks.
 #[derive(Debug, Clone, Copy, Error)]
 #[error(
-    "payload building is not supported on a clustered node: it keeps only its trie slice and \
-     cannot compute a block's state root; build blocks on an unclustered node"
+    "payload building is not supported on a clustered node that does not hold every shard: it \
+     keeps only its trie slice and cannot compute a block's state root; build blocks on an \
+     unclustered node"
 )]
 pub struct PayloadBuildingUnsupported;
 
@@ -204,7 +215,7 @@ where
         attr: &PayloadAttributes,
         header: &BaseHeader,
     ) -> Result<(), InvalidPayloadAttributesError> {
-        if self.cluster.is_some() {
+        if self.refuses_payload_building {
             error!(error = %PayloadBuildingUnsupported, "refusing payload attributes");
             return Err(InvalidPayloadAttributesError::InvalidParams(Box::new(
                 PayloadBuildingUnsupported,

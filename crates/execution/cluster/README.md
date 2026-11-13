@@ -243,11 +243,12 @@ What a clustered node does with blocks:
   peers' results) and maintains its [trie slice](#trie-maintenance). It never computes a full
   state root, so the header's state root is not verified when a block is inserted.
 - Before it executes a block it waits for owners (see [Pre-execution wait](#pre-execution-wait)).
-- It does not build blocks: payload attributes in a forkchoice update are refused (the
-  forkchoice state itself is applied) with `payload building is not supported on a clustered
-  node: it keeps only its trie slice and cannot compute a block's state root; build blocks on an
-  unclustered node`, logged as `refusing payload attributes`. Blocks must be built by an
-  unclustered node; clustered nodes follow it.
+- Unless it holds every shard, it does not build blocks: payload attributes in a forkchoice
+  update are refused (the forkchoice state itself is applied) with `payload building is not
+  supported on a clustered node that does not hold every shard: it keeps only its trie slice and
+  cannot compute a block's state root; build blocks on an unclustered node`, logged as `refusing
+  payload attributes`. reth answers the forkchoice update with its invalid-payload-attributes
+  error. Blocks must be built by an unclustered node; clustered nodes follow it.
 - Proof RPCs (`eth_getProof`, witnesses) are not supported (see
   [Unsupported on clustered nodes](#unsupported-on-clustered-nodes)).
 
@@ -655,8 +656,9 @@ start-up whether it checks this root.
   refuses them; their answers are wrong.
 - The proofs-history extension: refused at launch (see
   [Operating requirements](#operating-requirements)).
-- Building payloads: the payload builder computes a full state root over don't-care rows, so
-  payload attributes are refused (see [Operating requirements](#operating-requirements)).
+- Building payloads on a node that does not hold every shard: the payload builder computes a
+  full state root over don't-care rows, so payload attributes are refused (see
+  [Operating requirements](#operating-requirements)).
 - `--debug.skip-state-root` is refused: the node already uses its own state-root strategy.
 
 ## Design record
