@@ -39,8 +39,15 @@ pub use bootstrap::{
     TableCopy,
 };
 
+mod partition;
+pub use partition::{
+    ClaimedPartition, OrderedPartitions, PartitionClaims, PartitionConsumer, PartitionRows,
+    PendingWork, RawRow, ReadParallelism, TablePartitions, TablePosition, TableRange, WorkItem,
+    WorkQueue,
+};
+
 mod storage_report;
-pub use storage_report::{ContractRows, StorageCounter, StorageReport};
+pub use storage_report::{ContractRows, CountRange, StorageCounter, StorageReport, StorageScan};
 
 mod protocol;
 pub use protocol::{

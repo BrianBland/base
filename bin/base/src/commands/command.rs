@@ -178,6 +178,52 @@ mod tests {
         assert_eq!(bootstrap.from, PathBuf::from("/full"));
         assert_eq!(bootstrap.cluster_config, [PathBuf::from("/c1.toml"), "/c2.toml".into()]);
         assert_eq!(bootstrap.to, [PathBuf::from("/d1"), "/d2".into()]);
+        assert_eq!(bootstrap.read_threads.get(), 16);
+    }
+
+    #[test]
+    fn parses_cluster_read_threads_and_rejects_zero() {
+        let bootstrap = |threads: &str| {
+            BaseCli::try_parse_from([
+                "base",
+                "cluster",
+                "bootstrap",
+                "--from",
+                "/full",
+                "--cluster.config",
+                "/c1.toml",
+                "--to",
+                "/d1",
+                "--read-threads",
+                threads,
+            ])
+        };
+        let BaseCommand::Cluster(cluster) = bootstrap("4").unwrap().command else {
+            panic!("not a cluster command")
+        };
+        let ClusterSubcommand::Bootstrap(args) = cluster.command else { panic!("not a bootstrap") };
+        assert_eq!(args.read_threads.get(), 4);
+        assert!(bootstrap("0").is_err(), "zero reader threads are refused");
+
+        let report = |threads: &str| {
+            BaseCli::try_parse_from([
+                "base",
+                "cluster",
+                "storage-report",
+                "--from",
+                "/full",
+                "--read-threads",
+                threads,
+            ])
+        };
+        let BaseCommand::Cluster(cluster) = report("1").unwrap().command else {
+            panic!("not a cluster command")
+        };
+        let ClusterSubcommand::StorageReport(args) = cluster.command else {
+            panic!("not a storage report")
+        };
+        assert_eq!(args.read_threads.get(), 1);
+        assert!(report("0").is_err(), "zero reader threads are refused");
     }
 
     #[test]
@@ -209,6 +255,7 @@ mod tests {
             panic!("not a storage report")
         };
         assert_eq!(report.top, 20);
+        assert_eq!(report.read_threads.get(), 16);
     }
 
     #[test]

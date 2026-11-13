@@ -1,8 +1,8 @@
 //! `base cluster` subcommand group: Clustered Base maintenance.
 
-use std::path::PathBuf;
+use std::{num::NonZeroUsize, path::PathBuf};
 
-use base_execution_cluster::{Bootstrap, BootstrapTarget, Cluster, StorageReport};
+use base_execution_cluster::{Bootstrap, BootstrapTarget, Cluster, ReadParallelism, StorageReport};
 use clap::{Args, Parser, Subcommand};
 use eyre::{WrapErr, ensure};
 
@@ -41,6 +41,10 @@ pub(crate) struct BootstrapArgs {
     /// written.
     #[arg(long, value_name = "DATADIR", required = true)]
     pub(crate) to: Vec<PathBuf>,
+    /// Threads reading the source, each with its own read transaction; 1 reads it with one
+    /// thread.
+    #[arg(long, default_value_t = ReadParallelism::DEFAULT_THREADS)]
+    pub(crate) read_threads: NonZeroUsize,
 }
 
 /// Arguments of `base cluster storage-report`.
@@ -52,6 +56,9 @@ pub(crate) struct StorageReportArgs {
     /// Number of contracts to list.
     #[arg(long, default_value_t = StorageReport::DEFAULT_TOP)]
     pub(crate) top: usize,
+    /// Threads reading the database, each with its own read transaction.
+    #[arg(long, default_value_t = ReadParallelism::DEFAULT_THREADS)]
+    pub(crate) read_threads: NonZeroUsize,
 }
 
 impl ClusterSubcommand {
@@ -77,12 +84,20 @@ impl ClusterSubcommand {
                         Ok(BootstrapTarget { cluster, destination: to.join(Self::DB_DIR) })
                     })
                     .collect::<eyre::Result<Vec<_>>>()?;
-                let report = Bootstrap::new(targets)?.run(&args.from.join(Self::DB_DIR))?;
+                let report = Bootstrap::new(targets)?
+                    .with_read_parallelism(ReadParallelism::with_threads(args.read_threads))
+                    .run(&args.from.join(Self::DB_DIR))?;
                 println!("{report}");
                 Ok(())
             }
             Self::StorageReport(args) => {
-                println!("{}", StorageReport::scan(&args.from.join(Self::DB_DIR), args.top)?);
+                let report = StorageReport::scan_with(
+                    &args.from.join(Self::DB_DIR),
+                    args.top,
+                    ReadParallelism::with_threads(args.read_threads),
+                    StorageReport::HAND_OFF_ROWS,
+                )?;
+                println!("{report}");
                 Ok(())
             }
         }

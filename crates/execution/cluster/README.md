@@ -381,17 +381,35 @@ exactly as one started on a full copy.
   retention, split contracts), since the nodes would not agree on placement.
 - A row of a sharded table that cannot be placed (a key or split-contract subkey of the wrong
   encoding) stops the copy with an error; nothing is dropped silently.
-- Rows move as raw bytes in source order, in MDBX append mode, from one read transaction of the
-  source (long-read safety disabled; the source is stopped). One thread reads and places each
-  row once and hands the rows, in shared batches of up to 16 384 rows or 1 mebibyte, to one
-  writer thread per destination, which appends those its node holds; so a run uses one thread
-  per destination plus the reader. Each writer's queue holds at most 8 batches, so about 10
-  mebibytes of rows are in flight whatever the number of destinations; the slowest destination
-  sets the pace. Each destination commits once the rows or bytes written to it since its last commit
-  reach 100 000 rows or 256 mebibytes, with MDBX's `SafeNoSync` sync mode, and all are synced
-  to disk once at the end. The first error of any writer, else of the reader, stops the run. An
-  interrupted run leaves partial databases: delete every `<to>/db` and run again; there is no
-  resume.
+- Rows move as raw bytes in source order, in MDBX append mode. The source is read in parallel,
+  because a cold read is bound by the disk's random-read latency: one cursor walk faults in one
+  page at a time, while many concurrent walks keep the disk busy. Each table is split into
+  partitions of consecutive rows, about 4 mebibytes of the table's pages each (from MDBX's page
+  counts). Partition boundaries are 4-byte key prefixes spaced evenly over the key space.
+  Each `split_storage` contract in a duplicate-key sharded table gets as many partitions again,
+  at subkey prefixes; its first partition starts at the contract's first row, so rows that sort
+  before the first prefix (short storage-trie paths) are kept. `--read-threads` reader threads
+  (default 16; 1 reads with a single thread) each hold their own read transaction and cursor on
+  the source (long-read safety disabled; the source is stopped). They claim partitions in order,
+  at most `--read-threads` at once counted from the one being written, and place each row once.
+  One thread takes the partitions strictly in order and hands their rows, in shared batches of
+  up to 16 384 rows or 1 mebibyte, to one writer thread per destination, which appends those its
+  node holds. So every destination receives the rows in exactly source order, and a run uses
+  the readers, that thread, and one thread per destination.
+- Memory is bounded: each partition being read queues at most 8 batches, so at most
+  `read threads x 9` batches are read ahead (about 200 mebibytes at 16 threads, since a
+  batch is at most about 1.4 mebibytes with its row index), plus 8 batches queued per writer.
+  The slowest destination sets the pace.
+- Parallelism needs keys spread over the key space. A table keyed by a big-endian block number
+  is one partition and is read by one thread. A giant contract that is not in `split_storage`
+  lies in one partition: one thread walks it, and while it is being written the other readers
+  can read at most the window ahead and then wait. Use the storage report (below) to find such
+  contracts and list them before bootstrapping.
+- Each destination commits once the rows or bytes written to it since its last commit reach
+  100 000 rows or 256 mebibytes, with MDBX's `SafeNoSync` sync mode, and all are synced to disk
+  once at the end. The first error of any writer, else of a reader, stops every thread of the
+  run, and a panicking thread's panic is propagated. An interrupted run leaves partial
+  databases: delete every `<to>/db` and run again; there is no resume.
 - It logs each table at start and finish (rows read, and rows written per destination) and every
   10 million rows of a large table, and prints a summary per destination: rows and bytes of each
   sharded table kept against the source and of the unsharded tables together; then the elapsed
@@ -405,12 +423,16 @@ exactly as one started on a full copy.
 
 ### Choosing split contracts
 
-`base cluster storage-report --from <datadir> [--top N]` walks `HashedStorages` of `<datadir>/db`
-once, read-only, and prints the `N` (default 20) hashed addresses with the most rows, each with
-its row count and share of the table, then the table's total, and last a ready
-`split_storage = [...]` line listing the hashed addresses that hold at least 1% of the rows. It
-takes no lock; on a running node its long read transaction keeps MDBX from reusing pages until
-it finishes, so prefer a stopped node.
+`base cluster storage-report --from <datadir> [--top N] [--read-threads T]` walks
+`HashedStorages` of `<datadir>/db` once, read-only, and prints the `N` (default 20) hashed
+addresses with the most rows, each with its row count and share of the table, then the table's
+total, and last a ready `split_storage = [...]` line listing the hashed addresses that hold at
+least 1% of the rows. `T` threads (default 16) count the table's partitions (as in the
+bootstrap) in any order. A thread that sees one contract reach 1 000 000 rows hands the
+contract's values with a greater first byte to the other threads, one range per byte, and the
+pieces are summed, so no single thread walks a giant contract. The counts are the same as a
+single walk's. It takes no lock; on a running node its long read transactions keep MDBX from
+reusing pages until it finishes, so prefer a stopped node.
 
 ## Limits
 

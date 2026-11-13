@@ -2,9 +2,9 @@
 //! for each node only the rows it holds, in one pass over the source.
 
 use std::{
-    borrow::Cow,
     collections::HashSet,
     fmt,
+    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -26,7 +26,10 @@ use reth_stages_types::StageId;
 use thiserror::Error;
 use tracing::info;
 
-use crate::{Cluster, KeyPlacement, NodeId, Shard, ShardedTable, StorageCounter, StorageReport};
+use crate::{
+    Cluster, KeyPlacement, NodeId, OrderedPartitions, PartitionConsumer, PartitionRows,
+    ReadParallelism, Shard, ShardedTable, StorageCounter, StorageReport, TablePartitions,
+};
 
 /// Why a bootstrap or a storage report failed or was refused.
 #[derive(Debug, Error)]
@@ -257,13 +260,14 @@ pub struct Bootstrap {
     targets: Vec<BootstrapTarget>,
     batch: BatchLimit,
     arguments: DatabaseArguments,
+    read: ReadParallelism,
 }
 
 impl Bootstrap {
     /// Rows of one table between progress logs.
     pub const PROGRESS_ROWS: u64 = 10_000_000;
     /// Row batches queued for each destination's writer: with [`RowBatch::MAX_BYTES`], bounds the
-    /// rows in flight between the reader and the writers.
+    /// rows in flight between the dispatching thread and the writers.
     pub const QUEUED_BATCHES: usize = 8;
 
     /// A bootstrap of `targets`, refused when there are none, when two share a destination or a
@@ -288,6 +292,7 @@ impl Bootstrap {
             targets,
             batch: BatchLimit::DEFAULT,
             arguments: DatabaseArguments::new(Default::default()),
+            read: ReadParallelism::DEFAULT,
         })
     }
 
@@ -302,6 +307,12 @@ impl Bootstrap {
     /// Commits each destination at `batch` instead of [`BatchLimit::DEFAULT`].
     pub const fn with_batch_limit(mut self, batch: BatchLimit) -> Self {
         self.batch = batch;
+        self
+    }
+
+    /// Reads the source with `read` instead of [`ReadParallelism::DEFAULT`].
+    pub const fn with_read_parallelism(mut self, read: ReadParallelism) -> Self {
+        self.read = read;
         self
     }
 
@@ -361,7 +372,7 @@ impl Bootstrap {
         let mut storage = StorageCounter::new(StorageReport::DEFAULT_TOP);
         let tables = Tables::ALL
             .iter()
-            .map(|table| self.copy_table(&txn, &destinations, *table, &mut storage))
+            .map(|table| self.copy_table(&source_env, &txn, &destinations, *table, &mut storage))
             .collect::<Result<Vec<_>, _>>()?;
         for env in &destinations {
             env.sync(true)?;
@@ -377,21 +388,39 @@ impl Bootstrap {
         Ok(report)
     }
 
-    /// Copies `table` from the source transaction to every destination, in source order: this
-    /// thread reads and places each row once, and one writer thread per destination appends the
-    /// rows its node holds. The first error of a writer, else of the reader, is returned; a
-    /// failed writer stops the reader, and the reader stopping stops the writers.
+    /// Copies `table` from the source to every destination, in source order: a pool of reader
+    /// threads reads and places the table's partitions, this thread hands their rows on in
+    /// partition order, and one writer thread per destination appends the rows its node holds.
+    /// The first error of a writer, else of a reader, else of this thread is returned; any
+    /// failure or panic stops every thread of the table, and a panic is resumed here.
     fn copy_table(
         &self,
-        source: &Transaction<RO>,
+        source: &DatabaseEnv,
+        txn: &Transaction<RO>,
         destinations: &[DatabaseEnv],
         table: Tables,
         storage: &mut StorageCounter,
     ) -> Result<TableCopy, BootstrapError> {
         let name = table.name();
         let sharded = ShardedTable::from_table_name(name);
-        info!(table = name, "copying table");
-        let (read, written) = thread::scope(|scope| {
+        let split_keys: Vec<_> = match sharded {
+            Some(sharded) if sharded.is_duplicate() => {
+                let mut keys: Vec<_> =
+                    self.targets[0].cluster.split_storage().iter().copied().collect();
+                keys.sort_unstable();
+                keys
+            }
+            _ => Vec::new(),
+        };
+        let dbi = txn.open_db(Some(name))?.dbi();
+        let partitions = OrderedPartitions::new(
+            TablePartitions::plan(txn, dbi, &split_keys, self.read.partition_bytes)?,
+            self.read.window,
+            self.read.queued_batches,
+        );
+        let readers = self.read.threads.get().min(partitions.len());
+        info!(table = name, partitions = partitions.len(), readers, "copying table");
+        let (read, readers, written) = thread::scope(|scope| {
             let (senders, writers): (Vec<_>, Vec<_>) = destinations
                 .iter()
                 .zip(&self.targets)
@@ -402,18 +431,29 @@ impl Bootstrap {
                     (sender, writer)
                 })
                 .unzip();
-            let read = self.read_table(source, name, sharded, storage, &senders);
-            drop(senders);
-            let written = writers
-                .into_iter()
-                .map(|writer| {
-                    writer.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            let readers: Vec<_> = (0..readers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let read = panic::catch_unwind(AssertUnwindSafe(|| {
+                            self.read_partitions(source, name, sharded, &partitions)
+                        }));
+                        if !matches!(read, Ok(Ok(()))) {
+                            partitions.stop();
+                        }
+                        read.unwrap_or_else(|panic| panic::resume_unwind(panic))
+                    })
                 })
-                .collect::<Result<Vec<_>, _>>();
-            (read, written)
+                .collect();
+            let counted = (sharded == Some(ShardedTable::HashedStorages)).then_some(storage);
+            let read = self.dispatch(partitions.consumer(), name, counted, &senders);
+            drop(senders);
+            let readers = Self::join_all(readers);
+            let written = Self::join_all(writers);
+            (read, readers, written)
         });
-        let copy =
-            TableCopy { table: name, sharded: sharded.is_some(), written: written?, read: read? };
+        let written = written?;
+        readers?;
+        let copy = TableCopy { table: name, sharded: sharded.is_some(), written, read: read? };
         info!(
             table = name,
             rows_read = copy.read.rows,
@@ -423,55 +463,107 @@ impl Bootstrap {
         Ok(copy)
     }
 
-    /// Reads table `name` from the source in order, places each row of a sharded table, and
-    /// sends the rows in batches to every writer. Stops early, without error, when a writer has
-    /// stopped: that writer's outcome is the copy's.
-    fn read_table(
+    /// Joins `threads`, resuming the first panic, and returns their outcomes in order or the
+    /// first error.
+    fn join_all<T>(
+        threads: Vec<thread::ScopedJoinHandle<'_, Result<T, BootstrapError>>>,
+    ) -> Result<Vec<T>, BootstrapError> {
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap_or_else(|panic| panic::resume_unwind(panic)))
+            .collect()
+    }
+
+    /// Claims partitions of table `name` until none is left, and reads each from its own read
+    /// transaction of the source: places each row of a sharded table and sends the rows in
+    /// batches to the partition's queue, then its end. Returns early, without error, when the
+    /// reading stops or the consumer closes a queue.
+    fn read_partitions(
         &self,
-        source: &Transaction<RO>,
+        source: &DatabaseEnv,
         name: &'static str,
         sharded: Option<ShardedTable>,
-        storage: &mut StorageCounter,
+        partitions: &OrderedPartitions,
+    ) -> Result<(), BootstrapError> {
+        let placement = &self.targets[0].cluster;
+        let txn = source.begin_ro_txn()?;
+        let mut cursor = txn.cursor(txn.open_db(Some(name))?.dbi())?;
+        while let Some(partition) = partitions.claim() {
+            let mut batch = RowBatch::default();
+            let mut row = partition.range.start.seek(&mut cursor)?;
+            while let Some((key, value)) = row {
+                if partition.range.is_passed_by(&key, &value) {
+                    break;
+                }
+                let placed = match sharded {
+                    None => KeyPlacement::Replicated,
+                    Some(sharded) => {
+                        let subkey = sharded.subkey_of(&value).unwrap_or_default();
+                        placement.placement(sharded, &key, subkey).ok_or_else(|| {
+                            BootstrapError::InvalidRow {
+                                table: name,
+                                key: Bytes::copy_from_slice(&key),
+                            }
+                        })?
+                    }
+                };
+                batch.push(&key, &value, placed);
+                if batch.is_full() {
+                    let full = std::mem::replace(&mut batch, RowBatch::new());
+                    if partitions.is_stopped()
+                        || partition.rows.send(PartitionRows::Batch(full)).is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                row = cursor.next()?;
+            }
+            let last = (!batch.is_empty()).then_some(PartitionRows::Batch(batch));
+            for message in last.into_iter().chain([PartitionRows::End]) {
+                if partition.rows.send(message).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes the partitions of table `name` from `partitions` in order and sends each batch of
+    /// rows to every writer, counting the rows read and, when `storage` is given, each
+    /// `HashedStorages` row by contract. Stops early, without error, when a writer has stopped
+    /// (that writer's outcome is the copy's) or a partition ends before its end is sent (a
+    /// reader stopped, and its outcome is the copy's).
+    fn dispatch(
+        &self,
+        mut partitions: PartitionConsumer<'_>,
+        name: &'static str,
+        mut storage: Option<&mut StorageCounter>,
         writers: &[SyncSender<Arc<RowBatch>>],
     ) -> Result<RowCount, BootstrapError> {
-        let counts_storage = sharded == Some(ShardedTable::HashedStorages);
-        let placement = &self.targets[0].cluster;
-        let send = |batch: RowBatch| {
-            let batch = Arc::new(batch);
-            writers.iter().all(|writer| writer.send(Arc::clone(&batch)).is_ok())
-        };
         let mut read = RowCount::default();
-        let mut batch = RowBatch::new();
-        let mut reader = source.cursor(source.open_db(Some(name))?.dbi())?;
-        let mut row = reader.first::<Cow<'_, [u8]>, Cow<'_, [u8]>>()?;
-        while let Some((key, value)) = row {
-            read.add(&key, &value);
-            let placed = match sharded {
-                None => KeyPlacement::Replicated,
-                Some(sharded) => {
-                    let subkey = sharded.subkey_of(&value).unwrap_or_default();
-                    placement.placement(sharded, &key, subkey).ok_or_else(|| {
-                        BootstrapError::InvalidRow {
-                            table: name,
-                            key: Bytes::copy_from_slice(&key),
-                        }
-                    })?
+        while let Some(partition) = partitions.next_partition() {
+            loop {
+                let batch = match partition.recv() {
+                    Ok(PartitionRows::Batch(batch)) => batch,
+                    Ok(PartitionRows::End) => break,
+                    Err(_) => return Ok(read),
+                };
+                if let Some(storage) = storage.as_deref_mut() {
+                    for (key, _, _) in batch.rows() {
+                        storage.count(StorageCounter::address(key)?);
+                    }
                 }
-            };
-            if counts_storage {
-                storage.count(StorageCounter::address(&key)?);
+                let before = read.rows;
+                read.rows += batch.rows.len() as u64;
+                read.bytes += batch.bytes.len() as u64;
+                if before / Self::PROGRESS_ROWS != read.rows / Self::PROGRESS_ROWS {
+                    info!(table = name, rows_read = read.rows, "copying table");
+                }
+                let batch = Arc::new(batch);
+                if !writers.iter().all(|writer| writer.send(Arc::clone(&batch)).is_ok()) {
+                    return Ok(read);
+                }
             }
-            batch.push(&key, &value, placed);
-            if batch.is_full() && !send(std::mem::replace(&mut batch, RowBatch::new())) {
-                return Ok(read);
-            }
-            if read.rows.is_multiple_of(Self::PROGRESS_ROWS) {
-                info!(table = name, rows_read = read.rows, "copying table");
-            }
-            row = reader.next()?;
-        }
-        if !batch.is_empty() {
-            send(batch);
         }
         Ok(read)
     }

@@ -4,6 +4,7 @@
 use std::{
     collections::BTreeMap,
     net::TcpListener,
+    num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,7 +12,7 @@ use std::{
 use alloy_primitives::{B256, Bytes, U256, keccak256};
 use base_execution_cluster::{
     BatchLimit, Bootstrap, BootstrapError, BootstrapTarget, ClientOptions, Cluster, ClusterConfig,
-    ClusteredDatabase, NodeConfig, NodeId, Shard, StorageReport,
+    ClusteredDatabase, NodeConfig, NodeId, ReadParallelism, RowBatch, Shard, StorageReport,
 };
 use rand::{Rng, rngs::StdRng};
 use reth_chainspec::MAINNET;
@@ -48,6 +49,21 @@ const DB_MAX_SIZE: usize = 1 << 30;
 /// Slots and storage-trie paths of the large contract, spread over every range.
 const LARGE_SLOTS: usize = 400;
 const LARGE_PATHS: usize = 120;
+
+/// One reader thread, as a single walk of the source.
+const ONE_READER: ReadParallelism = ReadParallelism::with_threads(NonZeroUsize::MIN);
+
+/// Several reader threads, a window smaller than the threads, queues of two batches, and
+/// partitions of a fraction of a page, so that readers block and partitions interleave.
+const READERS: ReadParallelism = ReadParallelism {
+    threads: NonZeroUsize::new(4).unwrap(),
+    window: NonZeroUsize::new(3).unwrap(),
+    queued_batches: 2,
+    partition_bytes: NonZeroU64::new(256).unwrap(),
+};
+
+/// Every reading of the source the equivalence tests run.
+const READINGS: [ReadParallelism; 2] = [ONE_READER, READERS];
 
 fn arguments() -> DatabaseArguments {
     DatabaseArguments::new(ClientVersion::default()).with_geometry_max_size(Some(DB_MAX_SIZE))
@@ -234,10 +250,22 @@ fn copied_and_shed(source: &Path, node_id: u64, split: &[B256]) -> FullDump {
 
 /// Bootstraps `nodes` from `source` in one pass and dumps each node's database, in node order.
 fn bootstrapped(source: &Path, nodes: &[u64], split: &[B256], batch: BatchLimit) -> Vec<FullDump> {
+    bootstrapped_with(source, nodes, split, batch, ReadParallelism::DEFAULT)
+}
+
+/// [`bootstrapped`], reading the source with `read`.
+fn bootstrapped_with(
+    source: &Path,
+    nodes: &[u64],
+    split: &[B256],
+    batch: BatchLimit,
+    read: ReadParallelism,
+) -> Vec<FullDump> {
     let dir = TempDir::new().unwrap();
     let targets = targets(dir.path(), nodes, split);
     let destinations: Vec<_> = targets.iter().map(|target| target.destination.clone()).collect();
-    let report = bootstrap(targets).with_batch_limit(batch).run(source).unwrap();
+    let report =
+        bootstrap(targets).with_batch_limit(batch).with_read_parallelism(read).run(source).unwrap();
     assert_eq!(report.destinations, destinations);
     destinations.iter().map(|destination| dump_path(destination)).collect()
 }
@@ -256,20 +284,35 @@ fn contract_rows(dump: &FullDump, contract: B256) -> usize {
 
 const ALL_NODES: [u64; NODES as usize] = [1, 2, 3, 4, 5];
 
-/// Every node of the cluster, bootstrapped in one pass, equals a full copy shed by that node.
+/// Every node of the cluster, bootstrapped in one pass with one reader or several, equals a full
+/// copy shed by that node.
 fn assert_equivalent(split: bool) {
     let source = Source::new(1, true);
     let split = if split { vec![source.large_contract] } else { Vec::new() };
     let full = dump_path(&source.db());
-    let copies = bootstrapped(&source.db(), &ALL_NODES, &split, BatchLimit::DEFAULT);
-    for (node_id, copy) in ALL_NODES.into_iter().zip(&copies) {
-        let context = format!("node {node_id}, split {}", !split.is_empty());
-        let reference = copied_and_shed(&source.db(), node_id, &split);
+    let references: Vec<_> =
+        ALL_NODES.iter().map(|node_id| copied_and_shed(&source.db(), *node_id, &split)).collect();
+    for read in READINGS {
+        let copies = bootstrapped_with(&source.db(), &ALL_NODES, &split, BatchLimit::DEFAULT, read);
+        assert_copies(&source, &split, &full, &references, &copies, read);
+    }
+}
+
+fn assert_copies(
+    source: &Source,
+    split: &[B256],
+    full: &FullDump,
+    references: &[FullDump],
+    copies: &[FullDump],
+    read: ReadParallelism,
+) {
+    for ((node_id, copy), reference) in ALL_NODES.into_iter().zip(copies).zip(references) {
+        let context = format!("node {node_id}, split {}, {read:?}", !split.is_empty());
         for table in Tables::ALL {
             assert_eq!(copy[table.name()], reference[table.name()], "{context}: {}", table.name());
         }
         assert!(
-            rows(copy, tables::HashedStorages::NAME) < rows(&full, tables::HashedStorages::NAME),
+            rows(copy, tables::HashedStorages::NAME) < rows(full, tables::HashedStorages::NAME),
             "{context}: a node holds part of the storage"
         );
         assert_eq!(copy[tables::PlainStorageState::NAME], full[tables::PlainStorageState::NAME]);
@@ -302,15 +345,18 @@ fn small_batches_and_single_destinations_give_the_same_databases() {
     let source = Source::new(2, true);
     let split = [source.large_contract];
     let whole = bootstrapped(&source.db(), &ALL_NODES, &split, BatchLimit::DEFAULT);
-    let by_rows =
-        bootstrapped(&source.db(), &ALL_NODES, &split, BatchLimit { rows: 7, bytes: u64::MAX });
-    let by_bytes =
-        bootstrapped(&source.db(), &ALL_NODES, &split, BatchLimit { rows: u64::MAX, bytes: 1 });
-    assert_eq!(by_rows, whole, "7-row batches");
-    assert_eq!(by_bytes, whole, "one-row batches by size");
-    for (node_id, copy) in ALL_NODES.into_iter().zip(&whole) {
-        let alone = bootstrapped(&source.db(), &[node_id], &split, BatchLimit::DEFAULT);
-        assert_eq!(&alone[0], copy, "node {node_id} bootstrapped alone");
+    for read in READINGS {
+        let by_rows = BatchLimit { rows: 7, bytes: u64::MAX };
+        let by_rows = bootstrapped_with(&source.db(), &ALL_NODES, &split, by_rows, read);
+        let by_bytes = BatchLimit { rows: u64::MAX, bytes: 1 };
+        let by_bytes = bootstrapped_with(&source.db(), &ALL_NODES, &split, by_bytes, read);
+        assert_eq!(by_rows, whole, "7-row batches, {read:?}");
+        assert_eq!(by_bytes, whole, "one-row batches by size, {read:?}");
+        for (node_id, copy) in ALL_NODES.into_iter().zip(&whole) {
+            let alone =
+                bootstrapped_with(&source.db(), &[node_id], &split, BatchLimit::DEFAULT, read);
+            assert_eq!(&alone[0], copy, "node {node_id} bootstrapped alone, {read:?}");
+        }
     }
 }
 
@@ -319,9 +365,13 @@ fn a_contract_whose_duplicates_span_batches_is_copied_whole() {
     let source = Source::new(3, true);
     let shard = Shard(source.large_contract[0]);
     let owner = cluster(NODES, &[]).owners(shard)[0].0;
-    let copy = bootstrapped(&source.db(), &[owner], &[], BatchLimit { rows: 7, bytes: u64::MAX });
-    assert_eq!(contract_rows(&copy[0], source.large_contract), LARGE_SLOTS);
-    assert_eq!(copy[0], copied_and_shed(&source.db(), owner, &[]));
+    let reference = copied_and_shed(&source.db(), owner, &[]);
+    for read in READINGS {
+        let batch = BatchLimit { rows: 7, bytes: u64::MAX };
+        let copy = bootstrapped_with(&source.db(), &[owner], &[], batch, read);
+        assert_eq!(contract_rows(&copy[0], source.large_contract), LARGE_SLOTS, "{read:?}");
+        assert_eq!(copy[0], reference, "{read:?}");
+    }
 }
 
 #[test]
@@ -329,7 +379,9 @@ fn the_source_is_not_modified() {
     let source = Source::new(4, true);
     let before = dump_path(&source.db());
     let batch = BatchLimit { rows: 7, bytes: u64::MAX };
-    bootstrapped(&source.db(), &ALL_NODES, &[source.large_contract], batch);
+    for read in READINGS {
+        bootstrapped_with(&source.db(), &ALL_NODES, &[source.large_contract], batch, read);
+    }
     assert_eq!(dump_path(&source.db()), before);
 }
 
@@ -409,9 +461,12 @@ fn a_sharded_row_that_cannot_be_placed_is_an_error() {
         .unwrap();
         tx.commit().unwrap();
     }
-    let dir = TempDir::new().unwrap();
-    let result = bootstrap(targets(dir.path(), &[1], &[])).run(&source.db());
-    assert!(matches!(result, Err(BootstrapError::InvalidRow { .. })), "{result:?}");
+    for read in READINGS {
+        let dir = TempDir::new().unwrap();
+        let bootstrap = bootstrap(targets(dir.path(), &[1, 2, 3], &[])).with_read_parallelism(read);
+        let result = bootstrap.run(&source.db());
+        assert!(matches!(result, Err(BootstrapError::InvalidRow { .. })), "{read:?}: {result:?}");
+    }
 }
 
 #[test]
@@ -444,6 +499,83 @@ fn storage_report_lists_the_contracts_with_the_most_rows() {
     assert_eq!(summary.storage.top[..3], report.top[..]);
     let storage = summary.storage.to_string();
     assert!(summary.to_string().ends_with(&storage), "the summary ends with the storage report");
+}
+
+/// Rows of the unlisted contract of [`parallel_source`]: more than its partition's queue holds,
+/// so its reader blocks until the partition's turn comes.
+const UNLISTED_ROWS: usize = 3 * RowBatch::MAX_ROWS + 5;
+
+/// [`Source::new`] plus an unlisted contract of [`UNLISTED_ROWS`] storage rows; returns it too.
+fn parallel_source(seed: u64) -> (Source, B256) {
+    let source = Source::new(seed, true);
+    let mut rng = rng(seed);
+    let unlisted = B256::from(rng.random::<[u8; 32]>());
+    let env = DatabaseEnv::open(&source.db(), DatabaseEnvKind::RW, arguments()).unwrap();
+    let tx = env.tx_mut().unwrap();
+    for _ in 0..UNLISTED_ROWS {
+        let entry = StorageEntry {
+            key: B256::from(rng.random::<[u8; 32]>()),
+            value: U256::from(rng.random_range(1..u64::MAX)),
+        };
+        tx.put::<tables::HashedStorages>(unlisted, entry).unwrap();
+    }
+    tx.commit().unwrap();
+    (source, unlisted)
+}
+
+#[test]
+fn several_readers_write_the_same_databases_as_one() {
+    let (source, unlisted) = parallel_source(9);
+    let split = [source.large_contract];
+    let full = dump_path(&source.db());
+    assert_eq!(contract_rows(&full, unlisted), UNLISTED_ROWS);
+    let one = bootstrapped_with(&source.db(), &ALL_NODES, &split, BatchLimit::DEFAULT, ONE_READER);
+    let rendezvous = ReadParallelism {
+        threads: NonZeroUsize::new(8).unwrap(),
+        window: NonZeroUsize::new(8).unwrap(),
+        queued_batches: 0,
+        partition_bytes: NonZeroU64::new(64).unwrap(),
+    };
+    let one_window = ReadParallelism { window: NonZeroUsize::MIN, ..READERS };
+    for read in [READERS, rendezvous, one_window] {
+        let several =
+            bootstrapped_with(&source.db(), &ALL_NODES, &split, BatchLimit::DEFAULT, read);
+        assert_eq!(several, one, "{read:?}");
+    }
+    let view = cluster(NODES, &split);
+    let owners = view.owners(Shard(unlisted[0]));
+    for (node_id, copy) in ALL_NODES.into_iter().zip(&one) {
+        let held = if owners.contains(&NodeId(node_id)) { UNLISTED_ROWS } else { 0 };
+        assert_eq!(contract_rows(copy, unlisted), held, "node {node_id}");
+    }
+}
+
+#[test]
+fn storage_report_counts_the_same_with_any_readers_and_hand_off() {
+    let (source, unlisted) = parallel_source(10);
+    let full = dump_path(&source.db());
+    let mut counts: BTreeMap<&[u8], u64> = BTreeMap::new();
+    for (key, _) in &full[tables::HashedStorages::NAME] {
+        *counts.entry(key.as_slice()).or_default() += 1;
+    }
+    let mut want: Vec<_> =
+        counts.iter().map(|(key, rows)| (*rows, B256::from_slice(key))).collect();
+    want.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+    let top = counts.len() + 1;
+    let one = StorageReport::scan_with(&source.db(), top, ONE_READER, u64::MAX).unwrap();
+    let listed: Vec<_> = one.top.iter().map(|entry| (entry.rows, entry.hashed_address)).collect();
+    assert_eq!(listed, want);
+    assert_eq!(one.total_rows, full[tables::HashedStorages::NAME].len() as u64);
+    assert_eq!(one.top[0].hashed_address, unlisted);
+    for (read, hand_off_rows) in
+        [(READERS, 50), (READERS, 1), (ONE_READER, 50), (READERS, u64::MAX)]
+    {
+        let report = StorageReport::scan_with(&source.db(), top, read, hand_off_rows).unwrap();
+        assert_eq!(report, one, "{read:?}, hand-off at {hand_off_rows} rows");
+        let short = StorageReport::scan_with(&source.db(), 3, read, hand_off_rows).unwrap();
+        assert_eq!(short.top, one.top[..3], "{read:?}, hand-off at {hand_off_rows} rows");
+    }
 }
 
 /// Rows of the throughput benchmark's unsharded table, written to every destination, at scale 1.
@@ -483,12 +615,31 @@ fn bench_source(table: &str, rows: impl Iterator<Item = (Vec<u8>, Vec<u8>)>) -> 
     dir
 }
 
-/// Bootstraps all five nodes from `source` and prints the source rows per second of `table`.
+/// Reader thread counts the benchmark runs, comma separated; 1 and 16 when unset.
+const BENCH_THREADS_VAR: &str = "BOOTSTRAP_BENCH_THREADS";
+
+fn bench_threads() -> Vec<NonZeroUsize> {
+    std::env::var(BENCH_THREADS_VAR)
+        .unwrap_or_else(|_| "1,16".to_owned())
+        .split(',')
+        .map(|threads| threads.trim().parse().unwrap())
+        .collect()
+}
+
+/// Bootstraps all five nodes from `source` with each of [`bench_threads`] reader threads and
+/// prints the source rows per second of `table`.
 fn bench_run(source: &TempDir, table: &str, split: &[B256]) {
+    for threads in bench_threads() {
+        bench_run_with(source, table, split, threads);
+    }
+}
+
+fn bench_run_with(source: &TempDir, table: &str, split: &[B256], threads: NonZeroUsize) {
     let dir = TempDir::new().unwrap();
     let started = std::time::Instant::now();
     let report = Bootstrap::new(targets(dir.path(), &ALL_NODES, split))
         .unwrap()
+        .with_read_parallelism(ReadParallelism::with_threads(threads))
         .run(&source.path().join("db"))
         .unwrap();
     let elapsed = started.elapsed();
@@ -496,7 +647,7 @@ fn bench_run(source: &TempDir, table: &str, split: &[B256]) {
     let appends: u64 = copy.written.iter().map(|written| written.rows).sum();
     let busiest = copy.written.iter().map(|written| written.rows).max().unwrap();
     println!(
-        "{table}: {} source rows, {appends} appends (at most {busiest} to one destination) in \
+        "{table}, {threads} reader threads: {} source rows, {appends} appends (at most {busiest} to one destination) in \
          {elapsed:.2?}: {:.0} source rows/s, {:.0} appends/s",
         copy.read.rows,
         copy.read.rows as f64 / elapsed.as_secs_f64(),
@@ -506,7 +657,8 @@ fn bench_run(source: &TempDir, table: &str, split: &[B256]) {
 
 /// Throughput of a bootstrap of five nodes from a source shaped like a real one: an unsharded
 /// table written to every destination, and `HashedStorages` with one split contract holding
-/// 99.7% of its rows. Run in release mode with
+/// 99.7% of its rows; each with the reader thread counts of `BOOTSTRAP_BENCH_THREADS` (default
+/// `1,16`). Run in release mode with
 /// `cargo test --release -p base-execution-cluster bootstrap_throughput -- --ignored --nocapture`.
 #[test]
 #[ignore = "benchmark: run in release mode with --ignored --nocapture"]
