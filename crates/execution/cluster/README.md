@@ -101,7 +101,7 @@ Consequences:
 - Results are never cached beyond one cursor position.
 - The owner refuses when it cannot reproduce `P` (it is behind, `P` is below its history, or it
   is on a different fork). The asker then tries the next owner, and retries for a bounded time
-  when every owner is merely behind.
+  while every owner is behind or unreachable.
 - An owner behind `P` is normal while the cluster follows the chain: the node reading may have
   persisted a block or two before the owner received it. The asker waits for it, retrying every
   20 ms for up to `read_retry_secs` (cluster config, default 60 seconds, 0 is rejected). An owner
@@ -211,6 +211,9 @@ A clustered node refuses to start unless:
 - `--engine.num-state-masking-blocks` is 0 (Base's default). With masking, the state tables lag
   the `Finish` checkpoint and `P` no longer identifies their contents.
 - `--debug.skip-state-root` is not set.
+- The proofs-history extension (`--proofs-history`) is not enabled: it reads trie rows outside
+  the node's slice. The launch fails with `the proofs-history extension reads trie rows a
+  clustered node does not hold; remove --proofs-history or the cluster config`.
 - The datadir is initialised: genesis is written (a `Finish` checkpoint exists).
 - reth's account and storage changesets are kept for at least `W` blocks (Base's full node
   default keeps them); an owner can serve history only as far back as they reach.
@@ -233,6 +236,44 @@ The block-hash lookup and the changeset reader hold the provider only weakly; th
 it strongly. The provider owns the clustered database, which owns the node, so a strong
 reference would keep the node and its owner listener alive forever. Once the feed task stops (at
 shutdown) the lookup knows no block and the reader reads nothing.
+
+What a clustered node does with blocks:
+
+- It executes new payloads and downloaded blocks (or, in [apply mode](#apply-mode), applies
+  peers' results) and maintains its [trie slice](#trie-maintenance). It never computes a full
+  state root, so the header's state root is not verified when a block is inserted.
+- Before it executes a block it waits for owners (see [Pre-execution wait](#pre-execution-wait)).
+- It does not build blocks: payload attributes in a forkchoice update are refused (the
+  forkchoice state itself is applied) with `payload building is not supported on a clustered
+  node: it keeps only its trie slice and cannot compute a block's state root; build blocks on an
+  unclustered node`, logged as `refusing payload attributes`. Blocks must be built by an
+  unclustered node; clustered nodes follow it.
+- Proof RPCs (`eth_getProof`, witnesses) are not supported (see
+  [Unsupported on clustered nodes](#unsupported-on-clustered-nodes)).
+
+### Pre-execution wait
+
+Before a clustered node executes a block (a new payload, including an apply node's fallback, or a
+downloaded block), it reads its persisted block `P` and asks every peer that owns a shard it does
+not hold for its servable range (`Status`). It proceeds once every such shard has an owner whose
+range contains `P`. Owners unreachable, still building their history index, or behind `P` are
+waited for, polling every 20 ms for up to `read_retry_secs`; after 1 second it logs one warning,
+`cluster node waiting for owners to reach its persisted block before executing`, with `block`,
+the number of waiting `shards` and each owner's state. A node holding every shard does not wait.
+
+When the wait runs out, or at once when every owner of some shard keeps history only above `P`,
+validation fails with a processing error, logged as `not executing a block until cluster owners
+can serve this node's persisted block` and returned to the consensus client as an internal error
+of `engine_newPayload`. reth does not record the block as invalid, so the consensus client can
+deliver it again. The messages are:
+
+- `no owner of N shards this node does not hold could serve its persisted block P within T
+  (owners: node 2: L..=H, node 3: unreachable); retry once they catch up`;
+- `persisted block P is below the history every owner of shard S keeps (owners: node 2: L..=H,
+  ...); this node is more than retention_blocks behind them and must be re-cloned`.
+
+The wait narrows but does not close the window in which a read inside execution can still run
+out of time (an owner can fall behind or go down after the check); see [Limits](#limits).
 
 ## Owner side
 
@@ -271,9 +312,9 @@ Refusals:
 - `P` below `L`: `SnapshotUnavailable` with the servable range, whose lowest block is above `P`.
   The asker does not wait for it.
 - A gap in the chain (a missed notification), a block without hashed state, an index that has
-  not reached `T` (the changesets of a committed block could not be read yet), or no index yet:
-  `SnapshotUnavailable` whose highest block is below `P` (or with no range): the owner is behind
-  and the asker retries.
+  not reached `T` (the changesets of a committed block could not be read yet), or no index yet
+  (it is being built at startup): `SnapshotUnavailable` whose highest block is below `P` (or
+  with no range): the owner is behind and the asker retries. `Status` answers no range then.
 - A hash for `P` that differs from the owner's: `WrongFork`.
 - A row the owner does not hold: `NotOwner`.
 
@@ -291,6 +332,10 @@ the new `T` also sees the index extended to it. A read whose transaction predate
 answers `P <= T` from the index as above and, for `P > T`, opens a fresh transaction, because
 the chain no longer holds the blocks it would need. Every read opens its own short read
 transaction; the owner holds no long-lived one.
+
+The startup build reads `W` blocks of changesets without holding the owner's lock, so the owner
+answers every request at once while it builds (as behind, above). It then publishes the index
+under the lock and extends it over the blocks persisted meanwhile.
 
 At startup the owner logs one line, `cluster owner history built`, with the shards it owns, the
 index's lowest and highest block and its entry count. Every 10 seconds it logs `cluster owner`
@@ -329,8 +374,9 @@ the previous version fails loudly. Mixed versions are not supported: upgrade eve
   encoding of the request, or of the response-or-error. An owner that fails internally (a
   database error) closes the connection, and the asker treats it like an unreachable owner.
 - The asker tries the owners in rendezvous order, skipping itself. It retries the round, for a
-  bounded time, only when every owner was unreachable or behind (`SnapshotUnavailable` with no
-  range or a range below `P`) and at least one was behind. Any other refusal is returned.
+  bounded time, only when every owner was unreachable (including a socket timeout) or behind
+  (`SnapshotUnavailable` with no range or a range below `P`). Any other refusal (`P` below an
+  owner's range, `WrongFork`, `NotOwner`, `Unsupported`) is returned at once.
 
 Transport is blocking sockets with a small connection pool, because reads happen inside
 synchronous cursor calls on engine and trie worker threads. Owners serve from their own threads.
@@ -390,9 +436,9 @@ few or no shards.
   the bundle state, and the senders (signatures are not recovered).
 - Fallback: when no result arrives in time, a peer is unreachable, the result does not decode or
   fails a check, the payload carries a block access list, or the parent's header or state is not
-  available (a parent off the canonical chain), the node logs a warning and executes the block
-  exactly as today. Apply mode never stalls a node and never changes what it accepts. Blocks
-  downloaded from the network (not new payloads) are always executed.
+  available (a parent off the canonical chain), the node logs a warning and executes the block,
+  after the [pre-execution wait](#pre-execution-wait). Apply mode never changes what a node
+  accepts. Blocks downloaded from the network (not new payloads) are always executed.
 - Counters: applied blocks, fallbacks by reason (`unavailable`, `unreachable`, `invalid`,
   `ineligible`) and time spent fetching, in `ClusterNode::applied_blocks`, the metrics
   `base_cluster_applied_blocks` and `base_cluster_apply_fallbacks{reason}`, and a `cluster apply`
@@ -508,10 +554,25 @@ reusing pages until it finishes, so prefer a stopped node.
 - An owner answers a bytecode only once it has persisted it, so reading code from a block this
   node persisted before every owner of the code's shard did waits for an owner to persist it,
   and fails if none does within the client's retry budget (`read_retry_secs`, 60 s by default).
-- A read that runs out of `read_retry_secs` while owners stay behind fails. Inside transaction
-  execution reth retries the block, but when the failure lands in the pre-execution system calls
-  (the block-hash contract call, for example) or the post-execution checks, reth records the
-  block as invalid, rejects every descendant, and the node needs a restart.
+- A read that runs out of `read_retry_secs` while owners stay behind or unreachable fails. The
+  [pre-execution wait](#pre-execution-wait) makes this rare, but an owner that falls behind or
+  goes down after the wait can still cause it. Inside transaction execution reth retries the
+  block, but when the failure lands in the pre-execution system calls (the block-hash contract
+  call, for example) or the post-execution checks, reth records the block as invalid, rejects
+  every descendant, and the node needs a restart.
+- `retention_blocks` is what an existing config says: a config with `retention_blocks = 160`
+  keeps 160 blocks of history (the 30,000 default applies only when the key is absent). A node
+  whose persisted block is below every owner's range for some shard does not execute: each new
+  payload fails with the `below the history` error above, naming the owners' ranges, until it is
+  re-cloned. An owner refusing such a read answers `SnapshotUnavailable` with its range, counted
+  as `refused` in its `cluster owner` log line.
+- The history index holds one entry per held row changed in the window: about 150-250 bytes
+  each. At about 40 changed rows per block (Base Sepolia) and half of them held, the default
+  30,000 blocks is about 150 megabytes per owner; a network with thousands of changed rows per
+  block needs a smaller `W` or a lot of memory, and the startup build reads `W` blocks of
+  changesets.
+- No state-root integrity check runs yet: a wrong state transition that does not change
+  receipts, gas or logs is not detected.
 - An owner checks a block hash with the node's provider on each read below its persisted tip.
 - `entries` (table statistics) of a sharded table counts local rows only.
 - Shedding frees pages inside MDBX but does not shrink the file without a compacting copy.
@@ -590,9 +651,12 @@ start-up whether it checks this root.
 
 ### Unsupported on clustered nodes
 
-- Proofs (`eth_getProof`, witnesses) and the proofs-history extension: they read trie rows
-  outside the held slice. Nothing refuses them yet; their answers are wrong.
-- Building payloads: the payload builder computes a full state root over don't-care rows.
+- Proofs (`eth_getProof`, witnesses): they read trie rows outside the held slice. Nothing
+  refuses them; their answers are wrong.
+- The proofs-history extension: refused at launch (see
+  [Operating requirements](#operating-requirements)).
+- Building payloads: the payload builder computes a full state root over don't-care rows, so
+  payload attributes are refused (see [Operating requirements](#operating-requirements)).
 - `--debug.skip-state-root` is refused: the node already uses its own state-root strategy.
 
 ## Design record
@@ -621,3 +685,12 @@ Decided after a two-seat, two-pass design review on 2026-11-12.
   one).
 - The message-passer skip counter is handed to Base's engine validator as a callback, so
   `base-node-core` does not depend on this crate.
+- Decided on 2026-11-13 (integration of the values-only design): the pre-execution wait runs in
+  the engine validator wrapper before execution and fails with a processing error, which reth
+  answers as an internal error without recording the block as invalid; a downloaded block that
+  fails the same way is logged and dropped by reth. Payload attributes are refused in that
+  wrapper rather than by replacing the payload builder, so a clustered node keeps its usual
+  components. A destroyed contract with storage can only be one created in the same transaction
+  (Cancun); such a contract, and one created again at the same address later, are covered by the
+  end-to-end test against a full node. A wipe of a contract with persisted storage would arrive
+  without a wipe flag on a full node at this reth revision too.
