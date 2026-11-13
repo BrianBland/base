@@ -3,6 +3,7 @@
 
 mod apply;
 mod e2e;
+mod guards;
 mod slices;
 
 use std::{
@@ -330,9 +331,12 @@ impl TestNode {
         self.cluster.as_ref().expect("a clustered node")
     }
 
-    /// Builds the next block with `transactions` after the L1 info deposit on this node's head,
-    /// inserts it and makes it the head, and returns its payload.
-    async fn produce(&self, transactions: Vec<Bytes>) -> Result<BaseExecutionPayloadEnvelopeV4> {
+    /// The forkchoice state of this node's head and the attributes of a block on it carrying
+    /// `transactions`.
+    async fn next_block(
+        &self,
+        transactions: Vec<Bytes>,
+    ) -> Result<(ForkchoiceState, BasePayloadAttributes)> {
         let parent = self
             .engine
             .l2_block_by_label(BlockNumberOrTag::Latest)
@@ -344,8 +348,6 @@ impl TestNode {
             .node
             .chain_spec()
             .base_fee_params_at_timestamp(parent.header.timestamp);
-        let transactions: Vec<_> =
-            std::iter::once(L1_BLOCK_INFO_DEPOSIT_TX).chain(transactions).collect();
         let attributes = BasePayloadAttributes {
             payload_attributes: PayloadAttributes {
                 timestamp: parent.header.timestamp + BLOCK_TIME_SECONDS,
@@ -358,7 +360,7 @@ impl TestNode {
                 slot_number: None,
                 target_gas_limit: None,
             },
-            transactions: Some(transactions.clone()),
+            transactions: Some(transactions),
             no_tx_pool: Some(true),
             gas_limit: Some(parent.header.gas_limit),
             eip_1559_params: Some(B64::from(
@@ -373,6 +375,15 @@ impl TestNode {
             safe_block_hash: head,
             finalized_block_hash: head,
         };
+        Ok((state, attributes))
+    }
+
+    /// Builds the next block with `transactions` after the L1 info deposit on this node's head,
+    /// inserts it and makes it the head, and returns its payload.
+    async fn produce(&self, transactions: Vec<Bytes>) -> Result<BaseExecutionPayloadEnvelopeV4> {
+        let transactions: Vec<_> =
+            std::iter::once(L1_BLOCK_INFO_DEPOSIT_TX).chain(transactions).collect();
+        let (state, attributes) = self.next_block(transactions.clone()).await?;
         let started = self.engine.fork_choice_updated_v3(state, Some(attributes)).await?;
         let payload_id =
             started.payload_id.ok_or_else(|| eyre!("forkchoice did not start a payload"))?;
