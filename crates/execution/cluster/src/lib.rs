@@ -33,6 +33,14 @@ pub use placement::{KeyPlacement, NodeId, Shard, ShardMap, ShardedTable};
 mod config;
 pub use config::{Cluster, ClusterConfig, ConfigError, NodeConfig};
 
+mod bootstrap;
+pub use bootstrap::{
+    BatchLimit, Bootstrap, BootstrapError, BootstrapReport, BootstrapTarget, RowCount, TableCopy,
+};
+
+mod storage_report;
+pub use storage_report::{ContractRows, StorageCounter, StorageReport};
+
 mod protocol;
 pub use protocol::{
     DuplicateValues, Frame, FrameError, Query, ReadError, ReadResult, Request, Response,

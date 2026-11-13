@@ -9,9 +9,10 @@ use reth_cli_runner::CliRunner;
 
 use crate::{
     commands::{
-        bootnode::BootnodeCommand, consensus::ConsensusCommand, dev::DevCommand,
-        execution::ExecutionCommand, follow::FollowCommand, reth::RethCommand, rpc::RpcCommand,
-        sequencer::SequencerCommand, snapshot::SnapshotCommand, update::UpdateCommand,
+        bootnode::BootnodeCommand, cluster::ClusterCommand, consensus::ConsensusCommand,
+        dev::DevCommand, execution::ExecutionCommand, follow::FollowCommand, reth::RethCommand,
+        rpc::RpcCommand, sequencer::SequencerCommand, snapshot::SnapshotCommand,
+        update::UpdateCommand,
     },
     config::ChainResolver,
 };
@@ -56,6 +57,9 @@ pub(crate) enum BaseCommand {
     /// Snapshot manifest generation and download utilities (uses its own --chain flag).
     #[command(name = "snapshot")]
     Snapshot(Box<SnapshotCommand>),
+    /// Clustered Base maintenance: bootstrap clustered nodes' databases, report storage.
+    #[command(name = "cluster")]
+    Cluster(Box<ClusterCommand>),
 }
 
 impl BaseCommand {
@@ -94,17 +98,22 @@ impl BaseCommand {
                 chain_resolver.reject_for_reth_command("base snapshot")?;
                 snapshot.command.run()
             }
+            Self::Cluster(cluster) => {
+                chain_resolver.reject_for_reth_command("base cluster")?;
+                cluster.command.run()
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, process::Command, thread, time::Duration};
+    use std::{net::TcpListener, path::PathBuf, process::Command, thread, time::Duration};
 
     use clap::Parser;
 
-    use crate::{cli::BaseCli, config::ChainResolver};
+    use super::BaseCommand;
+    use crate::{cli::BaseCli, commands::cluster::ClusterSubcommand, config::ChainResolver};
 
     #[test]
     fn rejects_legacy_node_rpc_path() {
@@ -142,6 +151,64 @@ mod tests {
         let err = BaseCli::try_parse_from(["base", "snapshot", "--help"]).unwrap_err();
 
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn parses_cluster_bootstrap_pairs() {
+        let cli = BaseCli::try_parse_from([
+            "base",
+            "cluster",
+            "bootstrap",
+            "--from",
+            "/full",
+            "--cluster.config",
+            "/c1.toml",
+            "--to",
+            "/d1",
+            "--cluster.config",
+            "/c2.toml",
+            "--to",
+            "/d2",
+        ])
+        .unwrap();
+        let BaseCommand::Cluster(cluster) = cli.command else { panic!("not a cluster command") };
+        let ClusterSubcommand::Bootstrap(bootstrap) = cluster.command else {
+            panic!("not a bootstrap")
+        };
+        assert_eq!(bootstrap.from, PathBuf::from("/full"));
+        assert_eq!(bootstrap.cluster_config, [PathBuf::from("/c1.toml"), "/c2.toml".into()]);
+        assert_eq!(bootstrap.to, [PathBuf::from("/d1"), "/d2".into()]);
+    }
+
+    #[test]
+    fn rejects_unpaired_cluster_bootstrap_destinations() {
+        let cli = BaseCli::try_parse_from([
+            "base",
+            "cluster",
+            "bootstrap",
+            "--from",
+            "/full",
+            "--cluster.config",
+            "/c1.toml",
+            "--to",
+            "/d1",
+            "--to",
+            "/d2",
+        ])
+        .unwrap();
+        let err = cli.command.run(ChainResolver::new(None), false).unwrap_err();
+        assert!(err.to_string().contains("--cluster.config"), "{err}");
+    }
+
+    #[test]
+    fn parses_cluster_storage_report() {
+        let cli = BaseCli::try_parse_from(["base", "cluster", "storage-report", "--from", "/full"])
+            .unwrap();
+        let BaseCommand::Cluster(cluster) = cli.command else { panic!("not a cluster command") };
+        let ClusterSubcommand::StorageReport(report) = cluster.command else {
+            panic!("not a storage report")
+        };
+        assert_eq!(report.top, 20);
     }
 
     #[test]

@@ -358,6 +358,56 @@ the engine's persistence writer never waits long. Reads do not depend on it (see
 mid-shed resumes on its next start. Scale-up copies a shard from an owner at a persisted tip;
 scale-down sheds it.
 
+### Filtered copy
+
+`base cluster bootstrap --from <full datadir> --cluster.config <FILE> --to <new datadir>` writes
+a clustered node's state database directly from a full node's, instead of copying the whole
+datadir and shedding. `--cluster.config` and `--to` repeat, paired by position, to write several
+nodes' databases in one pass over the source. For each node it creates `<to>/db` holding every
+table of `<from>/db` that reth's schema declares (`Tables::ALL`): unsharded tables row for row,
+and for the five sharded tables only the rows that node holds by [placement](#placement):
+replicated `AccountsTrie` paths are kept, and a split contract's rows are placed one by one by
+subkey, its replicated storage-trie paths kept. The result is identical, row for row and byte for
+byte, to a full copy on which that node's shed has finished, so a node started on it behaves
+exactly as one started on a full copy.
+
+- The source must be a full node that is stopped. The command refuses when reth's `db/lock` file
+  names a live process, and holds that lock while it copies, so a node cannot start on the
+  source meanwhile (it creates and removes the lock file; no table of the source changes). It
+  also refuses when the source has no `Finish` stage checkpoint, when a `<to>/db` exists and is
+  not empty, and when a config does not list its `node_id`; then nothing is created.
+- The pairs are refused when their counts differ, when two share a `--to` path or a `node_id`,
+  or when the configs differ in anything but `node_id` and `apply_from` (node list, replication,
+  retention, split contracts), since the nodes would not agree on placement.
+- A row of a sharded table that cannot be placed (a key or split-contract subkey of the wrong
+  encoding) stops the copy with an error; nothing is dropped silently.
+- Rows move as raw bytes in source order, in MDBX append mode, from one read transaction of the
+  source (long-read safety disabled; the source is stopped). Each row is placed once and
+  appended to every destination whose node holds it. The destinations commit together once the
+  rows or bytes written to all of them since the last commit reach 100 000 rows or 256
+  mebibytes, with MDBX's `SafeNoSync` sync mode, and are synced to disk once at the end. An
+  interrupted run leaves partial databases: delete every `<to>/db` and run again; there is no
+  resume.
+- It logs each table at start and finish (rows read, and rows written per destination) and every
+  10 million rows of a large table, and prints a summary per destination: rows and bytes of each
+  sharded table kept against the source and of the unsharded tables together; then the elapsed
+  time and the contracts with the most `HashedStorages` rows (see below).
+- Only `<to>/db` is written. The operator provides the rest of the datadir from the stopped
+  source: `static_files` and `rocksdb` copied in full (they are not sharded), and `reth.toml` and
+  any other node files as for any copied datadir. Consensus-layer files live outside the
+  execution datadir and are handled as for any new node.
+- `split_storage` must be final before bootstrapping: rows of split contracts in ranges the node
+  does not own are never copied.
+
+### Choosing split contracts
+
+`base cluster storage-report --from <datadir> [--top N]` walks `HashedStorages` of `<datadir>/db`
+once, read-only, and prints the `N` (default 20) hashed addresses with the most rows, each with
+its row count and share of the table, then the table's total, and last a ready
+`split_storage = [...]` line listing the hashed addresses that hold at least 1% of the rows. It
+takes no lock; on a running node its long read transaction keeps MDBX from reusing pages until
+it finishes, so prefer a stopped node.
+
 ## Limits
 
 - A clustered node can only follow the chain live. It must be re-cloned when it falls behind by
