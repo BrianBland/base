@@ -4,6 +4,7 @@
 mod apply;
 mod e2e;
 mod guards;
+mod join;
 mod slices;
 
 use std::{

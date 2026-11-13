@@ -7,7 +7,9 @@ use std::{
 };
 
 use base_execution_chainspec::BaseChainSpec;
-use base_execution_cluster::{Cluster, ClusteredDatabase, OwnerServer, RootMismatchMarker};
+use base_execution_cluster::{
+    Cluster, ClusteredDatabase, JoinMarker, OwnerServer, RootMismatchMarker,
+};
 use base_node_runner::{BaseNodeBuilder, LaunchedBaseNode};
 use base_upgrade_signal::UpgradeSignalStartupMode;
 use clap::{Args, value_parser};
@@ -40,8 +42,9 @@ const DEFAULT_BASE_MAX_OUTBOUND_EL_PEERS: usize = 80;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
 pub struct ClusterArgs {
     /// Cluster configuration file (TOML). When set, this node stores only its shards of the
-    /// state (clustered Base, experimental) and reads the rest from its peers. Requires an
-    /// initialised datadir and `--engine.num-state-masking-blocks 0`.
+    /// state (clustered Base, experimental) and reads the rest from its peers. Requires
+    /// `--engine.num-state-masking-blocks 0` and an initialised datadir, except on a node that
+    /// stores nothing and lists `apply_from`, which joins its cluster on an empty datadir.
     #[arg(long = "cluster.config", value_name = "FILE")]
     pub cluster_config: Option<PathBuf>,
 }
@@ -391,13 +394,17 @@ impl ExecutionNodeRuntimeConfig {
             !self.node_config.debug.skip_state_root,
             "a clustered node maintains its own trie slice; remove --debug.skip-state-root"
         );
+        let datadir = self.node_config.datadir();
+        JoinMarker::ensure_absent(datadir.data_dir())?;
+        let cluster = Arc::new(Cluster::load(config)?);
         let finish = env.tx()?.get::<tables::StageCheckpoints>(StageId::Finish.to_string())?;
         eyre::ensure!(
-            finish.is_some(),
-            "a clustered node requires an initialised datadir; run `init` without a cluster config"
+            finish.is_some() || !cluster.apply_from().is_empty(),
+            "a clustered node requires an initialised datadir unless it stores nothing and lists \
+             apply_from (it then joins its cluster at a peer's persisted block); run `init` \
+             without a cluster config"
         );
-        RootMismatchMarker::ensure_absent(self.node_config.datadir().data_dir())?;
-        let cluster = Arc::new(Cluster::load(config)?);
+        RootMismatchMarker::ensure_absent(datadir.data_dir())?;
         let address = cluster
             .address(cluster.node_id())
             .ok_or_else(|| eyre::eyre!("cluster config does not list this node"))?;
@@ -679,6 +686,41 @@ mod tests {
 
         let clustered = runtime.open_database().unwrap();
         assert!(clustered.cluster().is_some());
+    }
+
+    /// The runtime of node 2, which stores nothing, of a cluster with storing node 1, applying
+    /// from `apply_from`.
+    fn non_storing_runtime(dir: &Path, apply_from: &str) -> ExecutionNodeRuntimeConfig {
+        let config = dir.join("non-storing.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "node_id = 2\nreplication = 1\napply_from = {apply_from}\n\
+                 [[nodes]]\nid = 1\naddress = \"127.0.0.1:0\"\n\
+                 [[nodes]]\nid = 2\naddress = \"127.0.0.1:0\"\nstorage = false\n"
+            ),
+        )
+        .unwrap();
+        let mut runtime = clustered_runtime(dir, "0");
+        runtime.cluster.cluster_config = Some(config);
+        runtime
+    }
+
+    #[test]
+    fn only_a_non_storing_apply_node_opens_an_empty_datadir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let executing = non_storing_runtime(dir.path(), "[]").open_database().unwrap_err();
+        assert!(executing.to_string().contains("initialised datadir"), "{executing}");
+
+        let joining = non_storing_runtime(dir.path(), "[1]").open_database().unwrap();
+        assert!(joining.cluster().is_some());
+
+        let other = tempfile::tempdir().unwrap();
+        let half_joined = non_storing_runtime(other.path(), "[1]");
+        JoinMarker::create(half_joined.node_config.datadir().data_dir()).unwrap();
+        let refused = half_joined.open_database().unwrap_err();
+        assert!(refused.to_string().contains("delete the datadir"), "{refused}");
     }
 
     #[test]

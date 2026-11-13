@@ -6,7 +6,7 @@ use alloy_primitives::{B256, Bytes};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use crate::{BlockShardHashes, Shard, ShardHash, ShardedTable};
+use crate::{BlockShardHashes, JoinPoint, Shard, ShardHash, ShardedTable};
 
 /// The block a read is answered as of: the asker's persisted tip `P`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +118,10 @@ pub enum Query {
         /// Number of the block.
         number: u64,
     },
+    /// The headers a node that stores nothing needs to start at the answering node's persisted
+    /// tip, answered with [`Response::JoinPoint`] or refused with [`ReadError::NotAvailable`];
+    /// the snapshot and table of the request are ignored (see [`JoinPoint`]).
+    JoinPoint,
 }
 
 /// Entries of the refused [`Query::SeekGe`]; kept for the encoding of [`Response`].
@@ -160,6 +164,8 @@ pub enum Response {
     /// Answer to [`Query::SplitShardHashes`]: each held account shard with split contracts whose
     /// storage roots were all supplied, and its hash.
     SplitShardHashes(Vec<(Shard, ShardHash)>),
+    /// Answer to [`Query::JoinPoint`].
+    JoinPoint(JoinPoint),
 }
 
 /// Inclusive range of blocks an owner can answer as of.
@@ -317,6 +323,7 @@ mod tests {
             (Query::ShardHashes { number: 0, hash }, 8),
             (Query::SplitShardHashes { number: 0, hash, storage_roots: Vec::new() }, 9),
             (Query::ExecutedBlockAt { hash, number: 0 }, 10),
+            (Query::JoinPoint, 11),
         ];
         let responses = [
             (Response::Value(None), 0),
@@ -327,6 +334,7 @@ mod tests {
             (Response::Status(None), 5),
             (Response::ShardHashes(BlockShardHashes::default()), 6),
             (Response::SplitShardHashes(Vec::new()), 7),
+            (Response::JoinPoint(JoinPoint::default()), 8),
         ];
         let errors = [
             (ReadError::SnapshotUnavailable { servable: None }, 0),

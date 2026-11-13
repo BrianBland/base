@@ -7,7 +7,7 @@ use std::{
 
 use base_common_network::SharedEngineApi;
 use base_common_rpc_types_engine::PayloadReady;
-use base_execution_cluster::{ClusteredDatabase, RootMismatchMarker};
+use base_execution_cluster::{ClusteredDatabase, JoinMarker, RootMismatchMarker};
 use base_execution_payload_builder::{
     RejectionCache,
     config::{BaseDAConfig, GasLimitConfig, ResourceMeteringConfig},
@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use tracing::info;
 
 use crate::{
-    ApplyEngineValidatorBuilder, BaseNodeBuilder, BaseNodeExtension, ClusterFeed,
+    ApplyEngineValidatorBuilder, BaseNodeBuilder, BaseNodeExtension, ClusterFeed, ClusterJoinStart,
     ClusterUnsupportedRpc, FromExtensionConfig, NodeHooks, RootCheckTask,
     node::BaseNode,
     service::{DefaultPayloadServiceBuilder, PayloadServiceBuilder},
@@ -226,6 +226,15 @@ impl<SB: PayloadServiceBuilder> BaseNodeRunner<SB> {
                 );
             }
             RootMismatchMarker::ensure_absent(&datadir)?;
+            JoinMarker::ensure_absent(&datadir)?;
+            if ClusterJoinStart::is_needed(node, builder.db())? {
+                let (node, db) = (Arc::clone(node), builder.db().clone());
+                let (config, runtime) = (builder.config().clone(), builder.task_executor().clone());
+                tokio::task::spawn_blocking(move || {
+                    ClusterJoinStart::run(&node, &db, &config, &runtime)
+                })
+                .await??;
+            }
             engine_validator.install_cluster(Arc::clone(node));
         }
         let owner_feed = cluster.clone();

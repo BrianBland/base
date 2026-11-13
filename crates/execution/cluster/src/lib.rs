@@ -68,6 +68,9 @@ pub use protocol::{
     ServableRange, ShardEntries, SnapshotId,
 };
 
+mod join;
+pub use join::{ClusterJoin, JoinError, JoinHeaderLookup, JoinHeaders, JoinMarker, JoinPoint};
+
 mod changesets;
 pub use changesets::{ChangesetReader, ChangesetSource, PlainChangesets, ProviderChangesets};
 

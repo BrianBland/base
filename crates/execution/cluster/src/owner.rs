@@ -25,8 +25,8 @@ use tracing::{error, info, warn};
 
 use crate::{
     BlockHashLookup, ChangesetReader, ChangesetSource, Cluster, ClusterNode, HistoryIndex,
-    OwnerAnswer, OwnerStats, Query, ReadError, Request, Response, ServableRange, Shard,
-    ShardedTable, SnapshotId,
+    JoinHeaderLookup, JoinPoint, OwnerAnswer, OwnerStats, Query, ReadError, Request, Response,
+    ServableRange, Shard, ShardedTable, SnapshotId,
 };
 
 /// A canonical block as an owner keeps it above its persisted tip.
@@ -256,6 +256,7 @@ pub struct OwnerStore<DB> {
     retention_blocks: u64,
     history: Mutex<OwnerHistory>,
     block_hashes: OnceLock<BlockHashLookup>,
+    join_headers: OnceLock<JoinHeaderLookup>,
     changesets: OnceLock<ChangesetReader>,
     stats: Arc<OwnerStats>,
 }
@@ -290,6 +291,7 @@ impl<DB: Database> OwnerStore<DB> {
             retention_blocks,
             history: Mutex::new(OwnerHistory { persisted, ..Default::default() }),
             block_hashes: OnceLock::new(),
+            join_headers: OnceLock::new(),
             changesets: OnceLock::new(),
             stats: Arc::default(),
         })
@@ -309,6 +311,25 @@ impl<DB: Database> OwnerStore<DB> {
     /// The hash of canonical block `number` from the installed lookup, if any.
     pub fn block_hash(&self, number: u64) -> Option<B256> {
         self.block_hashes.get().and_then(|lookup| lookup(number))
+    }
+
+    /// Installs the lookup of encoded canonical headers that [`Query::JoinPoint`] answers from.
+    /// Only the first lookup installed is kept; returns whether this one was.
+    pub fn install_join_headers(&self, lookup: JoinHeaderLookup) -> bool {
+        self.join_headers.set(lookup).is_ok()
+    }
+
+    /// The join point at persisted tip `tip`: the encoded headers of [`JoinPoint::window`], none
+    /// at genesis; `None` before a lookup is installed, when a header is missing, or when the
+    /// answer would not fit in a frame.
+    pub fn join_point(&self, tip: u64) -> Option<JoinPoint> {
+        if tip == 0 {
+            return Some(JoinPoint::default());
+        }
+        let window = JoinPoint::window(tip);
+        let expected = window.clone().count();
+        let point = self.join_headers.get().and_then(|lookup| lookup(window))?;
+        (point.headers.len() == expected && point.fits_frame()).then_some(point)
     }
 
     /// Installs the changeset reader and builds the history index from it. Only the first
@@ -524,6 +545,11 @@ impl<DB: Database> OwnerStore<DB> {
             | Query::SplitShardHashes { .. }
             | Query::ExecutedBlockAt { .. } => Err(ReadError::Unsupported.into()),
             Query::Status => Ok(Some(Response::Status(self.servable()))),
+            Query::JoinPoint => {
+                let tip = ClusterNode::finish_checkpoint(tx)?;
+                let point = self.join_point(tip).ok_or(ReadError::NotAvailable)?;
+                Ok(Some(Response::JoinPoint(point)))
+            }
             Query::AccountValue { address } => {
                 Self::check_table(request, ShardedTable::HashedAccounts)?;
                 self.check_holds(ShardedTable::HashedAccounts, address.as_slice(), &[])?;

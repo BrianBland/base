@@ -15,8 +15,9 @@ workspace = true
 # reth
 reth-trie.workspace = true
 reth-db-api.workspace = true
-reth-stages-types.workspace = true
 reth-provider.workspace = true
+reth-prune-types.workspace = true
+reth-stages-types.workspace = true
 reth-primitives-traits.workspace = true
 reth-db = { workspace = true, features = ["mdbx"] }
 reth-execution-types = { workspace = true, features = ["serde"] }
@@ -50,6 +51,7 @@ base-common-consensus = { workspace = true, features = ["reth"] }
 tempfile.workspace = true
 reth-tasks.workspace = true
 reth-chainspec.workspace = true
+reth-db-common.workspace = true
 reth-trie-db.workspace = true
 reth-db = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true, features = ["test-utils"] }

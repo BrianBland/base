@@ -303,11 +303,13 @@ Keys and values travel as the encoded table bytes MDBX stores.
 | `ShardHashes { number, hash }` (see [State-root check](#state-root-check)) | the block's captured subtree hashes |
 | `SplitShardHashes { number, hash, storage_roots }` | the block's held split-contract shards, recomputed |
 | `ExecutedBlockAt { hash, number }` (see [Apply mode](#apply-mode)) | the block's encoded execution result |
+| `JoinPoint` (see [Joining on an empty datadir](#joining-on-an-empty-datadir)) | the encoded headers of the 256 blocks ending at the node's persisted tip |
 
 Every request carries the snapshot `P` and a table (`HashedAccounts` or `HashedStorages` for the
-exact reads; ignored by `Status`, `ExecutedBlock`, `ExecutedBlockAt` and the two hash requests).
-Errors: `SnapshotUnavailable` (with the range the owner can serve), `WrongFork`, `NotOwner`,
-`Unsupported`, `NotAvailable` for `ExecutedBlock`, `ExecutedBlockAt` and the hash requests, and
+exact reads; ignored by `Status`, `ExecutedBlock`, `ExecutedBlockAt`, `JoinPoint` and the two
+hash requests). Errors: `SnapshotUnavailable` (with the range the owner can serve), `WrongFork`,
+`NotOwner`, `Unsupported`, `NotAvailable` for `ExecutedBlock`, `ExecutedBlockAt`, `JoinPoint` and
+the hash requests, and
 `NotRetained` for `ExecutedBlockAt`. New requests, responses and errors are appended to the end
 of their enums, so the encoding of the older ones is unchanged (a unit test pins every variant's
 position); an owner refuses the older ordered and trie requests (`Get` of a table other than
@@ -518,7 +520,13 @@ A clustered node refuses to start unless:
 - The proofs-history extension (`--proofs-history`) is not enabled: it reads trie rows outside
   the node's slice. The launch fails with `the proofs-history extension reads trie rows a
   clustered node does not hold; remove --proofs-history or the cluster config`.
-- The datadir is initialised: genesis is written (a `Finish` checkpoint exists).
+- The datadir is initialised: genesis is written (a `Finish` checkpoint exists). Exception: a
+  node with `storage = false` and a non-empty `apply_from` starts on an empty datadir and joins
+  its cluster (see [Joining on an empty datadir](#joining-on-an-empty-datadir)). A storing node,
+  or a non-storing node without `apply_from`, still refuses an empty datadir with `a clustered
+  node requires an initialised datadir unless it stores nothing and lists apply_from`.
+- No interrupted join marker (`<datadir>/cluster-join-incomplete`) exists. The start fails with
+  `a cluster join was interrupted in this datadir (<path>); delete the datadir and start again`.
 - reth's account and storage changesets are kept for at least `W` blocks (Base's full node
   default keeps them); an owner can serve history only as far back as they reach.
 - No state-root mismatch marker (`<datadir>/cluster-root-mismatch`) exists. The start fails with
@@ -546,7 +554,7 @@ Every key of the cluster TOML (see [Placement](#placement) for the example):
 | `retention_blocks` | 30000 (at least 160) | `W`, blocks of history each owner serves; the same on every node ([Owner side](#owner-side)) |
 | `read_retry_secs` | 60 (not 0) | how long a remote read and the [pre-execution wait](#pre-execution-wait) wait for owners ([Read rule](#read-rule)) |
 | `split_storage` | `[]` | contracts whose storage is placed slot by slot; the same on every node ([Placement](#placement)) |
-| `apply_from` | `[]` (execute) | executors an apply node asks, only on `storage = false` ([Apply mode](#apply-mode)) |
+| `apply_from` | `[]` (execute) | executors an apply node asks, only on `storage = false` ([Apply mode](#apply-mode)); such a node joins on an empty datadir ([Joining](#joining-on-an-empty-datadir)) |
 | `root_check` | `"exit"` | `"exit"`, `"log"` or `"off"`: what a state-root mismatch does ([State-root check](#state-root-check)) |
 | `root_check_warn_blocks` | 300 | blocks without a verified state root before the check warns |
 
@@ -690,6 +698,40 @@ to the 400 ms deadline per block. Two nodes that apply from each other only wait
 then execute. An apply node does not warm reth's execution cache, so a fallback execution starts
 cold.
 
+### Joining on an empty datadir
+
+An apply node (`storage = false`, non-empty `apply_from`) whose datadir has no `Finish` checkpoint
+joins its cluster at a peer's persisted block `P` instead of starting from a copied datadir. Every
+other clustered node launched by `base-node-runner` on an empty datadir still gets its genesis from
+the launch, and the `base` command refuses it (see
+[Operating requirements](#operating-requirements)).
+
+1. It creates `<datadir>/cluster-join-incomplete`, then writes genesis as reth's launch does.
+2. It asks its `apply_from` nodes, in order, for `JoinPoint`: the RLP-encoded canonical headers
+   of blocks `max(1, P - 255)..=P`, where `P` is the answering node's persisted tip (`P`'s header
+   and the 255 before it, the block hashes the `BLOCKHASH` opcode reads). The headers must be
+   consecutive and linked by parent hash, block 1 to this chain's genesis. A second node confirms
+   `P`'s hash: the first other cluster node whose own join point holds `P` with the same hash, or
+   else the same peer asked again. Peers are trusted; this catches a peer on another chain or fork.
+   Rounds repeat every 500 ms for up to `read_retry_secs`; then the start fails with `no apply_from
+   node gave a join point another node confirmed`, listing each node's failure. A node still at
+   genesis answers no header, and the joining node starts from genesis.
+3. In one commit it writes the headers to the header static files and `HeaderNumbers`, restarts
+   every other static-file segment after `P` with history below `P` counted as pruned (reth's
+   `anchor_pruned_static_files`, as after its snap sync), records every prune checkpoint as pruned
+   through `P`, and moves every stage checkpoint, `Finish` included, to `P`.
+4. It removes the marker and continues the normal start, at `P`.
+
+It logs `cluster node joining at a peer's persisted block` (`peer`, `block`) and `cluster node
+joined` (`block`, `elapsed`). A crash before the marker is removed leaves a datadir the next start
+refuses; delete it and start again.
+
+Nothing else is transferred (a join point is about 256 headers, roughly 150 KB on Base; an answer
+that would not fit a frame is refused with `NotAvailable`). Transaction numbers restart at 0 above
+`P`: they are local storage indexes no peer compares. The replicated trie rows are not transferred:
+a node that stores nothing never computes a trie, captures nothing for the state-root check and
+refuses proof RPCs, so nothing reads them; it keeps the genesis values its genesis write left.
+
 ## Bootstrap
 
 Start from a full datadir (genesis initialised or snapshot restored on a pass-through database).
@@ -778,6 +820,17 @@ single walk's. It takes no lock; on a running node its long read transactions ke
 reusing pages until it finishes, so prefer a stopped node.
 
 ## Limits
+
+- A node that joined on an empty datadir (see
+  [Joining on an empty datadir](#joining-on-an-empty-datadir)) holds no block before its join
+  block `P` except genesis, and only the headers of `P - 255..=P`. Block, transaction, receipt,
+  log and trace RPCs for blocks at or below `P` fail or answer nothing (reth reports blocks below
+  `P` as expired, and `P`'s body was never stored; the test checks `eth_getBlockByNumber`);
+  historical state reads below `P` fail as on every clustered node. Headers below
+  `P - 255` are absent. When `P - 255` falls in genesis's header static file (the first 500 000
+  blocks by default) but `P` does not, the headers start at that file's end instead, so fewer
+  than 256 block hashes are held; a join block inside that file and above 256 is refused, since a
+  static file holds consecutive blocks from its first.
 
 - A clustered node can only follow the chain live. It must be re-cloned when it falls behind by
   more than the engine's backfill threshold, or when a reorg reaches persisted blocks.

@@ -18,9 +18,9 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::{
-    ApplyFallback, BlockShardHashes, Cluster, Frame, FrameError, KeyPlacement, NodeId, Query,
-    ReadError, ReadResult, RemoteReadStats, Request, Response, ServableRange, Shard, ShardHash,
-    ShardedTable, SnapshotId,
+    ApplyFallback, BlockShardHashes, Cluster, Frame, FrameError, JoinPoint, KeyPlacement, NodeId,
+    Query, ReadError, ReadResult, RemoteReadStats, Request, Response, ServableRange, Shard,
+    ShardHash, ShardedTable, SnapshotId,
 };
 
 /// Timeouts, retry budget, pool size and simulated latency of a [`ClusterClient`].
@@ -209,6 +209,14 @@ impl ClusterClient {
     ) -> Result<Option<ServableRange>, OwnerFailure> {
         match self.ask_by(node, &Self::unsnapshotted(Query::Status), deadline)? {
             Response::Status(servable) => Ok(servable),
+            _ => unreachable!("checked by ask"),
+        }
+    }
+
+    /// `node`'s join point at its persisted tip, asked once, with the answer due by `deadline`.
+    pub fn join_point(&self, node: NodeId, deadline: Instant) -> Result<JoinPoint, OwnerFailure> {
+        match self.ask_by(node, &Self::unsnapshotted(Query::JoinPoint), deadline)? {
+            Response::JoinPoint(point) => Ok(point),
             _ => unreachable!("checked by ask"),
         }
     }
@@ -475,6 +483,7 @@ impl ClusterClient {
                 )
                 | (Query::ShardHashes { .. }, Response::ShardHashes(_))
                 | (Query::SplitShardHashes { .. }, Response::SplitShardHashes(_))
+                | (Query::JoinPoint, Response::JoinPoint(_))
         );
         if expected { Ok(response) } else { Err(OwnerFailure::UnexpectedResponse) }
     }

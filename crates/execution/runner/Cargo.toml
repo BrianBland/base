@@ -19,14 +19,18 @@ base-test-utils = { workspace = true, optional = true }
 reth-evm.workspace = true
 reth-trie.workspace = true
 reth-exex.workspace = true
+reth-tasks.workspace = true
+reth-db-api.workspace = true
 reth-rpc-api.workspace = true
 reth-node-api.workspace = true
 reth-provider.workspace = true
+reth-db-common.workspace = true
 reth-consensus.workspace = true
 reth-engine-tree.workspace = true
 reth-chain-state.workspace = true
 reth-network-p2p.workspace = true
 reth-trie-common.workspace = true
+reth-stages-types.workspace = true
 reth-node-builder.workspace = true
 reth-payload-builder.workspace = true
 reth-storage-overlay.workspace = true
@@ -35,7 +39,6 @@ reth-primitives-traits.workspace = true
 reth-db = { workspace = true, optional = true }
 reth-ipc = { workspace = true, optional = true }
 reth-tracing = { workspace = true, optional = true }
-reth-tasks = { workspace = true, optional = true }
 reth-node-core = { workspace = true, optional = true }
 reth-rpc-layer = { workspace = true, optional = true }
 
@@ -111,7 +114,6 @@ test-utils = [
 	"dep:reth-ipc",
 	"dep:reth-node-core",
 	"dep:reth-rpc-layer",
-	"dep:reth-tasks",
 	"dep:reth-tracing",
 	"dep:tower",
 	"dep:tracing-subscriber",
@@ -120,5 +122,5 @@ test-utils = [
 	"reth-node-builder/test-utils",
 	"reth-primitives-traits/test-utils",
 	"reth-provider/test-utils",
-	"reth-tasks?/test-utils",
+	"reth-tasks/test-utils",
 ]

@@ -33,7 +33,7 @@ const DEPOSITS_PER_KIND: u64 = 24;
 
 /// The seed of the `index`th deposit value of `kind` in block `number`: kind 1 is a recipient
 /// account, 3 a written slot of [`STORAGE_CONTRACT`], 2 and 4 their deposits' source hashes.
-fn deposit_seed(number: u64, kind: u8, index: u64) -> B256 {
+pub(crate) fn deposit_seed(number: u64, kind: u8, index: u64) -> B256 {
     keccak256([[kind].as_slice(), &number.to_be_bytes(), &index.to_be_bytes()].concat())
 }
 
@@ -202,9 +202,9 @@ async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
     let producer = TestNode::launch(&chain_spec, None).await?;
     let executor = TestNode::launch(&chain_spec, Some(cluster_config(1, &nodes))).await?;
     let applier_config = ClusterConfig { apply_from: vec![NodeId(4)], ..cluster_config(3, &nodes) };
-    let applier = TestNode::launch(&chain_spec, Some(applier_config)).await?;
 
-    // Node 4 serves results whose first receipt reports one more gas than was used.
+    // Node 4 serves results whose first receipt reports one more gas than was used. It is up
+    // before the applier starts on its empty datadir, which asks it for a join point.
     let corrupt_results = Arc::new(ExecutedBlocks::default());
     let corrupt_view = Cluster::new(cluster_config(4, &nodes))?;
     let corrupt_store =
@@ -214,6 +214,7 @@ async fn apply_node_executes_when_no_valid_result_arrives() -> Result<()> {
         corrupt_store,
         Arc::clone(&corrupt_results),
     )?;
+    let applier = TestNode::launch(&chain_spec, Some(applier_config)).await?;
 
     let envelope = producer.produce(block_transactions(1)).await?;
     let hash = executor.import(&envelope).await?;
