@@ -130,6 +130,14 @@ subkey ranges (the first subkey byte), a duplicate in a range the node does not 
 walk seek to the next range, and its replicated storage-trie paths stay visible. A value's subkey
 is encoded to place it only for a split contract; every other row is placed by its key.
 
+A replicated one-nibble `AccountsTrie` node is read with its tree-mask bits (stored children)
+cleared for children in shards the node does not own, as a database holding only the visible
+rows would have it; its hashes and other masks are read as stored. reth's trie walker trusts a
+tree bit: seeking a claimed child that the filter hides, it takes the next visible node, under the
+next nibble, for a descendant, skips that whole nibble and hashes every account under it from the
+leaves. A side computation descends toward a foreign account leaf on every block, so without this
+it re-hashed every held account under the next nibble each time.
+
 ### Remote exact reads
 
 Outside a [`LocalReads`] scope, in a read-only transaction, the hashed tables answer as follows
@@ -385,7 +393,8 @@ Rows on disk are either meaningful or don't-care:
   mask bits of held children.
 - Don't care: in replicated nodes, the hashes of children in shards this node does not hold (they
   stay as this node last wrote them and are reused as they are, so a branch keeps its 16
-  children); the root nodes above them; and the path from a split contract's account leaf up to
+  children) and, in one-nibble account-trie nodes, their tree-mask bits (read as clear, see
+  [Local filtered reads](#local-filtered-reads), so written clear); the root nodes above them; and the path from a split contract's account leaf up to
   its shard's two-nibble node, since that leaf's storage root mixes in other nodes' ranges.
   Nothing may trust these values.
 

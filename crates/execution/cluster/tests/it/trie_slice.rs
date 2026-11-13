@@ -352,7 +352,7 @@ impl SliceNode {
     fn start(node_id: u64, split: &[B256], initial: &BlockUpdates, shed: bool) -> Self {
         let dir = TempDir::new().unwrap();
         let arguments =
-            DatabaseArguments::new(ClientVersion::default()).with_geometry_max_size(Some(1 << 30));
+            DatabaseArguments::new(ClientVersion::default()).with_geometry_max_size(Some(1 << 34));
         let env = init_db(dir.path().join("db"), arguments).unwrap();
         let populate = node_factory(ClusteredDatabase::new(env.clone()), &dir.path().join("full"));
         let provider = populate.provider_rw().unwrap();
@@ -1103,4 +1103,234 @@ fn owners_without_a_capture_are_passed_over_and_a_block_without_any_is_skipped()
         CheckOutcome::Skipped(SkipReason::NotAvailable),
         "a different block at the same number is not available"
     );
+}
+
+/// A shard `view`'s node does not own whose later siblings under the same first nibble it does
+/// not own either, while it owns a shard under the next nibble: reaching an account there walks
+/// through a replicated one-nibble node whose stored children after it are all hidden.
+fn foreign_shard_ending_its_nibble(view: &Cluster) -> Shard {
+    Shard::all()
+        .find(|shard| {
+            let nibble_end = shard.0 | 0x0f;
+            nibble_end < u8::MAX
+                && (shard.0..=nibble_end).all(|later| !view.owns(Shard(later)))
+                && (nibble_end + 1..=nibble_end + 0x10).any(|next| view.owns(Shard(next)))
+        })
+        .expect("a foreign shard ending its first nibble")
+}
+
+/// Genesis of the side-call scenarios: `accounts` plain accounts, unsplit contracts, and split
+/// contract `contract` with `slots` slots over every range.
+fn side_call_genesis(
+    rng: &mut StdRng,
+    model: &mut Model,
+    contract: B256,
+    accounts: usize,
+    slots: usize,
+) -> BlockUpdates {
+    let mut state = HashedPostState::default();
+    for _ in 0..accounts {
+        let address = random_key(rng, None);
+        state.accounts.insert(address, Some(random_account(rng)));
+        model.plain.insert(address);
+    }
+    for _ in 0..CONTRACTS {
+        let address = random_key(rng, None);
+        state.accounts.insert(address, Some(random_account(rng)));
+        state.storages.insert(address, model.new_slots(rng, address, CONTRACT_SLOTS));
+    }
+    state.accounts.insert(contract, Some(random_account(rng)));
+    state.storages.insert(contract, model.new_slots(rng, contract, slots));
+    let trie = full_root(&factory(), &state);
+    updates(state, trie)
+}
+
+/// A block changing only `slots` slots of `contract` in `range`.
+fn slots_block(rng: &mut StdRng, contract: B256, range: Shard, slots: usize) -> HashedPostState {
+    let storage: Vec<_> =
+        (0..slots).map(|_| (random_key(rng, Some(range.0)), random_value(rng))).collect();
+    HashedPostState {
+        accounts: B256Map::default(),
+        storages: B256Map::from_iter([(contract, HashedStorage::from_iter(storage))]),
+    }
+}
+
+/// A side call reaches its contract's leaf through the replicated one-nibble node above the
+/// contract's account shard, which this node does not hold, nor any later shard under that
+/// nibble. Its walk must stay on the contract's path: before, the walker took the next visible
+/// node (under the next nibble) for a descendant, skipped that whole nibble, and re-hashed every
+/// held account under it, which on a large network costs seconds per block.
+#[test]
+fn a_side_call_walks_only_the_path_to_its_contract() {
+    let mut rng = rng(0x9a7);
+    let view = cluster_view(1, &[]);
+    let account_shard = foreign_shard_ending_its_nibble(&view);
+    let contract = random_key(&mut rng, Some(account_shard.0));
+    let split = [contract];
+    let initial =
+        side_call_genesis(&mut rng, &mut Model::default(), contract, PLAIN_ACCOUNTS, SPLIT_SLOTS);
+    let node = SliceNode::start(1, &split, &initial, true);
+    let held_range = Shard::all().find(|shard| view.owns(*shard)).unwrap();
+
+    let plan = node.slice.plan(&slots_block(&mut rng, contract, held_range, 2)).unwrap();
+    assert!(plan.main.is_none());
+    let [side] = <[_; 1]>::try_from(plan.side_calls).unwrap();
+    let _local = LocalReads::enter();
+    let tx = node.db.tx().unwrap();
+    let (_, trie) = DbStateRoot::overlay_root_from_nodes_with_updates(
+        &tx,
+        TrieInputSorted::from_unsorted(side.input),
+    )
+    .unwrap();
+
+    assert!(trie.storage_tries.contains_key(&contract));
+    // The root is not stored, so every one-nibble node is rewritten, as on a full node.
+    let nibble = Nibbles::from_nibbles([account_shard.0 >> 4]);
+    let off_path: Vec<_> = trie
+        .account_nodes
+        .keys()
+        .chain(&trie.removed_nodes)
+        .filter(|path| path.len() > 1 && !path.starts_with(&nibble))
+        .collect();
+    assert!(off_path.is_empty(), "account nodes off the contract's path: {off_path:?}");
+}
+
+/// The one-nibble account-trie nodes a walk of `tx` reads.
+fn one_nibble_account_nodes(tx: &impl DbTx) -> Vec<(PackedStoredNibbles, BranchNodeCompact)> {
+    let mut cursor = tx.cursor_read::<tables::PackedAccountsTrie>().unwrap();
+    let nodes = cursor.walk(None).unwrap().map(Result::unwrap);
+    nodes.filter(|(path, _)| path.0.len() == 1).collect()
+}
+
+/// Through a clustered database, a replicated one-nibble account-trie node claims stored
+/// children (tree-mask bits) only in shards this node holds, as a database with only the
+/// visible rows would; the rest of the node is as stored.
+#[test]
+fn replicated_account_nodes_claim_only_visible_stored_children() {
+    let mut rng = rng(0x7ee);
+    let mut model = Model::default();
+    let (genesis_state, _) = genesis(&mut rng, &mut model);
+    let initial = updates(genesis_state.clone(), full_root(&factory(), &genesis_state));
+    let node = SliceNode::start(1, &[], &initial, false);
+    let raw = one_nibble_account_nodes(&node.env.tx().unwrap());
+    let shown = one_nibble_account_nodes(&node.db.tx().unwrap());
+
+    assert_eq!(raw.len(), 16);
+    assert_eq!(shown.len(), 16);
+    let mut hidden = 0;
+    for ((path, stored), (shown_path, shown)) in raw.iter().zip(&shown) {
+        assert_eq!(path, shown_path);
+        for child in 0..16u8 {
+            let mut child_path = path.0;
+            child_path.push(child);
+            let claimed = stored.tree_mask.is_bit_set(child);
+            let expected = claimed && node.owns(&child_path);
+            hidden += usize::from(claimed && !expected);
+            assert_eq!(shown.tree_mask.is_bit_set(child), expected, "{child_path:?}");
+        }
+        assert_eq!(
+            (shown.state_mask, shown.hash_mask, &shown.hashes, shown.root_hash),
+            (stored.state_mask, stored.hash_mask, &stored.hashes, stored.root_hash),
+        );
+    }
+    assert!(hidden > 50, "few stored children in foreign shards: {hidden}");
+}
+
+/// Environment variable overriding the slot count of [`side_call_cost`]'s split contract.
+const SIDE_CALL_BENCH_SLOTS_VAR: &str = "SIDE_CALL_BENCH_SLOTS";
+/// Default slot count of [`side_call_cost`]'s split contract.
+const SIDE_CALL_BENCH_SLOTS: usize = 1_000_000;
+/// Environment variable overriding the plain account count of [`side_call_cost`].
+const SIDE_CALL_BENCH_ACCOUNTS_VAR: &str = "SIDE_CALL_BENCH_ACCOUNTS";
+/// Default plain account count of [`side_call_cost`]: the side call's slowness grew with the held
+/// accounts under one first nibble.
+const SIDE_CALL_BENCH_ACCOUNTS: usize = 1_000_000;
+/// Blocks persisted, then kept in memory as ancestors, before the measured blocks.
+const SIDE_CALL_BENCH_PERSISTED: u64 = 3;
+const SIDE_CALL_BENCH_ANCESTORS: u64 = 3;
+/// Measured blocks.
+const SIDE_CALL_BENCH_MEASURED: u64 = 5;
+
+fn bench_var(name: &str, default: usize) -> usize {
+    std::env::var(name).map_or(default, |value| value.parse().unwrap())
+}
+
+/// A block of the side-call benchmark: plain account changes and `slots` slot changes of
+/// `contract`, whose account changes too.
+fn bench_block(
+    rng: &mut StdRng,
+    model: &mut Model,
+    contract: B256,
+    slots: usize,
+) -> HashedPostState {
+    let mut state = HashedPostState::default();
+    let plain: Vec<_> = model.plain.iter().copied().collect();
+    for address in plain.choose_multiple(rng, 40) {
+        state.accounts.insert(*address, Some(random_account(rng)));
+    }
+    state.accounts.insert(contract, Some(random_account(rng)));
+    state.storages.insert(contract, model.slot_changes(rng, contract, slots));
+    state
+}
+
+/// Cost of a side call against the same change computed as a main call. A split contract with
+/// [`SIDE_CALL_BENCH_SLOTS`] slots over every range has its account in a shard node 1 does not
+/// hold, as it holds no later shard under that first nibble; there are
+/// [`SIDE_CALL_BENCH_ACCOUNTS`] plain accounts. After persisted blocks and in-memory ancestors,
+/// each measured block changes two slots in a range both node 1 (a side call) and an owner of
+/// the account shard (a main call) hold. Run in release mode with
+/// `cargo test --release -p base-execution-cluster side_call_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "benchmark: run in release mode with --ignored --nocapture"]
+fn side_call_cost() {
+    let slots = bench_var(SIDE_CALL_BENCH_SLOTS_VAR, SIDE_CALL_BENCH_SLOTS);
+    let accounts = bench_var(SIDE_CALL_BENCH_ACCOUNTS_VAR, SIDE_CALL_BENCH_ACCOUNTS);
+    let mut rng = rng(0x51de);
+    let side_view = cluster_view(1, &[]);
+    let account_shard = foreign_shard_ending_its_nibble(&side_view);
+    let main_id = (2..=STORING_NODES)
+        .find(|id| cluster_view(*id, &[]).owns(account_shard))
+        .expect("an owner of the account shard");
+    let main_view = cluster_view(main_id, &[]);
+    let common_range = Shard::all()
+        .find(|shard| side_view.owns(*shard) && main_view.owns(*shard))
+        .expect("a range both nodes hold");
+    let contract = random_key(&mut rng, Some(account_shard.0));
+    let split = [contract];
+
+    let started = std::time::Instant::now();
+    let mut model = Model::default();
+    let initial = side_call_genesis(&mut rng, &mut model, contract, accounts, slots);
+    println!("genesis of {accounts} accounts and {slots} slots in {:.2?}", started.elapsed());
+    let started = std::time::Instant::now();
+    let side = SliceNode::start(1, &split, &initial, true);
+    let main = SliceNode::start(main_id, &split, &initial, true);
+    println!("nodes 1 and {main_id} started and shed in {:.2?}", started.elapsed());
+
+    let empty = (TrieUpdates::default(), HashedPostState::default());
+    let mut ancestors = [empty.clone(), empty];
+    for number in 1..=SIDE_CALL_BENCH_PERSISTED + SIDE_CALL_BENCH_ANCESTORS {
+        let state = bench_block(&mut rng, &mut model, contract, 100);
+        for (node, ancestors) in [&side, &main].into_iter().zip(&mut ancestors) {
+            let trie = node.compute_clustered(&state, ancestors);
+            if number <= SIDE_CALL_BENCH_PERSISTED {
+                node.persist(&[(state.clone(), trie)]);
+            } else {
+                ancestors.0.extend(trie);
+                ancestors.1.extend(state.clone());
+            }
+        }
+    }
+
+    for _ in 0..SIDE_CALL_BENCH_MEASURED {
+        let state = slots_block(&mut rng, contract, common_range, 2);
+        let mut elapsed = Vec::new();
+        for (node, ancestors) in [&side, &main].into_iter().zip(&ancestors) {
+            let started = std::time::Instant::now();
+            let trie = node.compute_clustered(&state, ancestors);
+            elapsed.push(started.elapsed());
+            assert!(trie.storage_tries.contains_key(&contract));
+        }
+        println!("side call {:.2?}, main call {:.2?}", elapsed[0], elapsed[1]);
+    }
 }

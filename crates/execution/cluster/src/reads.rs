@@ -5,6 +5,7 @@
 use std::{mem, sync::Arc};
 
 use alloy_primitives::B256;
+use alloy_trie::TrieMask;
 use reth_db::{
     DatabaseError,
     common::{PairResult, ValueOnlyResult},
@@ -12,6 +13,7 @@ use reth_db::{
     mdbx::{TransactionKind, cursor::Cursor},
     table::{Compress, Decode, Decompress, DupSort, Encode, IntoVec, Table, TableRow},
 };
+use reth_trie_common::BranchNodeCompact;
 
 use crate::{
     ClusterNode, KeyPlacement, LocalReads, ReadSnapshot, Shard, ShardedTable, SplitCursor,
@@ -243,6 +245,37 @@ impl<K: TransactionKind> ShardedReads<K> {
         Ok(place == RowPlace::Held)
     }
 
+    /// `value` of the visible row at encoded `key` as this node shows it: a replicated
+    /// one-nibble account-trie node claims stored children (tree-mask bits) only in shards this
+    /// node owns, as in a database holding only the visible rows. A stored child that a tree bit
+    /// claims but the filter hides breaks reth's trie walker: seeking it, the walker takes the
+    /// next visible node, under the next nibble, for a descendant and skips that whole nibble,
+    /// hashing every account under it from the leaves. Hashes and the other masks are kept, so
+    /// a hidden child is still skipped by its hash.
+    fn shown<T: Table>(&self, key: &[u8], value: T::Value) -> Result<T::Value, DatabaseError> {
+        if self.table != ShardedTable::AccountsTrie
+            || ShardedTable::packed_path_nibbles(key) != Some(1)
+        {
+            return Ok(value);
+        }
+        let mut encoded = Vec::new();
+        value.compress_to_buf(&mut encoded);
+        let mut node = BranchNodeCompact::decompress(&encoded)?;
+        let nibble = key[0] >> 4;
+        let owned_children = (0..16u8)
+            .filter(|child| self.owns(Shard((nibble << 4) | child)))
+            .fold(TrieMask::default(), |mask, child| mask | TrieMask::from_nibble(child));
+        node.tree_mask &= owned_children;
+        encoded.clear();
+        node.compress_to_buf(&mut encoded);
+        Ok(T::Value::decompress(&encoded)?)
+    }
+
+    /// [`Self::shown`] of a visible row read at encoded `key`.
+    fn shown_row<T: Table>(&self, key: &[u8], row: Option<TableRow<T>>) -> PairResult<T> {
+        row.map(|(key_value, value)| Ok((key_value, self.shown::<T>(key, value)?))).transpose()
+    }
+
     /// A point read of encoded `key` of a non-duplicate table.
     pub fn point(&self, key: &[u8]) -> Result<PointRead, DatabaseError> {
         let mode = self.mode();
@@ -332,6 +365,7 @@ impl<K: TransactionKind> ShardedReads<K> {
                     if remote {
                         self.require_owned(start, Shard(encoded[0]))?;
                     }
+                    let value = self.shown::<T>(&encoded, value)?;
                     self.position = CursorPosition::Local { key: encoded, subkey: None };
                     return Ok(Some((key, value)));
                 }
@@ -394,12 +428,15 @@ impl<K: TransactionKind> ShardedReads<K> {
             position => position,
         };
         match position {
-            CursorPosition::Local { .. } => inner.current(),
+            CursorPosition::Local { key, .. } => self.shown_row::<T>(key, inner.current()?),
             CursorPosition::LocalSplit { key, value } | CursorPosition::Remote { key, value } => {
                 Self::decode::<T>(key, value).map(Some)
             }
             CursorPosition::Detached => match inner.current()? {
-                Some((key, value)) if self.visible::<T>(&key, &value)? => Ok(Some((key, value))),
+                Some((key, value)) if self.visible::<T>(&key, &value)? => {
+                    let value = self.shown::<T>(&Self::encode::<T>(&key), value)?;
+                    Ok(Some((key, value)))
+                }
                 _ => Ok(None),
             },
             CursorPosition::Unset | CursorPosition::Missed | CursorPosition::PastEnd { .. } => {
@@ -420,7 +457,7 @@ impl<K: TransactionKind> ShardedReads<K> {
         }
         match (self.place_key(&encoded)?, mode) {
             (RowPlace::Held, _) => {
-                let row = inner.seek_exact(key)?;
+                let row = self.shown_row::<T>(&encoded, inner.seek_exact(key)?)?;
                 Ok(self.settle_local(encoded, row))
             }
             (RowPlace::Foreign(_), ReadMode::Filtered) => {

@@ -24,7 +24,7 @@ use reth_db_api::{
     Database,
     cursor::{DbCursorRO, DbDupCursorRO},
     models::StorageSettings,
-    table::{Decode, Decompress, DupSort, Table, TableRow},
+    table::{Compress, Decode, Decompress, DupSort, Table, TableRow},
     tables::{self, RawDupSort, RawKey, RawTable, RawValue},
     transaction::{DbTx, DbTxMut},
 };
@@ -221,12 +221,38 @@ fn holds(cluster: &Cluster, table: ShardedTable, key: &[u8], value: &[u8]) -> bo
     cluster.holds(table, key, table.subkey_of(value).unwrap_or_default()) == Some(true)
 }
 
-/// The rows of `dump` `cluster`'s node holds: what it sees through a filtered read.
+/// Account-trie row `(key, value)` as `cluster`'s node reads it: a replicated one-nibble node
+/// claims stored children (tree-mask bits) only in shards the node owns.
+fn shown_account_node(cluster: &Cluster, key: &[u8], value: &[u8]) -> Vec<u8> {
+    if ShardedTable::packed_path_nibbles(key) != Some(1) {
+        return value.to_vec();
+    }
+    let mut node = BranchNodeCompact::decompress(value).unwrap();
+    let mut tree_mask = node.tree_mask.get();
+    for child in 0..16u8 {
+        if !cluster.owns(Shard((key[0] & 0xf0) | child)) {
+            tree_mask &= !(1 << child);
+        }
+    }
+    node.tree_mask = tree_mask.into();
+    let mut shown = Vec::new();
+    node.compress_to_buf(&mut shown);
+    shown
+}
+
+/// The rows of `dump` `cluster`'s node holds, as it sees them through a filtered read.
 fn visible(cluster: &Cluster, dump: &TableDump) -> TableDump {
     let rows = |table, map: &BTreeMap<Vec<u8>, Vec<u8>>| -> BTreeMap<_, _> {
         map.iter()
             .filter(|(key, value)| holds(cluster, table, key, value))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(key, value)| {
+                let value = if table == ShardedTable::AccountsTrie {
+                    shown_account_node(cluster, key, value)
+                } else {
+                    value.clone()
+                };
+                (key.clone(), value)
+            })
             .collect()
     };
     let duplicates = |table, map: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>| -> BTreeMap<_, _> {
