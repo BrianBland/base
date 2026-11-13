@@ -389,10 +389,11 @@ Rows on disk are either meaningful or don't-care:
   its shard's two-nibble node, since that leaf's storage root mixes in other nodes' ranges.
   Nothing may trust these values.
 
-Counters: blocks whose slice was computed, side computations and the time spent, in
-`ClusterNode::trie_slices`, the metrics `base_cluster_trie_slice_blocks` and
+Counters: blocks whose slice was computed, side computations and the time spent, and the time
+spent capturing subtree hashes for the state-root check (`capture_elapsed`, not part of
+`elapsed`), in `ClusterNode::trie_slices`, the metrics `base_cluster_trie_slice_blocks` and
 `base_cluster_trie_slice_side_calls`, and a `cluster trie slices` log line every 10 seconds in
-which a block was computed or a check skipped.
+which a block was computed or captured or a check skipped.
 
 ### Message-passer storage root
 
@@ -449,13 +450,15 @@ later. A shard's proof is taken again when `N` changed an account or storage in 
 the parent has no capture, and is carried otherwise. Everything served for `N` comes from this
 capture; nothing is recomputed from later data, so persisting later blocks never changes an
 answer. A failed capture is logged and never fails the block. Cost per block: no extra reads
-except one overlay read transaction (opened anyway when the slice changes), a multiproof per
-touched held shard with split contracts (one path from the root to each contract's leaf plus
-that contract's storage-root walk over its stored root node), and 16 + 16 per split contract
+except one overlay read transaction (opened anyway when the slice changes), at most one
+multiproof covering every touched held shard with split contracts (one path from the root to
+each such contract's leaf plus that contract's storage-root walk over its stored root node; its
+input, the block's slice trie updates and held post-state, is built once), and 16 + 16 per split
+contract
 node reads when seeding. Memory: about 128 shard values and 128 range values per split contract
 (33 bytes each plus map overhead) and a few proof nodes (at most 532 bytes each, about 6 per
-contract): roughly 10-20 KB per block, a few MB for the window. A node that stores nothing
-captures nothing.
+contract): roughly 10-20 KB per block, a few MB for the window. A node that stores nothing, or
+whose `root_check` is `"off"`, captures nothing.
 
 **Assembly** (`RootAssembly`, alloy-trie's node encoding): a split contract's storage root is the
 root branch over the 16 branch nodes of its 256 range values; a shard containing split contracts
@@ -492,7 +495,9 @@ and every subtree's `owner:value`. Then, by the config key `root_check`:
   refuses to start while that file exists (see
   [Operating requirements](#operating-requirements)); remove it after investigating.
 - `"log"`: only logs and counts.
-- `"off"`: the check does not run (captures are still kept and served to peers).
+- `"off"`: the check does not run, and the node captures nothing either, so it adds no work
+  to block insertion; peers that check find no capture from it and count its shards as unverified
+  unless another owner captured them.
 
 ## Operating requirements
 

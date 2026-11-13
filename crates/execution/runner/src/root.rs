@@ -4,7 +4,7 @@
 use std::{fmt, sync::Arc, time::Instant};
 
 use base_common_consensus::BasePrimitives;
-use base_execution_cluster::{CapturedBlock, ClusterNode, LocalReads};
+use base_execution_cluster::{CapturedBlock, ClusterNode, LocalReads, RootCheckMode};
 use reth_engine_tree::tree::state_root_strategy::{
     LazyHashedPostState, PreparedStateRootJob, StateRootJob, StateRootJobContext,
     StateRootJobOutcome, StateRootStrategy,
@@ -31,8 +31,9 @@ type BaseReceipt = <BasePrimitives as NodePrimitives>::Receipt;
 /// of the shards it holds, computed by reth's incremental root code over this node's database and
 /// in-memory ancestors with [`TrieSlice`](base_execution_cluster::TrieSlice) prefix sets, inside a
 /// [`LocalReads`] scope. Each block's subtree hashes are then captured for the state-root check
-/// ([`TrieHashCapture`](base_execution_cluster::TrieHashCapture)), which never fails the block. A
-/// node that stores nothing computes and captures nothing.
+/// ([`TrieHashCapture`](base_execution_cluster::TrieHashCapture)), which never fails the block and
+/// is skipped when the node's `root_check` is off. A node that stores nothing computes and
+/// captures nothing.
 pub struct ClusterStateRoot<P> {
     node: Arc<ClusterNode>,
     provider: P,
@@ -127,22 +128,26 @@ where
             self.node.trie_slice_stats().record_block(side_calls, started.elapsed());
             updates
         };
-        let captured = CapturedBlock {
-            number: block.number(),
-            hash: block.hash(),
-            parent_hash: block.header().parent_hash(),
-        };
-        let capture = self.node.trie_hash_capture();
-        let mut reads =
-            OverlayCaptureReads { provider: &provider, capture, state, updates: &updates };
-        if let Err(error) =
-            capture.capture(self.node.root_captures(), captured, state, &updates, &mut reads)
-        {
-            warn!(
-                block = captured.number,
-                error = %error,
-                "failed to capture trie hashes for the state root check"
-            );
+        if self.node.cluster().config().root_check.mode != RootCheckMode::Off {
+            let started = Instant::now();
+            let captured = CapturedBlock {
+                number: block.number(),
+                hash: block.hash(),
+                parent_hash: block.header().parent_hash(),
+            };
+            let capture = self.node.trie_hash_capture();
+            let mut reads =
+                OverlayCaptureReads { provider: &provider, capture, state, updates: &updates };
+            if let Err(error) =
+                capture.capture(self.node.root_captures(), captured, state, &updates, &mut reads)
+            {
+                warn!(
+                    block = captured.number,
+                    error = %error,
+                    "failed to capture trie hashes for the state root check"
+                );
+            }
+            self.node.trie_slice_stats().record_capture(started.elapsed());
         }
         Ok(StateRootJobOutcome::new(state_root, Arc::new(updates)))
     }

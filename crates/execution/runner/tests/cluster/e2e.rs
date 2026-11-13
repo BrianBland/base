@@ -15,8 +15,8 @@ use alloy_rpc_types_engine::PayloadStatusEnum;
 use base_common_rpc_types_engine::BaseExecutionPayloadEnvelopeV4;
 use base_execution_cluster::{
     CheckOutcome, CheckedBlock, Cluster, ClusterConfig, ClusterHashSource,
-    NodeConfig as ClusterNodeConfig, NodeId, OwnerCounts, RootCheckMode, RootCheckSchedule,
-    RootChecker, RootMismatchMarker, Shard, ShardHash,
+    NodeConfig as ClusterNodeConfig, NodeId, OwnerCounts, RootCheckConfig, RootCheckMode,
+    RootCheckSchedule, RootChecker, RootMismatchMarker, Shard, ShardHash,
 };
 use eyre::{Result, eyre};
 use reth_db::{
@@ -519,6 +519,32 @@ async fn a_node_waits_for_its_owners_and_never_marks_the_block_invalid() -> Resu
     assert_eq!(x.head().await?, chain.producer.head().await?);
 
     for node in [chain.producer, x, b, c] {
+        node.remove().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_with_the_root_check_off_captures_nothing() -> Result<()> {
+    base_node_runner::test_utils::init_silenced_tracing();
+    let chain_spec = chain_spec_with(256, 0, [])?;
+    let nodes = [ClusterNodeConfig { id: NodeId(1), address: free_address()?, storage: true }];
+    let off = ClusterConfig {
+        replication: 1,
+        root_check: RootCheckConfig { mode: RootCheckMode::Off, ..RootCheckConfig::default() },
+        ..cluster_config(1, &nodes)
+    };
+    let producer = TestNode::launch(&chain_spec, None).await?;
+    let node = TestNode::launch(&chain_spec, Some(off)).await?;
+    let mut chain = Chain { producer, blocks: Vec::new(), workload: Workload::default() };
+
+    chain.advance_to(3, &[&node]).await?;
+
+    let (head, number) = node.head().await?;
+    assert_eq!(number, 3);
+    assert!(node.cluster().root_captures().by_hash(head).is_none(), "block {number} captured");
+    assert!(node.cluster().trie_slices().capture_elapsed.is_zero());
+    for node in [chain.producer, node] {
         node.remove().await?;
     }
     Ok(())

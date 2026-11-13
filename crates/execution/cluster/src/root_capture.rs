@@ -213,7 +213,8 @@ impl TrieHashCapture {
     /// depth-1 nodes where `updates` rewrote or removed them, and otherwise from the parent's
     /// capture; without one, from the parent's stored nodes through `reads`. The proof of a held
     /// shard with split contracts is taken again when the block changed an account in it or the
-    /// parent has no capture, and otherwise carried.
+    /// parent has no capture, and otherwise carried; one multiproof of all such shards' split
+    /// contracts is taken per block and its nodes are split by shard.
     pub fn capture<R: CaptureReads>(
         &self,
         captures: &RootCaptures,
@@ -257,19 +258,25 @@ impl TrieHashCapture {
 
         let touched: BTreeSet<_> =
             state.accounts.keys().chain(state.storages.keys()).map(|key| Shard(key[0])).collect();
-        for (shard, contracts) in &self.split_shards {
-            if parent.is_some() && !touched.contains(shard) {
-                continue;
+        let refreshed: Vec<_> = self
+            .split_shards
+            .iter()
+            .filter(|(shard, _)| parent.is_none() || touched.contains(shard))
+            .collect();
+        if !refreshed.is_empty() {
+            let targets: Vec<_> =
+                refreshed.iter().flat_map(|(_, contracts)| contracts.iter().copied()).collect();
+            let mut by_shard: BTreeMap<Shard, Vec<(Nibbles, Bytes)>> = BTreeMap::new();
+            for (path, node) in reads.proof_nodes(&targets)? {
+                let (Some(high), Some(low)) = (path.get(0), path.get(1)) else { continue };
+                by_shard.entry(Shard((high << 4) | low)).or_default().push((path, node));
             }
-            let shard_path = Nibbles::from_nibbles([shard.0 >> 4, shard.0 & 0x0f]);
-            let mut nodes: Vec<_> = reads
-                .proof_nodes(contracts)?
-                .into_iter()
-                .filter(|(path, _)| path.starts_with(&shard_path))
-                .collect();
-            nodes.sort_unstable_by_key(|(path, _)| *path);
-            split_shards
-                .insert(*shard, Arc::new(SplitShardProof { contracts: contracts.clone(), nodes }));
+            for (shard, contracts) in refreshed {
+                let mut nodes = by_shard.remove(shard).unwrap_or_default();
+                nodes.sort_unstable_by_key(|(path, _)| *path);
+                let proof = SplitShardProof { contracts: contracts.clone(), nodes };
+                split_shards.insert(*shard, Arc::new(proof));
+            }
         }
 
         captures.insert(CapturedHashes { block, accounts, storages, split_shards });
@@ -364,6 +371,11 @@ mod tests {
 
     /// Node `node_id` of two storing nodes (`R = 1`) and a non-storing node 3.
     fn cluster(node_id: u64) -> Cluster {
+        cluster_splitting(node_id, &[])
+    }
+
+    /// Like [`cluster`], splitting the storage of the hashed addresses `split`.
+    fn cluster_splitting(node_id: u64, split: &[B256]) -> Cluster {
         let nodes = (1..=3)
             .map(|id| NodeConfig {
                 id: NodeId(id),
@@ -377,7 +389,10 @@ mod tests {
             retention_blocks: ClusterConfig::MIN_RETENTION_BLOCKS,
             nodes,
             apply_from: Vec::new(),
-            split_storage: Vec::new(),
+            split_storage: split
+                .iter()
+                .map(|hash| Bytes::copy_from_slice(hash.as_slice()))
+                .collect(),
             read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
             root_check: RootCheckConfig::default(),
         })
@@ -472,6 +487,90 @@ mod tests {
             carried.accounts.keys().collect::<Vec<_>>(),
             seeded.accounts.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// Parent nodes as [`CountingReads`] gives them, and proofs that hold, for each target, its
+    /// one- to three-nibble path nodes, counting the proofs taken.
+    #[derive(Default)]
+    struct ProofReads {
+        parents: CountingReads,
+        proofs: usize,
+    }
+
+    impl ProofReads {
+        fn path_node(target: B256, nibbles: usize) -> (Nibbles, Bytes) {
+            let path = Nibbles::unpack(target).slice(..nibbles);
+            (path, Bytes::from(vec![nibbles as u8, target[0]]))
+        }
+    }
+
+    impl CaptureReads for ProofReads {
+        type Error = Infallible;
+
+        fn parent_account_node(
+            &mut self,
+            path: Nibbles,
+        ) -> Result<Option<BranchNodeCompact>, Infallible> {
+            self.parents.parent_account_node(path)
+        }
+
+        fn parent_storage_node(
+            &mut self,
+            _contract: B256,
+            path: Nibbles,
+        ) -> Result<Option<BranchNodeCompact>, Infallible> {
+            self.parents.parent_account_node(path)
+        }
+
+        fn proof_nodes(&mut self, targets: &[B256]) -> Result<Vec<(Nibbles, Bytes)>, Infallible> {
+            self.proofs += 1;
+            Ok(targets
+                .iter()
+                .flat_map(|target| (1..=3).map(|nibbles| Self::path_node(*target, nibbles)))
+                .collect())
+        }
+    }
+
+    #[test]
+    fn one_proof_per_block_covers_every_refreshed_split_shard_and_is_split_by_shard() {
+        let held: Vec<_> = Shard::all().filter(|shard| cluster(1).owns(*shard)).take(2).collect();
+        let contracts: Vec<_> = held
+            .iter()
+            .map(|shard| {
+                let mut contract = B256::repeat_byte(0x5a);
+                contract.0[0] = shard.0;
+                contract
+            })
+            .collect();
+        let node = TrieHashCapture::new(&cluster_splitting(1, &contracts));
+        let captures = RootCaptures::default();
+        let mut reads = ProofReads::default();
+
+        node.capture(
+            &captures,
+            block(1),
+            &HashedPostState::default(),
+            &TrieUpdates::default(),
+            &mut reads,
+        )
+        .unwrap();
+
+        assert_eq!(reads.proofs, 1, "one multiproof for both split shards");
+        let captured = captures.get(1, hash(1, 1)).unwrap();
+        for (shard, contract) in held.iter().zip(&contracts) {
+            let proof = &captured.split_shards[shard];
+            assert_eq!(proof.contracts, vec![*contract]);
+            let expected: Vec<_> =
+                (2..=3).map(|nibbles| ProofReads::path_node(*contract, nibbles)).collect();
+            assert_eq!(proof.nodes, expected, "shard {shard:?} keeps only its own nodes");
+        }
+
+        let mut touched = HashedPostState::default();
+        touched.accounts.insert(contracts[0], None);
+        node.capture(&captures, block(2), &touched, &TrieUpdates::default(), &mut reads).unwrap();
+        assert_eq!(reads.proofs, 2, "a block touching one split shard takes one proof");
+        let carried = captures.get(2, hash(2, 1)).unwrap();
+        assert_eq!(carried.split_shards[&held[1]], captured.split_shards[&held[1]]);
     }
 
     #[test]
