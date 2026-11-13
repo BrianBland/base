@@ -100,6 +100,7 @@ pub(crate) fn cluster_splitting(node_id: u64, split: &[Address]) -> Arc<Cluster>
                 .map(|address| Bytes::copy_from_slice(address.as_slice()))
                 .collect(),
             read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
+            root_check: Default::default(),
         })
         .unwrap(),
     )

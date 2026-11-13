@@ -14,8 +14,9 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::{
-    ApplyFallback, Cluster, Frame, FrameError, KeyPlacement, NodeId, Query, ReadError, ReadResult,
-    RemoteReadStats, Request, Response, ServableRange, Shard, ShardedTable, SnapshotId,
+    ApplyFallback, BlockShardHashes, Cluster, Frame, FrameError, KeyPlacement, NodeId, Query,
+    ReadError, ReadResult, RemoteReadStats, Request, Response, ServableRange, Shard, ShardHash,
+    ShardedTable, SnapshotId,
 };
 
 /// Timeouts, retry budget, and pool size of a [`ClusterClient`].
@@ -195,6 +196,45 @@ impl ClusterClient {
         }
     }
 
+    /// The subtree hashes `node` captured for block `number` with hash `hash`, asked once.
+    pub fn shard_hashes(
+        &self,
+        node: NodeId,
+        number: u64,
+        hash: B256,
+    ) -> Result<BlockShardHashes, OwnerFailure> {
+        match self.ask(node, &Self::unsnapshotted(Query::ShardHashes { number, hash }))? {
+            Response::ShardHashes(hashes) => Ok(hashes),
+            _ => unreachable!("checked by ask"),
+        }
+    }
+
+    /// `node`'s hashes, at block `number` with hash `hash`, of its held account shards that
+    /// contain split contracts, recomputed with `storage_roots`, asked once.
+    pub fn split_shard_hashes(
+        &self,
+        node: NodeId,
+        number: u64,
+        hash: B256,
+        storage_roots: &[(B256, B256)],
+    ) -> Result<Vec<(Shard, ShardHash)>, OwnerFailure> {
+        let storage_roots = storage_roots.to_vec();
+        let query = Query::SplitShardHashes { number, hash, storage_roots };
+        match self.ask(node, &Self::unsnapshotted(query))? {
+            Response::SplitShardHashes(hashes) => Ok(hashes),
+            _ => unreachable!("checked by ask"),
+        }
+    }
+
+    /// A request of `query`, which ignores the snapshot and table.
+    const fn unsnapshotted(query: Query) -> Request {
+        Request {
+            snapshot: SnapshotId { number: 0, hash: None },
+            table: ShardedTable::HashedAccounts,
+            query,
+        }
+    }
+
     /// The encoded execution result of block `hash` from the first of the cluster's `apply_from`
     /// nodes that has it, asking them in order. One deadline, `budget` from now, bounds every
     /// connect, write and read across all of them, and an answer completed after it is a miss.
@@ -369,6 +409,8 @@ impl ClusterClient {
             ) | (Query::HasStorage { .. }, Response::HasStorage(_))
                 | (Query::Status, Response::Status(_))
                 | (Query::ExecutedBlock { .. }, Response::ExecutedBlock(_))
+                | (Query::ShardHashes { .. }, Response::ShardHashes(_))
+                | (Query::SplitShardHashes { .. }, Response::SplitShardHashes(_))
         );
         if expected { Ok(response) } else { Err(OwnerFailure::UnexpectedResponse) }
     }

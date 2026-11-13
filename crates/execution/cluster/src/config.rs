@@ -6,7 +6,7 @@ use alloy_primitives::{B256, Bytes, keccak256, map::B256Set};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{ClientOptions, KeyPlacement, NodeId, Shard, ShardMap, ShardedTable};
+use crate::{ClientOptions, KeyPlacement, NodeId, RootCheckConfig, Shard, ShardMap, ShardedTable};
 
 /// One node of the cluster as listed in the configuration file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +53,9 @@ pub struct ClusterConfig {
     /// requested block ([`ClientOptions::retry_for`]). May differ between nodes.
     #[serde(default = "ClusterConfig::default_read_retry_secs")]
     pub read_retry_secs: u64,
+    /// The state-root check: keys `root_check` and `root_check_warn_blocks`.
+    #[serde(flatten)]
+    pub root_check: RootCheckConfig,
 }
 
 impl ClusterConfig {
@@ -330,6 +333,17 @@ mod tests {
 
         let zero = THREE_NODES.replace("node_id = 3", "node_id = 3\nread_retry_secs = 0");
         assert!(matches!(parse(&zero), Err(ConfigError::ZeroReadRetry)));
+    }
+
+    #[test]
+    fn root_check_defaults_to_exit_and_is_configurable() {
+        assert_eq!(parse(THREE_NODES).unwrap().config().root_check, RootCheckConfig::default());
+        let configured = THREE_NODES.replace(
+            "node_id = 3",
+            "node_id = 3\nroot_check = \"log\"\nroot_check_warn_blocks = 9",
+        );
+        let root_check = parse(&configured).unwrap().config().root_check;
+        assert_eq!(root_check, RootCheckConfig { mode: crate::RootCheckMode::Log, warn_blocks: 9 });
     }
 
     #[test]

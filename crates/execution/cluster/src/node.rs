@@ -26,8 +26,8 @@ use tracing::{error, info, warn};
 use crate::{
     ApplyCounts, ApplyStats, ChangesetReader, ClientOptions, Cluster, ClusterClient,
     ExecutedBlocks, KeyPlacement, NodeId, OwnerServer, OwnerState, OwnerStates, OwnerStore,
-    OwnersNotReady, RemoteReadCounts, RemoteReadStats, Shard, ShardedTable, TrieSlice,
-    TrieSliceCounts, TrieSliceStats,
+    OwnersNotReady, RemoteReadCounts, RemoteReadStats, RootCaptures, Shard, ShardedTable,
+    TrieHashCapture, TrieSlice, TrieSliceCounts, TrieSliceStats,
 };
 
 /// Returns the hash of the canonical block with the given number, when known.
@@ -97,6 +97,8 @@ pub struct ClusterNode {
     apply_stats: Arc<ApplyStats>,
     trie_slice: TrieSlice,
     trie_slice_stats: Arc<TrieSliceStats>,
+    root_captures: Arc<RootCaptures>,
+    trie_hash_capture: TrieHashCapture,
 }
 
 impl fmt::Debug for ClusterNode {
@@ -129,8 +131,13 @@ impl ClusterNode {
             .spawn_logger(RemoteReadStats::LOG_INTERVAL)
             .map_err(ClusterStartError::StatsLogger)?;
         let executed_blocks = Arc::new(ExecutedBlocks::default());
-        let server =
-            OwnerServer::spawn(listener, Arc::clone(&owner_store), Arc::clone(&executed_blocks))?;
+        let root_captures = Arc::new(RootCaptures::default());
+        let server = OwnerServer::spawn_with_root_captures(
+            listener,
+            Arc::clone(&owner_store),
+            Arc::clone(&executed_blocks),
+            Arc::clone(&root_captures),
+        )?;
         let client = ClusterClient::new(Arc::clone(&cluster), options);
         client
             .remote_read_stats()
@@ -145,6 +152,7 @@ impl ClusterNode {
             .spawn_logger(TrieSliceStats::LOG_INTERVAL)
             .map_err(ClusterStartError::StatsLogger)?;
         let trie_slice = TrieSlice::new(Arc::clone(&cluster));
+        let trie_hash_capture = TrieHashCapture::new(&cluster);
         let owned = Shard::all().filter(|shard| cluster.owns(*shard)).count();
         info!(
             node_id = cluster.node_id().0,
@@ -165,6 +173,8 @@ impl ClusterNode {
             apply_stats,
             trie_slice,
             trie_slice_stats,
+            root_captures,
+            trie_hash_capture,
         })
     }
 
@@ -248,6 +258,16 @@ impl ClusterNode {
     /// This node's trie-slice work and skipped message-passer checks since it started.
     pub fn trie_slices(&self) -> TrieSliceCounts {
         self.trie_slice_stats.counts()
+    }
+
+    /// The subtree hashes this node captured for its recent blocks, for the state-root check.
+    pub const fn root_captures(&self) -> &Arc<RootCaptures> {
+        &self.root_captures
+    }
+
+    /// Builds each executed block's capture for the state-root check.
+    pub const fn trie_hash_capture(&self) -> &TrieHashCapture {
+        &self.trie_hash_capture
     }
 
     /// Installs the canonical block-hash lookup on the owner store. Only the first lookup

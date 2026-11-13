@@ -2,7 +2,9 @@
 //! maintained with reth's full incremental state root, and over simulated clustered nodes that
 //! keep only their slice with [`TrieSlice`] plans. After every block, every meaningful row a node
 //! holds must equal the reference row byte for byte, starting from replicated nodes whose foreign
-//! child hashes were overwritten with garbage.
+//! child hashes were overwritten with garbage. The same run checks the state-root check: every
+//! block's subtree hashes, captured by each node and combined across owners, must assemble to
+//! the reference state root.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11,16 +13,21 @@ use std::{
     sync::Arc,
 };
 
-use alloy_primitives::{B256, Bytes, U256, map::B256Map};
+use alloy_primitives::{
+    B256, Bytes, U256, keccak256,
+    map::{B256Map, B256Set},
+};
 use base_execution_cluster::{
-    ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, LocalReads, NodeConfig, NodeId,
-    Shard, TrieSlice,
+    BlockShardHashes, CaptureReads, CapturedBlock, CheckOutcome, CheckedBlock, ClientOptions,
+    Cluster, ClusterConfig, ClusteredDatabase, LocalReads, NodeConfig, NodeId, RootCaptures,
+    RootCheckMode, RootChecker, RootMismatchMarker, Shard, ShardHash, ShardHashSource, ShardSource,
+    SkipReason, SourceFailure, TrieHashCapture, TrieSlice,
 };
 use rand::{Rng, rngs::StdRng, seq::IndexedRandom};
 use reth_chainspec::MAINNET;
 use reth_db::{ClientVersion, DatabaseEnv, init_db, mdbx::DatabaseArguments};
 use reth_db_api::{
-    Database,
+    Database, DatabaseError,
     cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO},
     models::StorageSettings,
     tables,
@@ -33,11 +40,16 @@ use reth_provider::{
     test_utils::MockNodeTypesWithDB,
 };
 use reth_trie::{
-    BranchNodeCompact, HashedPostState, HashedStorage, Nibbles, PackedStorageTrieEntry,
-    PackedStoredNibbles, StateRoot, TrieInput, TrieInputSorted, updates::TrieUpdates,
+    BranchNodeCompact, HashedPostState, HashedStorage, MultiProofTargets, Nibbles,
+    PackedStorageTrieEntry, PackedStoredNibbles, StateRoot, TrieInput, TrieInputSorted,
+    prefix_set::TriePrefixSetsMut,
+    proof::Proof,
+    trie_cursor::{TrieCursor, TrieCursorFactory},
+    updates::TrieUpdates,
 };
 use reth_trie_db::{
-    DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, PackedKeyAdapter,
+    DatabaseHashedCursorFactory, DatabaseProof, DatabaseStateRoot, DatabaseTrieCursorFactory,
+    PackedKeyAdapter,
 };
 use tempfile::TempDir;
 
@@ -64,14 +76,19 @@ type DbStateRoot<'a, TX> = StateRoot<
     DatabaseHashedCursorFactory<&'a TX>,
 >;
 type NodeFactory = ProviderFactory<MockNodeTypesWithDB<ClusteredDatabase>>;
+type DbProof<'a, TX> =
+    Proof<DatabaseTrieCursorFactory<&'a TX, PackedKeyAdapter>, DatabaseHashedCursorFactory<&'a TX>>;
 
-/// Node `node_id` of four storing nodes, splitting `split`.
+/// The node that stores nothing and only verifies.
+const VERIFIER: u64 = STORING_NODES + 1;
+
+/// Node `node_id` of four storing nodes and the non-storing [`VERIFIER`], splitting `split`.
 fn cluster_view(node_id: u64, split: &[B256]) -> Arc<Cluster> {
-    let nodes = (1..=STORING_NODES)
+    let nodes = (1..=VERIFIER)
         .map(|id| NodeConfig {
             id: NodeId(id),
             address: format!("127.0.0.1:{}", 9100 + id).parse().unwrap(),
-            storage: true,
+            storage: id <= STORING_NODES,
         })
         .collect();
     Arc::new(
@@ -86,6 +103,7 @@ fn cluster_view(node_id: u64, split: &[B256]) -> Arc<Cluster> {
                 .map(|hash| Bytes::copy_from_slice(hash.as_slice()))
                 .collect(),
             read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
+            root_check: Default::default(),
         })
         .unwrap(),
     )
@@ -254,9 +272,65 @@ fn updates(state: HashedPostState, trie: TrieUpdates) -> BlockUpdates {
 
 /// The full root computation of `state` over `factory`'s database: the reference.
 fn full_root(factory: &TestFactory, state: &HashedPostState) -> TrieUpdates {
+    full_root_and_updates(factory, state).1
+}
+
+/// The reference state root and trie updates of `state` over `factory`'s database.
+fn full_root_and_updates(factory: &TestFactory, state: &HashedPostState) -> (B256, TrieUpdates) {
     let tx = snapshot(factory);
     let input = TrieInputSorted::from_state(state.clone().into_sorted());
-    DbStateRoot::overlay_root_from_nodes_with_updates(&tx, input).unwrap().1
+    DbStateRoot::overlay_root_from_nodes_with_updates(&tx, input).unwrap()
+}
+
+/// The hash of simulated block `number`.
+fn block_hash(number: u64) -> B256 {
+    keccak256(number.to_be_bytes())
+}
+
+/// Capture reads over a node's database at the parent block, as the engine's overlay provider
+/// gives them: stored nodes as they are, and proofs with the block's held post-state and trie
+/// updates layered on top.
+struct DbCaptureReads<'a, TX> {
+    tx: &'a TX,
+    capture: &'a TrieHashCapture,
+    state: &'a HashedPostState,
+    updates: &'a TrieUpdates,
+}
+
+impl<TX: DbTx> CaptureReads for DbCaptureReads<'_, TX> {
+    type Error = DatabaseError;
+
+    fn parent_account_node(
+        &mut self,
+        path: Nibbles,
+    ) -> Result<Option<BranchNodeCompact>, DatabaseError> {
+        let factory = DatabaseTrieCursorFactory::<_, PackedKeyAdapter>::new(self.tx);
+        Ok(factory.account_trie_cursor()?.seek_exact(path)?.map(|(_, node)| node))
+    }
+
+    fn parent_storage_node(
+        &mut self,
+        contract: B256,
+        path: Nibbles,
+    ) -> Result<Option<BranchNodeCompact>, DatabaseError> {
+        let factory = DatabaseTrieCursorFactory::<_, PackedKeyAdapter>::new(self.tx);
+        Ok(factory.storage_trie_cursor(contract)?.seek_exact(path)?.map(|(_, node)| node))
+    }
+
+    fn proof_nodes(&mut self, targets: &[B256]) -> Result<Vec<(Nibbles, Bytes)>, DatabaseError> {
+        let input = TrieInput::new(
+            self.updates.clone(),
+            self.capture.held_state(self.state),
+            TriePrefixSetsMut::default(),
+        );
+        let targets = MultiProofTargets::from_iter(
+            targets.iter().map(|target| (*target, B256Set::default())),
+        );
+        let proof = DbProof::from_tx(self.tx)
+            .overlay_multiproof(input, targets)
+            .map_err(|error| DatabaseError::Other(error.to_string()))?;
+        Ok(proof.account_subtree.into_inner().into_iter().collect())
+    }
 }
 
 /// A simulated clustered node: its MDBX holds only its rows; it computes from that MDBX directly,
@@ -265,6 +339,8 @@ fn full_root(factory: &TestFactory, state: &HashedPostState) -> TrieUpdates {
 struct SliceNode {
     cluster: Arc<Cluster>,
     slice: TrieSlice,
+    capture: TrieHashCapture,
+    captures: RootCaptures,
     env: DatabaseEnv,
     factory: NodeFactory,
     db: ClusteredDatabase,
@@ -298,11 +374,14 @@ impl SliceNode {
         }
         let factory = node_factory(db.clone(), &dir.path().join("node"));
         let slice = TrieSlice::new(Arc::clone(&cluster));
-        Self { cluster, slice, env, factory, db, _dir: dir }
+        let capture = TrieHashCapture::new(&cluster);
+        let captures = RootCaptures::default();
+        Self { cluster, slice, capture, captures, env, factory, db, _dir: dir }
     }
 
-    /// Computes and persists this node's slice of a block with hashed post-state `state`.
-    fn apply(&self, state: &HashedPostState) {
+    /// Computes, captures and persists this node's slice of block `number` with hashed
+    /// post-state `state`.
+    fn apply(&self, number: u64, state: &HashedPostState) {
         let plan = self.slice.plan(state).unwrap();
         let tx = self.env.tx().unwrap();
         let trie = plan
@@ -314,6 +393,10 @@ impl SliceNode {
                 .map(|(_, updates)| updates)
             })
             .unwrap();
+        let block =
+            CapturedBlock { number, hash: block_hash(number), parent_hash: block_hash(number - 1) };
+        let mut reads = DbCaptureReads { tx: &tx, capture: &self.capture, state, updates: &trie };
+        self.capture.capture(&self.captures, block, state, &trie, &mut reads).unwrap();
         drop(tx);
         let block = updates(state.clone(), trie);
         let provider = self.factory.provider_rw().unwrap();
@@ -618,7 +701,7 @@ fn held_trie_rows_match_a_full_node_after_every_block() {
         let trie = full_root(&reference, &state);
         write(&reference, &updates(state.clone(), trie));
         for node in &nodes {
-            node.apply(&state);
+            node.apply(number, &state);
             let expected = node.meaningful(&snapshot(&reference), &split);
             let actual = node.meaningful(&node.env.tx().unwrap(), &split);
             assert_eq!(
@@ -771,4 +854,253 @@ fn held_trie_rows_match_through_the_clustered_database_with_leftovers_and_ancest
             assert_eq!(actual.held_children, expected.held_children, "block {number}: node {id:?}");
         }
     }
+}
+
+/// Blocks of the state-root check runs.
+const CHECKED_BLOCKS: u64 = 6;
+
+/// Owners' captures as a verifier reaches them, without the network. A node mapped to `None` is
+/// unreachable.
+struct InProcess<'a> {
+    nodes: BTreeMap<NodeId, Option<&'a RootCaptures>>,
+}
+
+impl<'a> InProcess<'a> {
+    fn of(nodes: &'a [SliceNode]) -> Self {
+        Self {
+            nodes: nodes
+                .iter()
+                .map(|node| (node.cluster.node_id(), Some(&node.captures)))
+                .collect(),
+        }
+    }
+
+    fn captures(&self, owner: NodeId) -> Result<&'a RootCaptures, SourceFailure> {
+        self.nodes.get(&owner).copied().flatten().ok_or(SourceFailure::Unreachable)
+    }
+}
+
+impl ShardHashSource for InProcess<'_> {
+    fn shard_hashes(
+        &self,
+        owner: NodeId,
+        number: u64,
+        hash: B256,
+    ) -> Result<BlockShardHashes, SourceFailure> {
+        let capture = self.captures(owner)?.get(number, hash).ok_or(SourceFailure::NotAvailable)?;
+        Ok(capture.shard_hashes())
+    }
+
+    fn split_shard_hashes(
+        &self,
+        owner: NodeId,
+        number: u64,
+        hash: B256,
+        storage_roots: &[(B256, B256)],
+    ) -> Result<Vec<(Shard, ShardHash)>, SourceFailure> {
+        let capture = self.captures(owner)?.get(number, hash).ok_or(SourceFailure::NotAvailable)?;
+        Ok(capture.split_shard_hashes(&storage_roots.iter().copied().collect()))
+    }
+}
+
+/// A run of [`CHECKED_BLOCKS`] blocks over four poisoned storing nodes and the reference; the
+/// last block is quiet.
+struct RootRun {
+    split: [B256; 2],
+    nodes: Vec<SliceNode>,
+    /// The reference header of every block, by number - 1.
+    headers: Vec<CheckedBlock>,
+}
+
+impl RootRun {
+    /// Runs the blocks; `after_block` sees the run after each one. Every block also creates an
+    /// account in each split contract's account shard, a sibling of its leaf.
+    fn run(seed: u64, mut after_block: impl FnMut(&Self, u64)) -> Self {
+        let mut rng = rng(seed);
+        let mut model = Model::default();
+        let (genesis_state, universe) = genesis(&mut rng, &mut model);
+        let split = universe.split;
+        let reference = factory();
+        let genesis_trie = full_root(&reference, &genesis_state);
+        let initial = updates(genesis_state, genesis_trie);
+        write(&reference, &initial);
+        let nodes: Vec<_> =
+            (1..=STORING_NODES).map(|id| SliceNode::start(id, &split, &initial, true)).collect();
+        for node in &nodes {
+            node.poison(&split);
+        }
+        let mut run = Self { split, nodes, headers: Vec::new() };
+        for number in 1..=CHECKED_BLOCKS {
+            let mut state = if number == CHECKED_BLOCKS {
+                Self::quiet_block(&mut rng, &mut model, split[0])
+            } else {
+                block(&mut rng, &mut model, &universe, number)
+            };
+            for contract in split {
+                let sibling = random_key(&mut rng, Some(contract[0]));
+                state.accounts.insert(sibling, Some(random_account(&mut rng)));
+            }
+            let (state_root, trie) = full_root_and_updates(&reference, &state);
+            write(&reference, &updates(state.clone(), trie));
+            for node in &run.nodes {
+                node.apply(number, &state);
+            }
+            run.headers.push(CheckedBlock { number, hash: block_hash(number), state_root });
+            after_block(&run, number);
+        }
+        run
+    }
+
+    /// A block that changes one slot of `contract` and, with the split contracts' siblings, few
+    /// account shards: most subtree hashes must be carried from the parent's capture.
+    fn quiet_block(rng: &mut StdRng, model: &mut Model, contract: B256) -> HashedPostState {
+        HashedPostState {
+            accounts: B256Map::default(),
+            storages: B256Map::from_iter([(contract, model.slot_changes(rng, contract, 1))]),
+        }
+    }
+
+    fn header(&self, number: u64) -> CheckedBlock {
+        self.headers[number as usize - 1]
+    }
+
+    fn check(&self, view: u64, source: &InProcess<'_>, number: u64) -> CheckOutcome {
+        let cluster = cluster_view(view, &self.split);
+        RootChecker::new(&cluster, source).check(self.header(number))
+    }
+
+    fn node(&self, id: NodeId) -> &SliceNode {
+        self.nodes.iter().find(|node| node.cluster.node_id() == id).unwrap()
+    }
+}
+
+#[test]
+fn captured_hashes_combined_across_owners_verify_every_block_and_stay_pinned() {
+    const PINNED: u64 = 2;
+    let mut pinned_answers = None;
+    let run = RootRun::run(0x2007, |run, number| {
+        let source = InProcess::of(&run.nodes);
+        for view in [VERIFIER, 1] {
+            assert_eq!(
+                run.check(view, &source, number),
+                CheckOutcome::Verified,
+                "block {number} from node {view}'s view"
+            );
+        }
+        if number == PINNED {
+            pinned_answers = Some(answers(run, PINNED));
+        }
+    });
+
+    let split_shards: Vec<_> = run.split.iter().map(|contract| Shard(contract[0])).collect();
+    for contract in run.split {
+        let holders = run.nodes.iter().filter(|node| node.cluster.owns(Shard(contract[0])));
+        assert!(holders.clone().count() == 2 && holders.count() < run.nodes.len());
+    }
+    assert_eq!(
+        answers(&run, PINNED),
+        pinned_answers.unwrap(),
+        "answers for block {PINNED} changed after the nodes persisted later blocks"
+    );
+    let source = InProcess::of(&run.nodes);
+    for number in 1..=CHECKED_BLOCKS {
+        assert_eq!(run.check(VERIFIER, &source, number), CheckOutcome::Verified, "block {number}");
+    }
+    assert!(split_shards.iter().all(|shard| run.nodes.iter().any(|node| {
+        node.captures.get(PINNED, block_hash(PINNED)).unwrap().split_shards.contains_key(shard)
+    })));
+}
+
+/// Every node's answers for block `number`: its captured hashes and its recomputed split shards
+/// with the reference storage roots it would be sent.
+fn answers(run: &RootRun, number: u64) -> Vec<(BlockShardHashes, Vec<(Shard, ShardHash)>)> {
+    let roots = B256Map::from_iter(run.split.map(|contract| (contract, B256::repeat_byte(7))));
+    run.nodes
+        .iter()
+        .map(|node| {
+            let capture = node.captures.get(number, block_hash(number)).unwrap();
+            (capture.shard_hashes(), capture.split_shard_hashes(&roots))
+        })
+        .collect()
+}
+
+#[test]
+fn a_flipped_captured_hash_is_a_mismatch_naming_its_shard_and_owner() {
+    let run = RootRun::run(0xbad, |_, _| {});
+    let number = CHECKED_BLOCKS;
+    let verifier = cluster_view(VERIFIER, &run.split);
+    let shard = Shard::all()
+        .find(|shard| !run.split.iter().any(|contract| contract[0] == shard.0))
+        .unwrap();
+    let owner = verifier.owners(shard)[0];
+    let node = run.node(owner);
+    let mut corrupt = (*node.captures.get(number, block_hash(number)).unwrap()).clone();
+    let flipped = ShardHash::Hash(B256::repeat_byte(0x99));
+    assert_ne!(corrupt.accounts.insert(shard, flipped), Some(flipped));
+    node.captures.insert(corrupt);
+
+    let outcome = run.check(VERIFIER, &InProcess::of(&run.nodes), number);
+
+    let CheckOutcome::Mismatch(mismatch) = outcome else {
+        panic!("expected a mismatch: {outcome:?}")
+    };
+    assert_eq!(mismatch.block, run.header(number));
+    assert!(
+        mismatch.sources.contains(&ShardSource { contract: None, shard, owner, value: flipped }),
+        "the mismatch names shard {shard:?} and owner {owner:?}"
+    );
+    let datadir = tempfile::tempdir().unwrap();
+    assert!(RootCheckMode::Exit.on_mismatch(&mismatch, datadir.path()));
+    assert!(RootMismatchMarker::ensure_absent(datadir.path()).is_err(), "start-up is refused");
+    assert_eq!(
+        run.check(VERIFIER, &InProcess::of(&run.nodes), number - 1),
+        CheckOutcome::Verified,
+        "other blocks are unaffected"
+    );
+}
+
+#[test]
+fn owners_without_a_capture_are_passed_over_and_a_block_without_any_is_skipped() {
+    let run = RootRun::run(0x5c1b, |_, _| {});
+    let number = CHECKED_BLOCKS;
+    let restarted = RootCaptures::default();
+    let (first, second) = (NodeId(1), NodeId(2));
+    let verifier = cluster_view(VERIFIER, &run.split);
+    assert!(Shard::all().any(|shard| {
+        let owners = verifier.owners(shard);
+        owners.contains(&first) && owners.contains(&second)
+    }));
+
+    let mut one_restarted = InProcess::of(&run.nodes);
+    one_restarted.nodes.insert(first, Some(&restarted));
+    assert_eq!(run.check(VERIFIER, &one_restarted, number), CheckOutcome::Verified);
+    assert_eq!(run.check(1, &one_restarted, number), CheckOutcome::Verified);
+
+    let mut one_unreachable = InProcess::of(&run.nodes);
+    one_unreachable.nodes.insert(first, None);
+    assert_eq!(run.check(VERIFIER, &one_unreachable, number), CheckOutcome::Verified);
+
+    let mut both_restarted = InProcess::of(&run.nodes);
+    both_restarted.nodes.insert(first, Some(&restarted));
+    both_restarted.nodes.insert(second, Some(&restarted));
+    assert_eq!(
+        run.check(VERIFIER, &both_restarted, number),
+        CheckOutcome::Skipped(SkipReason::NotAvailable)
+    );
+
+    let mut both_unreachable = InProcess::of(&run.nodes);
+    both_unreachable.nodes.insert(first, None);
+    both_unreachable.nodes.insert(second, None);
+    assert_eq!(
+        run.check(VERIFIER, &both_unreachable, number),
+        CheckOutcome::Skipped(SkipReason::Unreachable)
+    );
+
+    let other_fork = CheckedBlock { hash: B256::repeat_byte(0x0f), ..run.header(number) };
+    let cluster = cluster_view(VERIFIER, &run.split);
+    assert_eq!(
+        RootChecker::new(&cluster, &InProcess::of(&run.nodes)).check(other_fork),
+        CheckOutcome::Skipped(SkipReason::NotAvailable),
+        "a different block at the same number is not available"
+    );
 }

@@ -519,7 +519,9 @@ impl<DB: Database> OwnerStore<DB> {
             Query::Get { .. }
             | Query::SeekGe { .. }
             | Query::SeekDupGe { .. }
-            | Query::ExecutedBlock { .. } => Err(ReadError::Unsupported.into()),
+            | Query::ExecutedBlock { .. }
+            | Query::ShardHashes { .. }
+            | Query::SplitShardHashes { .. } => Err(ReadError::Unsupported.into()),
             Query::Status => Ok(Some(Response::Status(self.servable()))),
             Query::AccountValue { address } => {
                 Self::check_table(request, ShardedTable::HashedAccounts)?;

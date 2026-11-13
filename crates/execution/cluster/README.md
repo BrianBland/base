@@ -60,6 +60,8 @@ retention_blocks = 30000  # W, optional, default 30000; the same on every node
 apply_from = [2]     # optional, default [] (execute); only on a node with storage = false
 split_storage = ["0x4200000000000000000000000000000000000016"]  # optional, default []
 read_retry_secs = 60 # optional, default 60; see Read rule
+root_check = "exit" # optional, "exit" | "log" | "off"; see State-root check
+root_check_warn_blocks = 300 # optional, default 300
 
 [[nodes]]
 id = 1
@@ -357,11 +359,13 @@ Keys and values travel as the encoded table bytes MDBX stores.
 | `Status` | the owner's servable range of state reads, or none |
 | `Get { table: Bytecodes, key }` | the bytecode, or absent |
 | `ExecutedBlock { hash }` (see [Apply mode](#apply-mode)) | the block's encoded execution result |
+| `ShardHashes { number, hash }` (see [State-root check](#state-root-check)) | the block's captured subtree hashes |
+| `SplitShardHashes { number, hash, storage_roots }` | the block's held split-contract shards, recomputed |
 
 Every request carries the snapshot `P` and a table (`HashedAccounts` or `HashedStorages` for the
-exact reads; ignored by `Status` and `ExecutedBlock`). Errors: `SnapshotUnavailable` (with the
-range the owner can serve), `WrongFork`, `NotOwner`, `Unsupported`, and `NotAvailable` for
-`ExecutedBlock`. The new requests and responses are appended to the end of the enums, so the
+exact reads; ignored by `Status`, `ExecutedBlock` and the two hash requests). Errors:
+`SnapshotUnavailable` (with the range the owner can serve), `WrongFork`, `NotOwner`,
+`Unsupported`, and `NotAvailable` for `ExecutedBlock` and the hash requests. The new requests and responses are appended to the end of the enums, so the
 encoding of the older ones is unchanged; an owner refuses the older ordered and trie requests
 (`Get` of a table other than `Bytecodes`, `SeekGe`, `SeekDupGe`) with `Unsupported`, so a node of
 the previous version fails loudly. Mixed versions are not supported: upgrade every node together.
@@ -596,8 +600,9 @@ the slice's trie updates; persistence then writes them through the [write rule](
 
 **The header's state root is not verified when a block is inserted.** Execution, receipts root,
 logs bloom, gas and the other header checks are unchanged; a block whose state root is wrong is
-accepted. Detecting a bad state transition is the job of a separate check that compares the
-header with hashes collected from the shards' owners (not built yet).
+accepted. Detecting a bad state transition is the job of the background
+[state-root check](#state-root-check), which compares the header with hashes collected from the
+shards' owners while they are in sync.
 
 Per block, `TrieSlice::plan` turns the block's hashed post-state into one main computation and
 zero or more side computations (`TrieSlicePlan`):
@@ -660,6 +665,81 @@ start-up whether it checks this root.
   full state root over don't-care rows, so payload attributes are refused (see
   [Operating requirements](#operating-requirements)).
 - `--debug.skip-state-root` is refused: the node already uses its own state-root strategy.
+
+## State-root check
+
+A background integrity check, run by every clustered node (a node that stores nothing checks
+too, through its peers), that recent blocks' state roots add up. **What is verified:** for a
+block `N`, the trie hashes the storing nodes computed for `N`, combined across owners, equal the
+header's state root. **What is not verified:** stored values are not re-read (a value written
+wrongly but hashed correctly goes unnoticed until a later block hashes it); one owner per subtree
+is asked, so a corrupt replica that was not asked is not detected; blocks are checked only while
+every needed owner still holds them in memory (about ten minutes), so a node far behind its
+peers, or a cluster catching up, checks nothing; and nothing is checked at insertion: a block
+with a wrong state root is accepted and detected afterwards, if at all, by this check.
+
+**Capture.** When the state-root strategy finishes block `N` (see
+[Trie maintenance](#trie-maintenance)), a storing node keeps, for the last
+`RootCaptures::WINDOW_BLOCKS` (300) blocks it executed, by block hash (`TrieHashCapture`):
+
+- for each held account shard `[x, y]` that contains no split contract: child `y` of
+  account-trie node `[x]`, as one of empty, a hash (the child is a branch node whose hash is
+  stored: its `hash_mask` bit), or not-a-hashed-branch;
+- for each split contract and held range `[a, b]`: the same from its storage-trie node `[a]`;
+- for each held account shard containing split contracts: the proof nodes of paths of two or
+  more nibbles from reth's multiproof (over the engine's overlay provider for `N`'s parent with
+  `N`'s held post-state and trie updates layered on top) of those contracts, which contain their
+  leaves with nonce, balance and code hash at `N`.
+
+Shard and range values come from `N`'s own depth-1 nodes where `N`'s trie updates rewrote or
+removed them, otherwise from the parent's capture. When the parent has no capture (the first
+block after start-up, a block after a failed capture, a fork from an uncaptured block), they are
+read from the parent's depth-1 nodes through the overlay provider, which shows that parent's
+state exactly (database plus in-memory ancestors), so there is no unknown state to re-seed from
+later. A shard's proof is taken again when `N` changed an account or storage in that shard, or
+the parent has no capture, and is carried otherwise. Everything served for `N` comes from this
+capture; nothing is recomputed from later data, so persisting later blocks never changes an
+answer. A failed capture is logged and never fails the block. Cost per block: no extra reads
+except one overlay read transaction (opened anyway when the slice changes), a multiproof per
+touched held shard with split contracts (one path from the root to each contract's leaf plus
+that contract's storage-root walk over its stored root node), and 16 + 16 per split contract
+node reads when seeding. Memory: about 128 shard values and 128 range values per split contract
+(33 bytes each plus map overhead) and a few proof nodes (at most 532 bytes each, about 6 per
+contract): roughly 10-20 KB per block, a few MB for the window. A node that stores nothing
+captures nothing.
+
+**Assembly** (`RootAssembly`, alloy-trie's node encoding): a split contract's storage root is the
+root branch over the 16 branch nodes of its 256 range values; a shard containing split contracts
+is recomputed by its owner by re-encoding the captured proof nodes bottom-up with each contract's
+leaf carrying the supplied storage root (nodes shared by two contracts are rebuilt once); the
+state root is the root branch over the 16 branch nodes of the 256 shard values. Empty children
+encode as empty; a not-a-hashed-branch value, or a top branch node left with fewer than two
+children, makes the block unverifiable (skipped), never wrong.
+
+**Verifier** (`RootChecker`, `RootCheckSchedule`; started by `RootCheckTask` in
+`base-node-runner`): every 500 ms, at most one block at a time, 2 blocks behind the canonical
+head and never more than 32 further behind. Round 1 asks owners for `ShardHashes` (this node
+first when it owns the subtree, then the others in placement order, falling to the next on "not
+available" or unreachable) and computes each split contract's storage root; round 2 asks the
+owners of shards containing split contracts for `SplitShardHashes` with those roots; then it
+assembles the state root and compares it with the header. An owner answers only for the exact
+`(number, hash)` it captured. A block some subtree of which no owner can supply is retried for
+20 s, then skipped; an unverifiable block is skipped at once.
+
+Signals: counters verified, skipped (`not_available`, `unverifiable`, `unreachable`) and
+mismatched, the last verified block and head minus last verified, in metrics
+`base_cluster_root_check_*` and a `cluster state root checks` log line every 10 seconds; a
+warning `cluster state root not verified for many blocks` at most every 60 s once
+`root_check_warn_blocks` (default 300) blocks pass unverified.
+
+**Mismatch:** an error `cluster state root mismatch` with the block, header root, assembled root
+and every subtree's `owner:value`. Then, by the config key `root_check`:
+
+- `"exit"` (default): writes `cluster-root-mismatch` in the datadir and exits the process with
+  code 3. A clustered node refuses to start while that file exists; remove it after
+  investigating.
+- `"log"`: only logs and counts.
+- `"off"`: the check does not run (captures are still kept and served to peers).
 
 ## Design record
 

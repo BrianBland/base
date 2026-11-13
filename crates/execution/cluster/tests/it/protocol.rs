@@ -8,10 +8,10 @@ use std::{
 
 use alloy_primitives::{B256, Bytes, keccak256};
 use base_execution_cluster::{
-    ApplyFallback, ClientError, ClientOptions, Cluster, ClusterClient, ClusterConfig,
-    ExecutedBlocks, Frame, NodeConfig, NodeId, OwnerFailure, OwnerServer, OwnerStore, Query,
-    ReadError, ReadResult, Request, Response, ServableRange, Shard, ShardedTable, SnapshotId,
-    StoreError,
+    ApplyFallback, CapturedBlock, CapturedHashes, ClientError, ClientOptions, Cluster,
+    ClusterClient, ClusterConfig, ExecutedBlocks, Frame, NodeConfig, NodeId, OwnerFailure,
+    OwnerServer, OwnerStore, Query, ReadError, ReadResult, Request, Response, RootCaptures,
+    ServableRange, Shard, ShardHash, ShardedTable, SnapshotId, SplitShardProof, StoreError,
 };
 use reth_db::test_utils::create_test_rw_db;
 use reth_db_api::{table::Compress, tables, transaction::DbTxMut};
@@ -44,6 +44,7 @@ fn cluster_of(
             apply_from: Vec::new(),
             split_storage: Vec::new(),
             read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
+            root_check: Default::default(),
         })
         .unwrap(),
     )
@@ -496,4 +497,65 @@ fn fetch_budget_is_shared_by_every_source() {
     let elapsed = started.elapsed();
     assert_eq!(result, Err(ApplyFallback::Unavailable));
     assert!(elapsed < FETCH_BUDGET + DEADLINE_SLACK, "waited {elapsed:?}");
+}
+
+/// A capture of block `number` holding one account shard, one range of `contract`, and a split
+/// shard whose proof has no nodes.
+fn capture(number: u64, contract: B256) -> CapturedHashes {
+    CapturedHashes {
+        block: CapturedBlock {
+            number,
+            hash: block_hash(1, number),
+            parent_hash: block_hash(1, number - 1),
+        },
+        accounts: [(Shard(0x10), ShardHash::Hash(B256::repeat_byte(0x10)))].into(),
+        storages: [(contract, [(Shard(0x22), ShardHash::Empty)].into())].into(),
+        split_shards: [(
+            Shard(contract[0]),
+            Arc::new(SplitShardProof { contracts: vec![contract], nodes: Vec::new() }),
+        )]
+        .into(),
+    }
+}
+
+#[test]
+fn owner_serves_captured_hashes_for_the_exact_block_only() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let view = cluster_of(1, 2, listener.local_addr().unwrap(), closed_port());
+    let store = Arc::new(OwnerStore::new(Arc::clone(&view), create_test_rw_db(), 160).unwrap());
+    let captures = Arc::new(RootCaptures::default());
+    let contract = B256::repeat_byte(0x7a);
+    captures.insert(capture(5, contract));
+    let _server =
+        OwnerServer::spawn_with_root_captures(listener, store, Arc::default(), captures).unwrap();
+    let client = ClusterClient::new(
+        cluster_of(3, 2, view.address(NodeId(1)).unwrap(), closed_port()),
+        ClientOptions::default(),
+    );
+
+    let hashes = client.shard_hashes(NodeId(1), 5, block_hash(1, 5)).unwrap();
+    assert_eq!(hashes, capture(5, contract).shard_hashes());
+    let split = client
+        .split_shard_hashes(NodeId(1), 5, block_hash(1, 5), &[(contract, B256::repeat_byte(1))])
+        .unwrap();
+    assert_eq!(split, vec![(Shard(contract[0]), ShardHash::NotHashedBranch)]);
+    assert_eq!(
+        client.split_shard_hashes(NodeId(1), 5, block_hash(1, 5), &[]).unwrap(),
+        Vec::new(),
+        "a shard whose storage roots are not all supplied is left out"
+    );
+
+    for (number, hash) in [(5, block_hash(2, 5)), (4, block_hash(1, 5)), (6, block_hash(1, 6))] {
+        assert!(
+            matches!(
+                client.shard_hashes(NodeId(1), number, hash),
+                Err(OwnerFailure::Refused(ReadError::NotAvailable))
+            ),
+            "block {number} {hash}"
+        );
+        assert!(matches!(
+            client.split_shard_hashes(NodeId(1), number, hash, &[]),
+            Err(OwnerFailure::Refused(ReadError::NotAvailable))
+        ));
+    }
 }

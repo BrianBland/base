@@ -28,7 +28,8 @@ use base_consensus_engine::{
 use base_consensus_providers::L1_RPC_TIMEOUT;
 use base_execution_chainspec::BaseChainSpec;
 use base_execution_cluster::{
-    Cluster, ClusterConfig, ClusterNode, ClusteredDatabase, NodeConfig as ClusterNodeConfig, NodeId,
+    Cluster, ClusterConfig, ClusterNode, ClusteredDatabase, NodeConfig as ClusterNodeConfig,
+    NodeId, RootCheckConfig,
 };
 use base_node_core::args::RollupArgs;
 use base_node_runner::{
@@ -153,6 +154,7 @@ fn cluster_config(node_id: u64, nodes: &[ClusterNodeConfig]) -> ClusterConfig {
         apply_from: Vec::new(),
         split_storage: Vec::new(),
         read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
+        root_check: RootCheckConfig::default(),
     }
 }
 

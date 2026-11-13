@@ -149,6 +149,7 @@ fn cluster_view(node_id: u64, addresses: &[std::net::SocketAddr], split: &[B256]
                 .map(|hash| alloy_primitives::Bytes::copy_from_slice(hash.as_slice()))
                 .collect(),
             read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
+            root_check: Default::default(),
         })
         .unwrap(),
     )

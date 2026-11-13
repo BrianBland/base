@@ -22,7 +22,7 @@ use tracing::info;
 
 use crate::{
     ApplyEngineValidatorBuilder, BaseNodeBuilder, BaseNodeExtension, ClusterFeed,
-    FromExtensionConfig, NodeHooks,
+    FromExtensionConfig, NodeHooks, RootCheckTask,
     node::BaseNode,
     service::{DefaultPayloadServiceBuilder, PayloadServiceBuilder},
 };
@@ -227,8 +227,14 @@ impl<SB: PayloadServiceBuilder> BaseNodeRunner<SB> {
             engine_validator.install_cluster(Arc::clone(node));
         }
         let owner_feed = cluster.clone();
+        let datadir = builder.config().datadir().data_dir().to_path_buf();
         let builder = builder.on_component_initialized(move |ctx| {
             if let Some(node) = owner_feed {
+                if let Some(check) =
+                    RootCheckTask::new(Arc::clone(&node), ctx.provider().clone(), datadir)?
+                {
+                    ctx.task_executor().spawn_task(check.run());
+                }
                 let feed = ClusterFeed::start(node, ctx.provider().clone())?;
                 ctx.task_executor().spawn_critical_task("cluster-owner-feed", feed);
             }

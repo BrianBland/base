@@ -36,6 +36,7 @@ fn serve() -> (SocketAddr, OwnerServer) {
         apply_from: Vec::new(),
         split_storage: Vec::new(),
         read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
+        root_check: Default::default(),
     })
     .unwrap();
     let store = Arc::new(OwnerStore::new(Arc::new(cluster), create_test_rw_db(), 160).unwrap());

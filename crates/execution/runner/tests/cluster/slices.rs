@@ -5,11 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
 use alloy_primitives::{B256, Bytes, keccak256};
+use alloy_provider::Provider;
 use base_common_consensus::Predeploys;
 use base_common_network::BaseEngineApi;
 use base_common_rpc_types_engine::{BaseExecutionPayloadEnvelopeV4, BaseExecutionPayloadV4};
 use base_execution_cluster::{
-    Cluster, ClusterConfig, NodeConfig as ClusterNodeConfig, NodeId, Shard, ShardMap,
+    CheckOutcome, CheckedBlock, Cluster, ClusterConfig, ClusterHashSource,
+    NodeConfig as ClusterNodeConfig, NodeId, RootChecker, Shard, ShardMap,
 };
 use eyre::{Result, eyre};
 use reth_db::{
@@ -219,6 +221,23 @@ async fn clustered_nodes_keep_trie_slices_equal_to_a_full_node() -> Result<()> {
     }
     for node in [&reference, &first, &second] {
         node.wait_persisted(SLICE_BLOCKS).await?;
+    }
+
+    for number in 1..=SLICE_BLOCKS {
+        let block = reference
+            .reads
+            .get_block_by_number(number.into())
+            .await?
+            .ok_or_else(|| eyre!("no block {number}"))?;
+        let checked =
+            CheckedBlock { number, hash: block.header.hash, state_root: block.header.state_root };
+        for node in clustered {
+            let source = ClusterHashSource { node: node.cluster() };
+            let outcome = tokio::task::block_in_place(|| {
+                RootChecker::new(node.cluster().cluster(), &source).check(checked)
+            });
+            assert_eq!(outcome, CheckOutcome::Verified, "block {number}, {:?}", node.cluster());
+        }
     }
 
     let message_passer = keccak256(Predeploys::L2_TO_L1_MESSAGE_PASSER);

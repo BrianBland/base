@@ -6,7 +6,7 @@ use alloy_primitives::{B256, Bytes};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use crate::ShardedTable;
+use crate::{BlockShardHashes, Shard, ShardHash, ShardedTable};
 
 /// The block a read is answered as of: the asker's persisted tip `P`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +88,27 @@ pub enum Query {
     /// The range of blocks the owner can answer state reads as of; the snapshot and table of the
     /// request are ignored.
     Status,
+    /// The subtree hashes the node captured for block `number` with hash `hash`, answered with
+    /// [`Response::ShardHashes`] or refused with [`ReadError::NotAvailable`]; the snapshot and
+    /// table of the request are ignored.
+    ShardHashes {
+        /// Block number.
+        number: u64,
+        /// Block hash.
+        hash: B256,
+    },
+    /// The hashes, at block `number` with hash `hash`, of the node's held account shards that
+    /// contain split contracts, recomputed with the split contracts' `storage_roots`, answered
+    /// with [`Response::SplitShardHashes`] or refused with [`ReadError::NotAvailable`]; the
+    /// snapshot and table of the request are ignored.
+    SplitShardHashes {
+        /// Block number.
+        number: u64,
+        /// Block hash.
+        hash: B256,
+        /// `(hashed address, storage root)` of each split contract.
+        storage_roots: Vec<(B256, B256)>,
+    },
 }
 
 /// Entries of the refused [`Query::SeekGe`]; kept for the encoding of [`Response`].
@@ -124,6 +145,11 @@ pub enum Response {
     HasStorage(bool),
     /// Answer to [`Query::Status`]: the servable range, or `None` when the owner can serve none.
     Status(Option<ServableRange>),
+    /// Answer to [`Query::ShardHashes`].
+    ShardHashes(BlockShardHashes),
+    /// Answer to [`Query::SplitShardHashes`]: each held account shard with split contracts whose
+    /// storage roots were all supplied, and its hash.
+    SplitShardHashes(Vec<(Shard, ShardHash)>),
 }
 
 /// Inclusive range of blocks an owner can answer as of.
@@ -155,8 +181,8 @@ pub enum ReadError {
     /// The query is not supported for the table, or a key is malformed.
     #[error("unsupported query")]
     Unsupported,
-    /// The node has no execution result for the requested block.
-    #[error("execution result not available")]
+    /// The node has no execution result, or no captured hashes, for the requested block.
+    #[error("not available for this block")]
     NotAvailable,
 }
 

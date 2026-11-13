@@ -7,7 +7,7 @@ use std::{
 };
 
 use base_execution_chainspec::BaseChainSpec;
-use base_execution_cluster::{Cluster, ClusteredDatabase};
+use base_execution_cluster::{Cluster, ClusteredDatabase, RootMismatchMarker};
 use base_node_runner::{BaseNodeBuilder, LaunchedBaseNode};
 use base_upgrade_signal::UpgradeSignalStartupMode;
 use clap::{Args, value_parser};
@@ -396,6 +396,7 @@ impl ExecutionNodeRuntimeConfig {
             finish.is_some(),
             "a clustered node requires an initialised datadir; run `init` without a cluster config"
         );
+        RootMismatchMarker::ensure_absent(self.node_config.datadir().data_dir())?;
         let cluster = Arc::new(Cluster::load(config)?);
         let address = cluster
             .address(cluster.node_id())

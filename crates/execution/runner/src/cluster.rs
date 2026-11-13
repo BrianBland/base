@@ -218,6 +218,7 @@ mod tests {
             apply_from: Vec::new(),
             split_storage: Vec::new(),
             read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
+            root_check: Default::default(),
         })
         .unwrap();
         let env = Arc::try_unwrap(create_test_rw_db()).unwrap().into_inner_db();

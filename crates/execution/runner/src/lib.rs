@@ -28,6 +28,9 @@ pub use apply::{
 mod root;
 pub use root::ClusterStateRoot;
 
+mod root_check;
+pub use root_check::{OverlayCaptureReads, RootCheckTask};
+
 mod service;
 pub use service::{DefaultPayloadServiceBuilder, PayloadServiceBuilder};
 

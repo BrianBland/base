@@ -1,5 +1,5 @@
-//! Owner server: answers peer read requests from an [`OwnerStore`], and execution-result requests
-//! from [`ExecutedBlocks`], on its own threads.
+//! Owner server: answers peer read requests from an [`OwnerStore`], execution-result requests
+//! from [`ExecutedBlocks`], and captured-hash requests from [`RootCaptures`], on its own threads.
 
 use std::{
     collections::HashMap,
@@ -18,7 +18,8 @@ use reth_db_api::Database;
 use tracing::{debug, error};
 
 use crate::{
-    ExecutedBlocks, Frame, OwnerStore, Query, ReadError, ReadResult, Request, Response, StoreError,
+    ExecutedBlocks, Frame, OwnerStore, Query, ReadError, ReadResult, Request, Response,
+    RootCaptures, StoreError,
 };
 
 /// A running owner server. Dropping it stops accepting and closes open connections.
@@ -35,12 +36,22 @@ impl OwnerServer {
     /// long it takes to notice that the server is dropped.
     pub const ACCEPT_POLL: Duration = Duration::from_millis(10);
 
-    /// Serves `store` and `executed` on `listener`: one thread accepts, and each connection is
-    /// served on its own thread, one request at a time.
+    /// Serves `store` and `executed` on `listener`, with no captured hashes: one thread accepts,
+    /// and each connection is served on its own thread, one request at a time.
     pub fn spawn<DB: Database + 'static>(
         listener: TcpListener,
         store: Arc<OwnerStore<DB>>,
         executed: Arc<ExecutedBlocks>,
+    ) -> io::Result<Self> {
+        Self::spawn_with_root_captures(listener, store, executed, Arc::default())
+    }
+
+    /// Like [`Self::spawn`], also serving the captured hashes in `root_captures`.
+    pub fn spawn_with_root_captures<DB: Database + 'static>(
+        listener: TcpListener,
+        store: Arc<OwnerStore<DB>>,
+        executed: Arc<ExecutedBlocks>,
+        root_captures: Arc<RootCaptures>,
     ) -> io::Result<Self> {
         let local_addr = listener.local_addr()?;
         // Accepting never blocks, so the acceptor notices the stop flag without a connection.
@@ -63,8 +74,12 @@ impl OwnerServer {
                             continue;
                         }
                     };
-                    let served =
-                        Self::serve_connection(next_id, stream, &store, &executed, &connections);
+                    let served = Self::serve_connection(
+                        next_id,
+                        stream,
+                        (&store, &executed, &root_captures),
+                        &connections,
+                    );
                     next_id += 1;
                     if let Err(error) = served {
                         error!(error = %error, "failed to start cluster owner connection");
@@ -83,8 +98,11 @@ impl OwnerServer {
     fn serve_connection<DB: Database + 'static>(
         id: u64,
         stream: TcpStream,
-        store: &Arc<OwnerStore<DB>>,
-        executed: &Arc<ExecutedBlocks>,
+        (store, executed, root_captures): (
+            &Arc<OwnerStore<DB>>,
+            &Arc<ExecutedBlocks>,
+            &Arc<RootCaptures>,
+        ),
         connections: &Arc<Mutex<HashMap<u64, TcpStream>>>,
     ) -> io::Result<()> {
         // Some platforms hand out accepted connections non-blocking like their listener.
@@ -93,9 +111,10 @@ impl OwnerServer {
         connections.lock().insert(id, stream.try_clone()?);
         let store = Arc::clone(store);
         let executed = Arc::clone(executed);
+        let root_captures = Arc::clone(root_captures);
         let connections = Arc::clone(connections);
         std::thread::Builder::new().name("cluster-owner-conn".into()).spawn(move || {
-            Self::answer_requests(stream, &store, &executed);
+            Self::answer_requests(stream, &store, &executed, &root_captures);
             connections.lock().remove(&id);
         })?;
         Ok(())
@@ -106,6 +125,7 @@ impl OwnerServer {
         mut stream: TcpStream,
         store: &OwnerStore<DB>,
         executed: &ExecutedBlocks,
+        root_captures: &RootCaptures,
     ) {
         loop {
             let request: Request = match Frame::read(&mut stream) {
@@ -120,6 +140,19 @@ impl OwnerServer {
                     .wait_for(hash, ExecutedBlocks::SERVE_WAIT)
                     .map(Response::ExecutedBlock)
                     .ok_or(ReadError::NotAvailable),
+                Query::ShardHashes { number, hash } => root_captures
+                    .get(number, hash)
+                    .map(|capture| Response::ShardHashes(capture.shard_hashes()))
+                    .ok_or(ReadError::NotAvailable),
+                Query::SplitShardHashes { number, hash, storage_roots } => {
+                    let storage_roots = storage_roots.into_iter().collect();
+                    root_captures
+                        .get(number, hash)
+                        .map(|capture| {
+                            Response::SplitShardHashes(capture.split_shard_hashes(&storage_roots))
+                        })
+                        .ok_or(ReadError::NotAvailable)
+                }
                 _ => match store.read(&request) {
                     Ok(response) => Ok(response),
                     Err(StoreError::Refused(refusal)) => Err(refusal),

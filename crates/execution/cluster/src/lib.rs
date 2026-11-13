@@ -89,3 +89,22 @@ mod client;
 pub use client::{
     ClientError, ClientOptions, ClusterClient, DeadlineStream, OwnerAttempt, OwnerFailure,
 };
+
+mod root_assembly;
+pub use root_assembly::{AssemblyError, RootAssembly, ShardHash};
+
+mod root_capture;
+pub use root_capture::{
+    BlockShardHashes, CaptureReads, CapturedBlock, CapturedHashes, RootCaptures, SplitShardProof,
+    TrieHashCapture,
+};
+
+mod root_check;
+pub use root_check::{
+    CheckOutcome, CheckedBlock, ClusterHashSource, MarkerError, RootCheckConfig, RootCheckMode,
+    RootChecker, RootMismatch, RootMismatchMarker, ShardHashSource, ShardSource, ShardSources,
+    SkipReason, SourceFailure,
+};
+
+mod root_check_stats;
+pub use root_check_stats::{RootCheckCounts, RootCheckSchedule, RootCheckStats, StepOutcome};

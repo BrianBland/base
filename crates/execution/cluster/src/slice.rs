@@ -218,6 +218,7 @@ mod tests {
                     .map(|hash| Bytes::copy_from_slice(hash.as_slice()))
                     .collect(),
                 read_retry_secs: ClusterConfig::DEFAULT_READ_RETRY_SECS,
+                root_check: Default::default(),
             })
             .unwrap(),
         )
