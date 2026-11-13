@@ -25,7 +25,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     BlockHashLookup, ChangesetReader, ChangesetSource, Cluster, ClusterNode, HistoryIndex,
-    JoinHeaderLookup, JoinPoint, OwnerAnswer, OwnerStats, Query, ReadError, Request, Response,
+    JoinPoint, JoinPointLookup, OwnerAnswer, OwnerStats, Query, ReadError, Request, Response,
     ServableRange, Shard, ShardedTable, SnapshotId,
 };
 
@@ -256,7 +256,7 @@ pub struct OwnerStore<DB> {
     retention_blocks: u64,
     history: Mutex<OwnerHistory>,
     block_hashes: OnceLock<BlockHashLookup>,
-    join_headers: OnceLock<JoinHeaderLookup>,
+    join_points: OnceLock<JoinPointLookup>,
     changesets: OnceLock<ChangesetReader>,
     stats: Arc<OwnerStats>,
 }
@@ -291,7 +291,7 @@ impl<DB: Database> OwnerStore<DB> {
             retention_blocks,
             history: Mutex::new(OwnerHistory { persisted, ..Default::default() }),
             block_hashes: OnceLock::new(),
-            join_headers: OnceLock::new(),
+            join_points: OnceLock::new(),
             changesets: OnceLock::new(),
             stats: Arc::default(),
         })
@@ -313,22 +313,24 @@ impl<DB: Database> OwnerStore<DB> {
         self.block_hashes.get().and_then(|lookup| lookup(number))
     }
 
-    /// Installs the lookup of encoded canonical headers that [`Query::JoinPoint`] answers from.
-    /// Only the first lookup installed is kept; returns whether this one was.
-    pub fn install_join_headers(&self, lookup: JoinHeaderLookup) -> bool {
-        self.join_headers.set(lookup).is_ok()
+    /// Installs the lookup of join points (encoded canonical headers and the last one's body)
+    /// that [`Query::JoinPoint`] answers from. Only the first lookup installed is kept; returns
+    /// whether this one was.
+    pub fn install_join_points(&self, lookup: JoinPointLookup) -> bool {
+        self.join_points.set(lookup).is_ok()
     }
 
-    /// The join point at persisted tip `tip`: the encoded headers of [`JoinPoint::window`], none
-    /// at genesis; `None` before a lookup is installed, when a header is missing, or when the
-    /// answer would not fit in a frame.
+    /// The join point at persisted tip `tip`: the encoded headers of [`JoinPoint::window`] and
+    /// `tip`'s encoded body, nothing at genesis; `None` before a lookup is installed, when a
+    /// header or the body is missing, or when the answer would not fit in a frame (the asker
+    /// retries, by when the persisted tip has usually moved on).
     pub fn join_point(&self, tip: u64) -> Option<JoinPoint> {
         if tip == 0 {
             return Some(JoinPoint::default());
         }
         let window = JoinPoint::window(tip);
         let expected = window.clone().count();
-        let point = self.join_headers.get().and_then(|lookup| lookup(window))?;
+        let point = self.join_points.get().and_then(|lookup| lookup(window))?;
         (point.headers.len() == expected && point.fits_frame()).then_some(point)
     }
 

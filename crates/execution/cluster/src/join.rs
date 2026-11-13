@@ -9,16 +9,19 @@ use std::{
 };
 
 use alloy_primitives::{B256, Bytes, U256};
-use alloy_rlp::Encodable;
+use alloy_rlp::{Decodable, Encodable};
 use reth_db_api::{
     tables,
     transaction::{DbTx, DbTxMut},
 };
-use reth_primitives_traits::{BlockHeader, FullBlockHeader, NodePrimitives, SealedHeader};
+use reth_primitives_traits::{
+    AlloyBlockHeader, Block, BlockBody, FullBlockHeader, NodePrimitives, SealedHeader,
+    transaction::{TxHashRef, signed::RecoveryError},
+};
 use reth_provider::{
-    DatabaseProvider, ProviderError, PruneCheckpointWriter, StageCheckpointWriter,
-    StaticFileProviderFactory, StaticFileSegment, StaticFileWriter,
-    providers::NodeTypesForProvider,
+    BlockBodyIndicesProvider, BlockWriter, DatabaseProvider, EitherWriter, ProviderError,
+    PruneCheckpointWriter, StageCheckpointWriter, StaticFileProviderFactory, StaticFileSegment,
+    StaticFileWriter, StorageSettingsCache, providers::NodeTypesForProvider,
 };
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
@@ -27,33 +30,39 @@ use thiserror::Error;
 
 use crate::{Cluster, ClusterClient, Frame, NodeId};
 
-/// Returns the join point of the canonical headers of a range of block numbers
-/// ([`JoinPoint::encode`]), or `None` when they cannot be read.
-pub type JoinHeaderLookup = Box<dyn Fn(RangeInclusive<u64>) -> Option<JoinPoint> + Send + Sync>;
+/// Returns the join point of a range of block numbers ending at a persisted block: the canonical
+/// headers of the range and the body of its last block ([`JoinPoint::encode`]), or `None` when
+/// they cannot be read.
+pub type JoinPointLookup = Box<dyn Fn(RangeInclusive<u64>) -> Option<JoinPoint> + Send + Sync>;
 
 /// What a node that stores no state needs from a peer to start at the peer's persisted tip `P`:
-/// the RLP-encoded canonical headers of [`Self::window`]`(P)`, ascending. The newest is `P`'s;
-/// the older ones give the joined node the block hashes the `BLOCKHASH` opcode reads. A peer
-/// still at genesis answers no header: the joining node then starts from genesis.
+/// the RLP-encoded canonical headers of [`Self::window`]`(P)`, ascending, and `P`'s RLP-encoded
+/// body. The newest header is `P`'s; the older ones give the joined node the block hashes the
+/// `BLOCKHASH` opcode reads. `P`'s body lets the joined node serve `P` as a full block: the
+/// consensus client reads the latest block's L1-info deposit to learn where it stands. A peer
+/// still at genesis answers no header and no body: the joining node then starts from genesis.
 ///
-/// Nothing else is transferred. Transaction numbers restart at 0 above `P`, as after reth's
-/// snap sync: they are local storage indexes that no peer compares. The replicated trie rows
-/// (short account-trie paths, short storage-trie paths of split contracts) are not transferred
-/// either: a node that stores nothing never computes a trie ([`crate::TrieSlice::plan`]), never
-/// captures hashes for the state-root check, and refuses proof RPCs, so nothing reads them.
+/// Nothing else is transferred. Transaction numbers restart at 0 with `P`'s transactions, as
+/// after reth's snap sync: they are local storage indexes that no peer compares. `P`'s receipts
+/// are not transferred. The replicated trie rows (short account-trie paths, short storage-trie
+/// paths of split contracts) are not transferred either: a node that stores nothing never
+/// computes a trie ([`crate::TrieSlice::plan`]), never captures hashes for the state-root check,
+/// and refuses proof RPCs, so nothing reads them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinPoint {
     /// Encoded headers, ascending, the last at the answering node's persisted tip.
     pub headers: Vec<Bytes>,
+    /// Encoded body of the last header's block; empty when there is no header.
+    pub body: Bytes,
 }
 
 impl JoinPoint {
     /// Headers in a join point: the block hashes the `BLOCKHASH` opcode can read.
     pub const MAX_HEADERS: u64 = 256;
 
-    /// Bincode overhead allowed per header (its length prefix) and per message, for
+    /// Bincode overhead allowed per encoded field (its length prefix) and per message, for
     /// [`Self::fits_frame`].
-    const HEADER_OVERHEAD: usize = 9;
+    const FIELD_OVERHEAD: usize = 9;
     const MESSAGE_OVERHEAD: usize = 16;
 
     /// The block numbers of the join point at tip `tip`: the [`Self::MAX_HEADERS`] blocks ending
@@ -62,32 +71,33 @@ impl JoinPoint {
         tip.saturating_sub(Self::MAX_HEADERS - 1).max(1)..=tip
     }
 
-    /// The join point of `headers`, ascending.
-    pub fn encode<H: Encodable>(headers: &[H]) -> Self {
-        Self { headers: headers.iter().map(|header| alloy_rlp::encode(header).into()).collect() }
+    /// The join point of `headers`, ascending, and the body of the last one's block.
+    pub fn encode<H: Encodable, B: Encodable>(headers: &[H], body: &B) -> Self {
+        Self {
+            headers: headers.iter().map(|header| alloy_rlp::encode(header).into()).collect(),
+            body: alloy_rlp::encode(body).into(),
+        }
     }
 
     /// Whether the encoded answer carrying this join point fits in one frame
     /// ([`Frame::MAX_LEN`]), from an upper bound of its encoded size.
     pub fn fits_frame(&self) -> bool {
         let headers: usize =
-            self.headers.iter().map(|header| header.len() + Self::HEADER_OVERHEAD).sum();
-        headers + Self::MESSAGE_OVERHEAD <= Frame::MAX_LEN
+            self.headers.iter().map(|header| header.len() + Self::FIELD_OVERHEAD).sum();
+        headers + self.body.len() + Self::FIELD_OVERHEAD + Self::MESSAGE_OVERHEAD <= Frame::MAX_LEN
     }
 
-    /// Decodes and checks the headers: at most [`Self::MAX_HEADERS`], consecutive, each linked
-    /// to its parent by hash, and the first after genesis linked to `genesis_hash`. `None` when
-    /// there is none: the answering node is at genesis.
-    pub fn decode<H: BlockHeader>(
-        &self,
-        genesis_hash: B256,
-    ) -> Result<Option<JoinHeaders<H>>, JoinError> {
+    /// Decodes and checks the join point: at most [`Self::MAX_HEADERS`] headers, consecutive,
+    /// each linked to its parent by hash, the first after genesis linked to `genesis_hash`, and
+    /// a body whose transactions (and ommers, when the body has them) match the last header's
+    /// roots. `None` when there is no header: the answering node is at genesis.
+    pub fn decode<B: Block>(&self, genesis_hash: B256) -> Result<Option<JoinChain<B>>, JoinError> {
         if self.headers.len() as u64 > Self::MAX_HEADERS {
             return Err(JoinError::TooManyHeaders(self.headers.len()));
         }
-        let mut headers: Vec<SealedHeader<H>> = Vec::with_capacity(self.headers.len());
+        let mut headers: Vec<SealedHeader<B::Header>> = Vec::with_capacity(self.headers.len());
         for encoded in &self.headers {
-            let header = SealedHeader::seal_slow(H::decode(&mut encoded.as_ref())?);
+            let header = SealedHeader::seal_slow(B::Header::decode(&mut encoded.as_ref())?);
             let parent = match headers.last() {
                 Some(previous) => {
                     if header.number() != previous.number() + 1 {
@@ -105,19 +115,28 @@ impl JoinPoint {
             }
             headers.push(header);
         }
-        Ok((!headers.is_empty()).then_some(JoinHeaders { headers }))
+        let Some(tip) = headers.last() else { return Ok(None) };
+        let body: B::Body = alloy_rlp::decode_exact(&self.body)?;
+        let ommers_match =
+            body.calculate_ommers_root().is_none_or(|root| root == tip.ommers_hash());
+        if body.calculate_tx_root() != tip.transactions_root() || !ommers_match {
+            return Err(JoinError::BodyMismatch(tip.number()));
+        }
+        Ok(Some(JoinChain { headers, body }))
     }
 }
 
-/// The checked headers of a [`JoinPoint`], the last at the join block `P`.
+/// The checked contents of a [`JoinPoint`]: its headers, the last at the join block `P`, and
+/// `P`'s body.
 #[derive(Debug, Clone)]
-pub struct JoinHeaders<H> {
-    headers: Vec<SealedHeader<H>>,
+pub struct JoinChain<B: Block> {
+    headers: Vec<SealedHeader<B::Header>>,
+    body: B::Body,
 }
 
-impl<H: BlockHeader> JoinHeaders<H> {
+impl<B: Block> JoinChain<B> {
     /// The join block `P`'s header.
-    pub fn tip(&self) -> &SealedHeader<H> {
+    pub fn tip(&self) -> &SealedHeader<B::Header> {
         self.headers.last().expect("decoded join headers are not empty")
     }
 
@@ -128,15 +147,20 @@ impl<H: BlockHeader> JoinHeaders<H> {
         self.headers.get(index).map(SealedHeader::hash)
     }
 
-    /// Writes the join point into a datadir holding only genesis, in `provider`'s transaction;
-    /// the caller commits. Afterwards the datadir starts as a node whose persisted tip is `P`:
+    /// Writes the join point into a storage-v2 datadir holding only genesis, in `provider`'s
+    /// transaction; the caller commits. Afterwards the datadir starts as a node whose persisted
+    /// tip is `P`, holding `P` as a full block:
     ///
     /// - the headers go to the header static files and `HeaderNumbers`; headers that would sit
     ///   between genesis and its static file's end are skipped, because a static file holds
     ///   consecutive blocks from its first;
-    /// - every other static-file segment restarts after `P`, with history below `P` counted as
-    ///   pruned ([`DatabaseProvider::anchor_pruned_static_files`]), and every prune checkpoint
-    ///   says so;
+    /// - `P`'s body is written as reth writes a block's: its transactions, numbered from 0, to
+    ///   the transactions static file, its body indices, its transaction-hash lookups and its
+    ///   senders, each unless the node's prune modes drop them entirely; the transactions and
+    ///   senders segments restart at `P`, so later blocks number their transactions after `P`'s;
+    /// - every other non-header static-file segment (receipts, change sets) restarts after `P`;
+    ///   history before the restart is counted as pruned in the static files and in every prune
+    ///   checkpoint;
     /// - every stage checkpoint, `Finish` included, is at `P`.
     ///
     /// Fails when `P` itself lies in genesis's header static file beyond the first
@@ -147,8 +171,71 @@ impl<H: BlockHeader> JoinHeaders<H> {
     pub fn write<TX, N>(&self, provider: &DatabaseProvider<TX, N>) -> Result<(), JoinError>
     where
         TX: DbTxMut + DbTx + 'static,
-        N: NodeTypesForProvider<Primitives: NodePrimitives<BlockHeader = H>>,
-        H: FullBlockHeader,
+        N: NodeTypesForProvider<
+            Primitives: NodePrimitives<Block = B, BlockHeader = B::Header, BlockBody = B::Body>,
+        >,
+        B::Header: FullBlockHeader,
+    {
+        if !provider.cached_storage_settings().storage_v2 {
+            return Err(JoinError::LegacyStorage);
+        }
+        let tip = self.tip().number();
+        self.write_headers(provider)?;
+        let prune_modes = provider.prune_modes_ref();
+        let keeps_senders = prune_modes.sender_recovery.is_none_or(|mode| !mode.is_full());
+        let keeps_lookups = prune_modes.transaction_lookup.is_none_or(|mode| !mode.is_full());
+        let static_files = provider.static_file_provider();
+        for segment in StaticFileSegment::iter().filter(|segment| !segment.is_headers()) {
+            let holds_tip = segment == StaticFileSegment::Transactions
+                || (segment == StaticFileSegment::TransactionSenders && keeps_senders);
+            let anchor = if holds_tip { tip - 1 } else { tip };
+            static_files.delete_segment(segment)?;
+            static_files.get_writer(anchor, segment)?.initialize_pruned_anchor(anchor)?;
+        }
+        provider.append_block_bodies(vec![(tip, Some(&self.body))])?;
+        let first_tx = provider
+            .block_body_indices(tip)?
+            .ok_or(ProviderError::BlockBodyIndicesNotFound(tip))?
+            .first_tx_num;
+        if keeps_senders {
+            let mut senders = EitherWriter::new_senders(provider, tip)?;
+            senders.increment_block(tip)?;
+            senders.append_senders((first_tx..).zip(self.body.recover_signers()?))?;
+        }
+        if keeps_lookups {
+            let lookups =
+                self.body.transactions_iter().map(|tx| *tx.tx_hash()).zip(first_tx..).collect();
+            provider.with_rocksdb_batch(|batch| {
+                let mut writer = EitherWriter::new_transaction_hash_numbers(provider, batch)?;
+                writer.put_transaction_hash_numbers_batch(lookups, false)?;
+                Ok(((), writer.into_raw_rocksdb_batch()))
+            })?;
+        }
+        for stage in StageId::ALL {
+            provider.save_stage_checkpoint(stage, StageCheckpoint::new(tip))?;
+        }
+        for segment in PruneSegment::variants() {
+            let tip_kept = match segment {
+                PruneSegment::Bodies => true,
+                PruneSegment::SenderRecovery => keeps_senders,
+                PruneSegment::TransactionLookup => keeps_lookups,
+                _ => false,
+            };
+            let pruned_through = if tip_kept { tip - 1 } else { tip };
+            provider
+                .save_prune_checkpoint(segment, PruneCheckpoint::pruned_through(pruned_through))?;
+        }
+        Ok(())
+    }
+
+    /// Writes the headers to the header static files and `HeaderNumbers` (see [`Self::write`]).
+    fn write_headers<TX, N>(&self, provider: &DatabaseProvider<TX, N>) -> Result<(), JoinError>
+    where
+        TX: DbTxMut + DbTx + 'static,
+        N: NodeTypesForProvider<
+            Primitives: NodePrimitives<Block = B, BlockHeader = B::Header, BlockBody = B::Body>,
+        >,
+        B::Header: FullBlockHeader,
     {
         let tip = self.tip().number();
         let static_files = provider.static_file_provider();
@@ -184,13 +271,6 @@ impl<H: BlockHeader> JoinHeaders<H> {
         for header in written {
             provider.tx_ref().put::<tables::HeaderNumbers>(header.hash(), header.number())?;
         }
-        provider.anchor_pruned_static_files(tip)?;
-        for stage in StageId::ALL {
-            provider.save_stage_checkpoint(stage, StageCheckpoint::new(tip))?;
-        }
-        for segment in PruneSegment::variants() {
-            provider.save_prune_checkpoint(segment, PruneCheckpoint::pruned_through(tip))?;
-        }
         Ok(())
     }
 }
@@ -208,14 +288,14 @@ impl ClusterJoin {
     /// other cluster node whose own join point holds `P` with the same hash, or else the same
     /// peer asked again. Peers are trusted; this catches a peer answering from a different
     /// chain or fork, not a malicious one. Rounds repeat every [`Self::RETRY_INTERVAL`] until
-    /// `budget` runs out, each exchange due by then. Returns the peer and its headers, which
+    /// `budget` runs out, each exchange due by then. Returns the peer and its join chain, which
     /// are `None` when the peer is at genesis (nothing to confirm or write).
-    pub fn fetch<H: BlockHeader>(
+    pub fn fetch<B: Block>(
         client: &ClusterClient,
         cluster: &Cluster,
         genesis_hash: B256,
         budget: Duration,
-    ) -> Result<(NodeId, Option<JoinHeaders<H>>), JoinError> {
+    ) -> Result<(NodeId, Option<JoinChain<B>>), JoinError> {
         let deadline = Instant::now() + budget;
         loop {
             let mut failures = Vec::new();
@@ -235,13 +315,13 @@ impl ClusterJoin {
     }
 
     /// `source`'s join point, once another node confirmed it.
-    fn ask_confirmed<H: BlockHeader>(
+    fn ask_confirmed<B: Block>(
         client: &ClusterClient,
         cluster: &Cluster,
         source: NodeId,
         genesis_hash: B256,
         deadline: Instant,
-    ) -> Result<Option<JoinHeaders<H>>, String> {
+    ) -> Result<Option<JoinChain<B>>, String> {
         let headers = Self::ask(client, source, genesis_hash, deadline)?;
         if let Some(theirs) = &headers {
             Self::confirm(client, cluster, source, theirs, genesis_hash, deadline)?;
@@ -249,22 +329,22 @@ impl ClusterJoin {
         Ok(headers)
     }
 
-    fn ask<H: BlockHeader>(
+    fn ask<B: Block>(
         client: &ClusterClient,
         node: NodeId,
         genesis_hash: B256,
         deadline: Instant,
-    ) -> Result<Option<JoinHeaders<H>>, String> {
+    ) -> Result<Option<JoinChain<B>>, String> {
         let point = client.join_point(node, deadline).map_err(|failure| format!("{failure:?}"))?;
         point.decode(genesis_hash).map_err(|error| error.to_string())
     }
 
     /// Checks `headers`' tip against the join point of another node, then of `source` again.
-    fn confirm<H: BlockHeader>(
+    fn confirm<B: Block>(
         client: &ClusterClient,
         cluster: &Cluster,
         source: NodeId,
-        headers: &JoinHeaders<H>,
+        headers: &JoinChain<B>,
         genesis_hash: B256,
         deadline: Instant,
     ) -> Result<(), String> {
@@ -277,7 +357,7 @@ impl ClusterJoin {
             .filter(|&node| node != source && node != cluster.node_id());
         let mut answers = Vec::new();
         for verifier in others.chain(std::iter::once(source)) {
-            match Self::ask::<H>(client, verifier, genesis_hash, deadline) {
+            match Self::ask::<B>(client, verifier, genesis_hash, deadline) {
                 Ok(Some(theirs)) => match theirs.hash_of(tip.number()) {
                     Some(hash) if hash == tip.hash() => return Ok(()),
                     Some(hash) => answers.push(format!("node {} has {hash}", verifier.0)),
@@ -347,6 +427,15 @@ pub enum JoinError {
     /// this chain's genesis for block 1).
     #[error("join point header {0} does not extend this chain")]
     BrokenLink(u64),
+    /// The join block's body does not match its header's transactions or ommers root.
+    #[error("the join point body does not match the header of block {0}")]
+    BodyMismatch(u64),
+    /// A sender of the join block's transactions could not be recovered.
+    #[error("a join block transaction's sender cannot be recovered: {0}")]
+    Sender(#[from] RecoveryError),
+    /// The datadir does not use storage v2, the only layout a join can write.
+    #[error("joining a cluster requires storage v2")]
+    LegacyStorage,
     /// The join block lies in genesis's header static file but not among its first blocks.
     #[error(
         "cannot join at block {tip}: a joined node's headers must start right after genesis \
@@ -397,16 +486,16 @@ impl From<reth_db_api::DatabaseError> for JoinError {
 mod tests {
     use std::sync::Arc;
 
-    use alloy_consensus::{BlockBody, Header, Signed, TxLegacy};
+    use alloy_consensus::{BlockBody as AlloyBlockBody, Header, Signed, TxLegacy};
     use alloy_primitives::{Address, Signature};
     use reth_chainspec::MAINNET;
     use reth_db_common::init::init_genesis_with_settings;
     use reth_execution_types::ExecutionOutcome;
     use reth_primitives_traits::RecoveredBlock;
     use reth_provider::{
-        BlockBodyIndicesProvider, BlockHashReader, BlockNumReader, BlockWriter, DBProvider,
-        DatabaseProviderFactory, HeaderProvider, NodePrimitivesProvider, ProviderFactory,
-        RocksDBProviderFactory, StageCheckpointReader, StorageSettings,
+        BlockHashReader, BlockNumReader, BlockReader, DBProvider, DatabaseProviderFactory,
+        HeaderProvider, NodePrimitivesProvider, ProviderFactory, RocksDBProviderFactory,
+        StageCheckpointReader, StorageSettings, TransactionsProvider,
         providers::StaticFileProvider,
         test_utils::{MockNodeTypesWithDB, create_test_provider_factory},
     };
@@ -417,12 +506,14 @@ mod tests {
 
     type Primitives = <ProviderFactory<MockNodeTypesWithDB> as NodePrimitivesProvider>::Primitives;
     type TestBlock = <Primitives as NodePrimitives>::Block;
+    type TestBody = <Primitives as NodePrimitives>::BlockBody;
+    type TestTx = <Primitives as NodePrimitives>::SignedTx;
     type TestReceipt = <Primitives as NodePrimitives>::Receipt;
 
     /// A join block in a static file far from genesis's, as on a live network.
     const TIP: u64 = 57_000_123;
 
-    /// `count` linked headers ending at `tip`, the first linked to `parent`.
+    /// `count` linked headers ending at `tip`, the first linked to `parent`, every block empty.
     fn chain(tip: u64, count: u64, parent: B256) -> Vec<Header> {
         let mut parent = parent;
         (tip + 1 - count..=tip)
@@ -432,6 +523,30 @@ mod tests {
                 header
             })
             .collect()
+    }
+
+    /// A transaction told apart from others by `nonce`.
+    fn transaction(nonce: u64) -> TestTx {
+        Signed::new_unhashed(TxLegacy { nonce, ..TxLegacy::default() }, Signature::test_signature())
+            .into()
+    }
+
+    fn body(transactions: Vec<TestTx>) -> TestBody {
+        AlloyBlockBody { transactions, ommers: Vec::new(), withdrawals: None }
+    }
+
+    /// `count` linked headers ending at `tip`, the first linked to `parent`, and the tip's body
+    /// of `transactions` (the tip's header carrying its transactions root).
+    fn chain_with_body(
+        tip: u64,
+        count: u64,
+        parent: B256,
+        transactions: Vec<TestTx>,
+    ) -> (Vec<Header>, TestBody) {
+        let body = body(transactions);
+        let mut headers = chain(tip, count, parent);
+        headers.last_mut().unwrap().transactions_root = body.calculate_tx_root();
+        (headers, body)
     }
 
     /// A storage-v2 datadir holding mainnet's genesis, written as a node's launch writes it.
@@ -460,9 +575,10 @@ mod tests {
     fn join(
         factory: &ProviderFactory<MockNodeTypesWithDB>,
         headers: &[Header],
+        body: &TestBody,
     ) -> Result<(), JoinError> {
-        let joined = JoinPoint::encode(headers)
-            .decode::<Header>(MAINNET.genesis_hash())?
+        let joined = JoinPoint::encode(headers, body)
+            .decode::<TestBlock>(MAINNET.genesis_hash())?
             .expect("headers to join at");
         let provider = factory.database_provider_rw()?;
         joined.write(&provider)?;
@@ -470,20 +586,31 @@ mod tests {
         Ok(())
     }
 
-    /// Block `number` on `parent` with one transaction from `sender`.
-    fn block(number: u64, parent: B256, sender: Address) -> RecoveredBlock<TestBlock> {
-        let tx = Signed::new_unhashed(TxLegacy::default(), Signature::test_signature()).into();
+    /// Block `number` on `parent` with `transactions`, each from `sender`.
+    fn block(
+        number: u64,
+        parent: B256,
+        transactions: Vec<TestTx>,
+        sender: Address,
+    ) -> RecoveredBlock<TestBlock> {
+        let senders = vec![sender; transactions.len()];
         let header = Header { number, parent_hash: parent, ..Header::default() };
-        let body = BlockBody { transactions: vec![tx], ommers: Vec::new(), withdrawals: None };
-        RecoveredBlock::new_unhashed(TestBlock::new(header, body), vec![sender])
+        RecoveredBlock::new_unhashed(TestBlock::new(header, body(transactions)), senders)
     }
 
     #[test]
-    fn a_joined_datadir_opens_at_the_join_block_and_appends_every_segment_after_it() {
+    fn a_joined_datadir_serves_the_join_block_and_appends_every_segment_after_it() {
         let factory = reopen(&genesis_datadir());
-        let headers = chain(TIP, JoinPoint::MAX_HEADERS, B256::repeat_byte(7));
-        join(&factory, &headers).unwrap();
+        let transactions: Vec<_> = (0..3).map(transaction).collect();
+        let (headers, tip_body) = chain_with_body(
+            TIP,
+            JoinPoint::MAX_HEADERS,
+            B256::repeat_byte(7),
+            transactions.clone(),
+        );
+        join(&factory, &headers, &tip_body).unwrap();
         let tip_hash = headers.last().unwrap().hash_slow();
+        let senders = tip_body.recover_signers().unwrap();
 
         let factory = reopen(&factory);
         assert_eq!(factory.check_consistency().unwrap(), (None, None));
@@ -493,19 +620,32 @@ mod tests {
         assert_eq!(provider.block_hash(TIP - 255).unwrap(), Some(headers[0].hash_slow()));
         assert_eq!(provider.block_hash(0).unwrap(), Some(MAINNET.genesis_hash()));
         assert_eq!(provider.header(tip_hash).unwrap().map(|header| header.number), Some(TIP));
+        let by_number = provider.block_by_number(TIP).unwrap().expect("the join block");
+        assert_eq!(by_number.header, *headers.last().unwrap());
+        assert_eq!(by_number.body.transactions, transactions);
+        assert_eq!(provider.block_by_hash(tip_hash).unwrap(), Some(by_number));
+        let indices = provider.block_body_indices(TIP).unwrap().unwrap();
+        assert_eq!((indices.first_tx_num, indices.tx_count), (0, 3));
+        assert_eq!(provider.senders_by_tx_range(0..3).unwrap(), senders);
+        let second = *transactions[1].tx_hash();
+        assert_eq!(provider.transaction_id(second).unwrap(), Some(1));
+        let (_, meta) = provider.transaction_by_hash_with_meta(second).unwrap().unwrap();
+        assert_eq!((meta.block_number, meta.index, meta.block_hash), (TIP, 1, tip_hash));
+        assert!(provider.block_by_number(TIP - 1).unwrap().is_none());
         for stage in StageId::ALL {
             assert_eq!(provider.get_stage_checkpoint(stage).unwrap().unwrap().block_number, TIP);
         }
         drop(provider);
 
         let provider = factory.database_provider_rw().unwrap();
-        let next = block(TIP + 1, tip_hash, Address::repeat_byte(1));
+        let next_transactions = vec![transaction(3), transaction(4)];
+        let next = block(TIP + 1, tip_hash, next_transactions.clone(), Address::repeat_byte(1));
         // One (empty) revert per block, as an executed block carries, so its changesets are
         // written.
         let bundle = BundleState { reverts: Reverts::new(vec![Vec::new()]), ..Default::default() };
         let outcome = ExecutionOutcome::<TestReceipt> {
             bundle,
-            receipts: vec![vec![TestReceipt::default()]],
+            receipts: vec![vec![TestReceipt::default(); 2]],
             first_block: TIP + 1,
             ..Default::default()
         };
@@ -527,67 +667,97 @@ mod tests {
                 "{segment}"
             );
         }
-        let indices = factory.provider().unwrap().block_body_indices(TIP + 1).unwrap().unwrap();
-        assert_eq!((indices.first_tx_num, indices.tx_count), (0, 1));
+        let provider = factory.provider().unwrap();
+        let indices = provider.block_body_indices(TIP + 1).unwrap().unwrap();
+        assert_eq!((indices.first_tx_num, indices.tx_count), (3, 2));
+        for segment in [StaticFileSegment::Transactions, StaticFileSegment::TransactionSenders] {
+            assert_eq!(static_files.get_highest_static_file_tx(segment), Some(4), "{segment}");
+        }
+        assert_eq!(provider.block_by_number(TIP).unwrap().unwrap().body.transactions, transactions);
         assert_eq!(
-            static_files.get_highest_static_file_tx(StaticFileSegment::Transactions),
-            Some(0)
+            provider.block_by_number(TIP + 1).unwrap().unwrap().body.transactions,
+            next_transactions
         );
+        assert_eq!(provider.transaction_id(*next_transactions[0].tx_hash()).unwrap(), Some(3));
     }
 
     #[test]
     fn a_join_through_the_provider_that_wrote_genesis_is_refused() {
         let factory = genesis_datadir();
         let headers = chain(TIP, JoinPoint::MAX_HEADERS, B256::repeat_byte(7));
-        assert!(matches!(join(&factory, &headers), Err(JoinError::HeaderFileInUse(_))));
+        assert!(matches!(
+            join(&factory, &headers, &body(Vec::new())),
+            Err(JoinError::HeaderFileInUse(_))
+        ));
     }
 
     #[test]
     fn a_young_chain_joins_with_every_header_after_genesis() {
         let factory = reopen(&genesis_datadir());
-        let headers = chain(20, 20, MAINNET.genesis_hash());
-        join(&factory, &headers).unwrap();
+        let (headers, tip_body) =
+            chain_with_body(20, 20, MAINNET.genesis_hash(), vec![transaction(0)]);
+        join(&factory, &headers, &tip_body).unwrap();
 
         let factory = reopen(&factory);
         assert_eq!(factory.check_consistency().unwrap(), (None, None));
         let provider = factory.provider().unwrap();
         assert_eq!(provider.best_block_number().unwrap(), 20);
         assert_eq!(provider.block_hash(1).unwrap(), Some(headers[0].hash_slow()));
+        let joined = provider.block_by_number(20).unwrap().expect("the join block");
+        assert_eq!(joined.body.transactions, tip_body.transactions);
     }
 
     #[test]
     fn a_join_block_inside_genesis_static_file_needs_every_header_after_genesis() {
         let factory = reopen(&genesis_datadir());
         let headers = chain(10_000, JoinPoint::MAX_HEADERS, B256::repeat_byte(7));
-        assert!(matches!(join(&factory, &headers), Err(JoinError::YoungChain { tip: 10_000, .. })));
+        assert!(matches!(
+            join(&factory, &headers, &body(Vec::new())),
+            Err(JoinError::YoungChain { tip: 10_000, .. })
+        ));
     }
 
     #[test]
     fn decoding_rejects_headers_that_do_not_form_a_chain() {
         let genesis = MAINNET.genesis_hash();
+        let empty = body(Vec::new());
+        let decode = |headers: &[Header]| {
+            JoinPoint::encode(headers, &empty).decode::<TestBlock>(genesis).map(|_| ())
+        };
         let mut gap = chain(100, 10, B256::ZERO);
         gap.remove(4);
-        assert!(matches!(
-            JoinPoint::encode(&gap).decode::<Header>(genesis),
-            Err(JoinError::NotConsecutive { previous: 94, next: 96 })
-        ));
+        assert!(matches!(decode(&gap), Err(JoinError::NotConsecutive { previous: 94, next: 96 })));
         let mut forked = chain(100, 10, B256::ZERO);
         forked[5].parent_hash = B256::repeat_byte(1);
-        assert!(matches!(
-            JoinPoint::encode(&forked).decode::<Header>(genesis),
-            Err(JoinError::BrokenLink(96))
-        ));
+        assert!(matches!(decode(&forked), Err(JoinError::BrokenLink(96))));
         let other_genesis = chain(5, 5, B256::repeat_byte(2));
-        assert!(matches!(
-            JoinPoint::encode(&other_genesis).decode::<Header>(genesis),
-            Err(JoinError::BrokenLink(1))
-        ));
+        assert!(matches!(decode(&other_genesis), Err(JoinError::BrokenLink(1))));
         let too_many = chain(1_000, JoinPoint::MAX_HEADERS + 1, B256::ZERO);
+        assert!(matches!(decode(&too_many), Err(JoinError::TooManyHeaders(257))));
+        assert!(matches!(JoinPoint::default().decode::<TestBlock>(genesis), Ok(None)));
+    }
+
+    #[test]
+    fn decoding_rejects_a_body_that_does_not_match_the_join_block() {
+        let genesis = MAINNET.genesis_hash();
+        let (headers, tip_body) = chain_with_body(100, 10, B256::ZERO, vec![transaction(0)]);
+        let other = body(vec![transaction(1)]);
         assert!(matches!(
-            JoinPoint::encode(&too_many).decode::<Header>(genesis),
-            Err(JoinError::TooManyHeaders(257))
+            JoinPoint::encode(&headers, &other).decode::<TestBlock>(genesis),
+            Err(JoinError::BodyMismatch(100))
         ));
-        assert!(matches!(JoinPoint::default().decode::<Header>(genesis), Ok(None)));
+        let mut with_ommer = tip_body.clone();
+        with_ommer.ommers.push(Header::default());
+        assert!(matches!(
+            JoinPoint::encode(&headers, &with_ommer).decode::<TestBlock>(genesis),
+            Err(JoinError::BodyMismatch(100))
+        ));
+        let truncated = JoinPoint {
+            body: JoinPoint::encode(&headers, &tip_body).body.slice(..4),
+            ..JoinPoint::encode(&headers, &tip_body)
+        };
+        assert!(matches!(truncated.decode::<TestBlock>(genesis), Err(JoinError::Decode(_))));
+        assert!(JoinPoint::encode(&headers, &tip_body).decode::<TestBlock>(genesis).is_ok());
     }
 
     #[test]
@@ -598,15 +768,21 @@ mod tests {
 
     #[test]
     fn a_join_point_fits_a_frame_only_below_the_frame_limit() {
-        let small = JoinPoint::encode(&chain(TIP, JoinPoint::MAX_HEADERS, B256::ZERO));
+        let headers = chain(TIP, JoinPoint::MAX_HEADERS, B256::ZERO);
+        let small = JoinPoint::encode(&headers, &body(vec![transaction(0)]));
         assert!(small.fits_frame());
-        let huge = JoinPoint { headers: vec![Bytes::from(vec![0; Frame::MAX_LEN])] };
-        assert!(!huge.fits_frame());
+        let huge_header =
+            JoinPoint { headers: vec![Bytes::from(vec![0; Frame::MAX_LEN])], ..small.clone() };
+        assert!(!huge_header.fits_frame());
+        let huge_body = JoinPoint { body: Bytes::from(vec![0; Frame::MAX_LEN]), ..small };
+        assert!(!huge_body.fits_frame());
     }
 
     #[test]
     fn a_join_point_round_trips_through_a_frame() {
-        let point = JoinPoint::encode(&chain(TIP, JoinPoint::MAX_HEADERS, B256::ZERO));
+        let (headers, tip_body) =
+            chain_with_body(TIP, JoinPoint::MAX_HEADERS, B256::ZERO, vec![transaction(0)]);
+        let point = JoinPoint::encode(&headers, &tip_body);
         let mut frame = Vec::new();
         Frame::write(&mut frame, &crate::ReadResult::Ok(crate::Response::JoinPoint(point.clone())))
             .unwrap();

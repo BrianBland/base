@@ -709,26 +709,33 @@ the launch, and the `base` command refuses it (see
 1. It creates `<datadir>/cluster-join-incomplete`, then writes genesis as reth's launch does.
 2. It asks its `apply_from` nodes, in order, for `JoinPoint`: the RLP-encoded canonical headers
    of blocks `max(1, P - 255)..=P`, where `P` is the answering node's persisted tip (`P`'s header
-   and the 255 before it, the block hashes the `BLOCKHASH` opcode reads). The headers must be
-   consecutive and linked by parent hash, block 1 to this chain's genesis. A second node confirms
+   and the 255 before it, the block hashes the `BLOCKHASH` opcode reads), and `P`'s RLP-encoded
+   body. The headers must be consecutive and linked by parent hash, block 1 to this chain's
+   genesis, and the body's transactions must match `P`'s transactions root. A second node confirms
    `P`'s hash: the first other cluster node whose own join point holds `P` with the same hash, or
    else the same peer asked again. Peers are trusted; this catches a peer on another chain or fork.
    Rounds repeat every 500 ms for up to `read_retry_secs`; then the start fails with `no apply_from
    node gave a join point another node confirmed`, listing each node's failure. A node still at
    genesis answers no header, and the joining node starts from genesis.
-3. In one commit it writes the headers to the header static files and `HeaderNumbers`, restarts
-   every other static-file segment after `P` with history below `P` counted as pruned (reth's
-   `anchor_pruned_static_files`, as after its snap sync), records every prune checkpoint as pruned
-   through `P`, and moves every stage checkpoint, `Finish` included, to `P`.
+3. In one commit it writes the headers to the header static files and `HeaderNumbers`, writes
+   `P`'s body as reth writes a block's (transactions numbered from 0, body indices,
+   transaction-hash lookups, senders), restarts the transactions and senders segments at `P` and
+   every other segment (receipts, change sets) after `P` with history below counted as pruned
+   (reth's `anchor_pruned_static_files`, as after its snap sync), records every prune checkpoint
+   as pruned through `P`, and moves every stage checkpoint, `Finish` included, to `P`.
 4. It removes the marker and continues the normal start, at `P`.
 
 It logs `cluster node joining at a peer's persisted block` (`peer`, `block`) and `cluster node
 joined` (`block`, `elapsed`). A crash before the marker is removed leaves a datadir the next start
 refuses; delete it and start again.
 
-Nothing else is transferred (a join point is about 256 headers, roughly 150 KB on Base; an answer
-that would not fit a frame is refused with `NotAvailable`). Transaction numbers restart at 0 above
-`P`: they are local storage indexes no peer compares. The replicated trie rows are not transferred:
+Nothing else is transferred (a join point is about 256 headers, roughly 150 KB on Base, plus one
+block body; an answer that would not fit a frame is refused with `NotAvailable`, and the joining
+node asks again). The joined node serves `P` as a full block, which the consensus client needs:
+at start-up it reads the latest block's L1-info deposit to learn where it stands. `P`'s receipts
+are not transferred, so receipt RPCs for `P`, and receipt-derived fields of its transactions
+(a deposit's nonce), are missing. Transaction numbers restart at 0 with `P`'s transactions: they
+are local storage indexes no peer compares. The replicated trie rows are not transferred:
 a node that stores nothing never computes a trie, captures nothing for the state-root check and
 refuses proof RPCs, so nothing reads them; it keeps the genesis values its genesis write left.
 

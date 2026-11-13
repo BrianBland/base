@@ -4,10 +4,13 @@
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, B256};
 use alloy_provider::Provider;
+use base_common_genesis::RollupConfig;
 use base_execution_cluster::{
     ClusterConfig, JoinMarker, NodeConfig as ClusterNodeConfig, NodeId, RootCheckSchedule,
 };
-use eyre::Result;
+use base_protocol::L2BlockInfo;
+use eyre::{Result, eyre};
+use reth_provider::{BlockBodyIndicesProvider, BlockReader};
 
 use crate::{
     Datadir, STORAGE_CONTRACT, TestNode,
@@ -47,9 +50,45 @@ fn touched(blocks: u64) -> (Vec<Address>, Vec<(Address, B256)>) {
     (accounts, slots)
 }
 
+/// Blocks `numbers` as `node`'s provider serves them, with their body indices' transaction counts.
+fn blocks(node: &TestNode, numbers: impl IntoIterator<Item = u64>) -> Result<Vec<String>> {
+    let provider = node.launched.handle.node.provider();
+    numbers
+        .into_iter()
+        .map(|number| {
+            let block =
+                provider.block_by_number(number)?.ok_or_else(|| eyre!("no block {number}"))?;
+            let by_hash = provider.block_by_hash(block.header.hash_slow())?;
+            eyre::ensure!(by_hash.as_ref() == Some(&block), "block {number} by hash: {by_hash:?}");
+            let indices =
+                provider.block_body_indices(number)?.ok_or_else(|| eyre!("no indices {number}"))?;
+            eyre::ensure!(indices.tx_count as usize == block.body.transactions.len());
+            Ok(format!("{block:?}"))
+        })
+        .collect()
+}
+
+/// The latest block as the follow node's start-up reads it from its execution node:
+/// `eth_getBlockByNumber("latest", true)`, turned into an `L2BlockInfo` from the block's L1-info
+/// deposit (`LocalL2Client::block_info` in the consensus follow service).
+async fn follow_start_block(node: &TestNode) -> Result<L2BlockInfo> {
+    let block = node
+        .reads
+        .get_block_by_number(BlockNumberOrTag::Latest)
+        .full()
+        .await?
+        .ok_or_else(|| eyre!("local L2 block unavailable at latest"))?;
+    let block = block
+        .map_header(|header| header.into_inner())
+        .into_consensus()
+        .map_transactions(|tx| tx.inner.inner.into_inner());
+    Ok(L2BlockInfo::from_block_and_genesis(&block, &RollupConfig::default().genesis)?)
+}
+
 /// A non-storing apply node started on an empty datadir joins at its executors' persisted block,
-/// reaches the head by applying their results, verifies state roots, reads the executors' state,
-/// keeps blocks before the join point unavailable, and survives a restart.
+/// serves that block in full as a storing node does (the follow start-up reads it), reaches the
+/// head by applying their results, verifies state roots, reads the executors' state, keeps blocks
+/// before the join point unavailable, and survives a restart.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_non_storing_node_joins_on_an_empty_datadir() -> Result<()> {
     base_node_runner::test_utils::init_silenced_tracing();
@@ -72,6 +111,19 @@ async fn a_non_storing_node_joins_on_an_empty_datadir() -> Result<()> {
     assert_eq!(c.persisted()?, BEFORE_JOIN);
     let before_join = c.reads.get_block_by_number(BlockNumberOrTag::Number(1)).await;
     assert!(!matches!(before_join, Ok(Some(_))), "block 1 is served: {before_join:?}");
+    assert_eq!(blocks(&c, [BEFORE_JOIN])?, blocks(&a, [BEFORE_JOIN])?);
+    assert_eq!(c.head().await?, a.head().await?);
+    assert_eq!(c.reads.get_block_number().await?, BEFORE_JOIN);
+    assert_eq!(follow_start_block(&c).await?, follow_start_block(&a).await?);
+    // The join block's receipts are not transferred, so receipt-derived RPC fields (a deposit's
+    // nonce) are absent on the joined node: compare what the block itself holds.
+    let join_hash = a.head().await?.0;
+    let joined = c.reads.get_block_by_hash(join_hash).await?.expect("join block by hash");
+    let stored = a.reads.get_block_by_hash(join_hash).await?.expect("join block by hash");
+    assert_eq!(joined.header, stored.header);
+    assert_eq!(joined.transactions, stored.transactions);
+    let receipts = c.reads.get_block_receipts(BEFORE_JOIN.into()).await;
+    assert!(!matches!(receipts, Ok(Some(_))), "join block receipts are served: {receipts:?}");
 
     let head = BEFORE_JOIN + AFTER_JOIN;
     for number in BEFORE_JOIN + 1..=head {
@@ -92,6 +144,7 @@ async fn a_non_storing_node_joins_on_an_empty_datadir() -> Result<()> {
 
     let c = c.stop().await?.launch(Some(joiner_config)).await?;
     assert_eq!(c.persisted()?, head);
+    assert_eq!(blocks(&c, BEFORE_JOIN..=head)?, blocks(&a, BEFORE_JOIN..=head)?);
     let envelope = producer.produce(block_transactions(head + 1)).await?;
     let hash = a.import(&envelope).await?;
     b.import(&envelope).await?;

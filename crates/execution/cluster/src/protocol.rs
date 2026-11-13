@@ -118,9 +118,10 @@ pub enum Query {
         /// Number of the block.
         number: u64,
     },
-    /// The headers a node that stores nothing needs to start at the answering node's persisted
-    /// tip, answered with [`Response::JoinPoint`] or refused with [`ReadError::NotAvailable`];
-    /// the snapshot and table of the request are ignored (see [`JoinPoint`]).
+    /// The headers and block body a node that stores nothing needs to start at the answering
+    /// node's persisted tip, answered with [`Response::JoinPoint`] or refused with
+    /// [`ReadError::NotAvailable`]; the snapshot and table of the request are ignored (see
+    /// [`JoinPoint`]).
     JoinPoint,
 }
 

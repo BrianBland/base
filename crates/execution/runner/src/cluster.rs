@@ -11,10 +11,11 @@ use base_execution_cluster::{
 use futures::{Stream, StreamExt};
 use reth_chain_state::ExecutedBlock;
 use reth_node_api::ConsensusEngineEvent;
-use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives};
+use reth_primitives_traits::{AlloyBlockHeader, Block, NodePrimitives};
 use reth_provider::{
-    BlockHashReader, CanonStateNotification, CanonStateSubscriptions, Chain, ChangeSetReader,
-    DatabaseProviderFactory, HeaderProvider, StaticFileProviderFactory, StorageChangeSetReader,
+    BlockHashReader, BlockReader, CanonStateNotification, CanonStateSubscriptions, Chain,
+    ChangeSetReader, DatabaseProviderFactory, HeaderProvider, StaticFileProviderFactory,
+    StorageChangeSetReader,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, warn};
@@ -25,7 +26,7 @@ pub struct ClusterFeed;
 
 impl ClusterFeed {
     /// Installs `provider`'s block hashes, persisted changesets (from which `node` builds its
-    /// owner's history index) and headers (for nodes joining at its persisted tip) on `node`,
+    /// owner's history index) and join points (for nodes joining at its persisted tip) on `node`,
     /// and returns the task that feeds every canonical block to `node`'s
     /// owner store. Subscribes before building, so no block notified after this call is missed.
     ///
@@ -37,12 +38,9 @@ impl ClusterFeed {
         provider: P,
     ) -> eyre::Result<impl Future<Output = ()> + Send + 'static>
     where
-        P: BlockHashReader
-            + CanonStateSubscriptions
-            + DatabaseProviderFactory
-            + HeaderProvider
-            + 'static,
-        P::Provider: ChangeSetReader + StorageChangeSetReader + StaticFileProviderFactory,
+        P: BlockHashReader + CanonStateSubscriptions + DatabaseProviderFactory + 'static,
+        P::Provider:
+            BlockReader + ChangeSetReader + StorageChangeSetReader + StaticFileProviderFactory,
     {
         let notifications = provider.subscribe_to_canonical_state();
         let provider = Arc::new(provider);
@@ -50,10 +48,13 @@ impl ClusterFeed {
         node.install_block_hashes(Box::new(move |number| {
             lookup.upgrade()?.block_hash(number).ok().flatten()
         }));
-        let headers = Arc::downgrade(&provider);
-        node.owner_store().install_join_headers(Box::new(move |range| {
-            let headers = headers.upgrade()?.headers_range(range).ok()?;
-            Some(JoinPoint::encode(&headers))
+        let join_points = Arc::downgrade(&provider);
+        node.owner_store().install_join_points(Box::new(move |range| {
+            // One read transaction, so the headers and the body are of the same chain.
+            let provider = join_points.upgrade()?.database_provider_ro().ok()?;
+            let body = provider.block_by_number(*range.end()).ok()??.into_body();
+            let headers = provider.headers_range(range).ok()?;
+            Some(JoinPoint::encode(&headers, &body))
         }));
         node.install_changesets(Box::new(ProviderChangesets::new(&provider)))?;
         info!("cluster owner store following canonical blocks");
@@ -154,7 +155,7 @@ impl ClusterFeed {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, ops::RangeBounds};
+    use std::net::TcpListener;
 
     use alloy_primitives::{B256, BlockNumber};
     use base_common_consensus::BasePrimitives;
@@ -162,7 +163,6 @@ mod tests {
         ClientOptions, Cluster, ClusterConfig, ClusteredDatabase, NodeConfig, NodeId,
     };
     use reth_db::test_utils::create_test_rw_db;
-    use reth_primitives_traits::SealedHeader;
     use reth_provider::{
         CanonStateNotifications, ProviderFactory, ProviderResult,
         test_utils::{MockNodeTypesWithDB, create_test_provider_factory},
@@ -193,40 +193,6 @@ mod tests {
 
         fn database_provider_rw(&self) -> ProviderResult<Self::ProviderRW> {
             self.changesets.database_provider_rw()
-        }
-    }
-
-    impl HeaderProvider for DatabaseOwningProvider {
-        type Header = <TestFactory as HeaderProvider>::Header;
-
-        fn header(&self, block_hash: B256) -> ProviderResult<Option<Self::Header>> {
-            self.changesets.header(block_hash)
-        }
-
-        fn header_by_number(&self, number: u64) -> ProviderResult<Option<Self::Header>> {
-            self.changesets.header_by_number(number)
-        }
-
-        fn headers_range(
-            &self,
-            range: impl RangeBounds<BlockNumber>,
-        ) -> ProviderResult<Vec<Self::Header>> {
-            self.changesets.headers_range(range)
-        }
-
-        fn sealed_header(
-            &self,
-            number: BlockNumber,
-        ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
-            self.changesets.sealed_header(number)
-        }
-
-        fn sealed_headers_while(
-            &self,
-            range: impl RangeBounds<BlockNumber>,
-            predicate: impl FnMut(&SealedHeader<Self::Header>) -> bool,
-        ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
-            self.changesets.sealed_headers_while(range, predicate)
         }
     }
 

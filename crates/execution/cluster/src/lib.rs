@@ -69,7 +69,7 @@ pub use protocol::{
 };
 
 mod join;
-pub use join::{ClusterJoin, JoinError, JoinHeaderLookup, JoinHeaders, JoinMarker, JoinPoint};
+pub use join::{ClusterJoin, JoinChain, JoinError, JoinMarker, JoinPoint, JoinPointLookup};
 
 mod changesets;
 pub use changesets::{ChangesetReader, ChangesetSource, PlainChangesets, ProviderChangesets};

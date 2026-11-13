@@ -22,7 +22,7 @@ use tracing::info;
 use crate::node::BaseNode;
 
 type JoinFactory = ProviderFactory<NodeTypesWithDBAdapter<BaseNode, ClusteredDatabase>>;
-type Header = <BasePrimitives as NodePrimitives>::BlockHeader;
+type Block = <BasePrimitives as NodePrimitives>::Block;
 
 /// Joins a node that stores no state to its cluster when its datadir is empty.
 #[derive(Debug, Clone, Copy)]
@@ -42,8 +42,9 @@ impl ClusterJoinStart {
 
     /// Joins: marks the datadir, writes genesis as reth's launch does, fetches a confirmed join
     /// point from the `apply_from` peers (asking for up to the config's `read_retry_secs`),
-    /// writes it (nothing when the peer is still at genesis), and removes the mark. A datadir the process left marked is refused at the next
-    /// start ([`JoinMarker::ensure_absent`]). Blocks on the network; run it off async threads.
+    /// writes it (nothing when the peer is still at genesis), and removes the mark. A datadir
+    /// the process left marked is refused at the next start ([`JoinMarker::ensure_absent`]).
+    /// Blocks on the network; run it off async threads.
     pub fn run(
         node: &Arc<ClusterNode>,
         db: &ClusteredDatabase,
@@ -58,15 +59,15 @@ impl ClusterJoinStart {
             config.storage_settings(),
         )?;
         let budget = node.cluster().config().client_options().retry_for;
-        let (peer, headers) =
-            ClusterJoin::fetch::<Header>(node.client(), node.cluster(), genesis_hash, budget)?;
-        let block = headers.as_ref().map_or(0, |headers| headers.tip().number());
+        let (peer, chain) =
+            ClusterJoin::fetch::<Block>(node.client(), node.cluster(), genesis_hash, budget)?;
+        let block = chain.as_ref().map_or(0, |chain| chain.tip().number());
         info!(peer = peer.0, block, "cluster node joining at a peer's persisted block");
-        if let Some(headers) = headers {
+        if let Some(chain) = chain {
             // A factory of its own: the one that wrote genesis keeps its header writer on
             // genesis's static file.
             let provider = Self::factory(db, config, runtime)?.database_provider_rw()?;
-            headers.write(&provider)?;
+            chain.write(&provider)?;
             provider.commit()?;
         }
         JoinMarker::remove(datadir.data_dir())?;
